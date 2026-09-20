@@ -35,7 +35,7 @@ fn main() {
         .application_id("de.dersobi.reoling")
         .build();
 
-    app.connect_startup(|_| ui::style::install());
+    app.connect_startup(|_| ui::icon::install());
 
     app.connect_activate(move |app| {
         let window = ApplicationWindow::builder()
