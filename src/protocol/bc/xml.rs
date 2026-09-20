@@ -15,6 +15,17 @@ pub struct BcXml {
     pub device_info: Option<DeviceInfo>,
     #[serde(rename = "Preview", skip_serializing_if = "Option::is_none")]
     pub preview: Option<Preview>,
+    #[serde(rename = "VersionInfo", skip_serializing_if = "Option::is_none")]
+    pub version_info: Option<VersionInfo>,
+}
+
+/// The device's own description of itself (reply to `MSG_ID_VERSION`): the
+/// name the owner gave it and its model.
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct VersionInfo {
+    pub name: Option<String>,
+    #[serde(rename = "type")]
+    pub model: Option<String>,
 }
 
 impl BcXml {

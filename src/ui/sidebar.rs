@@ -32,6 +32,7 @@ pub struct Handlers {
 
 struct Card {
     row: ListBoxRow,
+    name: Label,
     dot: Label,
     status: Label,
     spin: SpinButton,
@@ -180,13 +181,19 @@ impl Sidebar {
             }
         });
 
-        self.cards.borrow_mut().insert(device.key.clone(), Card { row, dot, status, spin });
+        self.cards.borrow_mut().insert(device.key.clone(), Card { row, name, dot, status, spin });
         self.set_status(&device.key, &Status::Idle);
     }
 
     pub fn remove_device(&self, key: &str) {
         if let Some(card) = self.cards.borrow_mut().remove(key) {
             self.list.remove(&card.row);
+        }
+    }
+
+    pub fn set_name(&self, key: &str, name: &str) {
+        if let Some(card) = self.cards.borrow().get(key) {
+            card.name.set_text(name);
         }
     }
 

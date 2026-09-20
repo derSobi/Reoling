@@ -9,8 +9,8 @@ use crate::ui::video_view::VideoView;
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Button, DropDown, EventControllerKey,
-    GestureClick, HeaderBar, IconTheme, Label, Orientation, Overlay, Paned, Stack, StackSwitcher,
-    ToggleButton,
+    GestureClick, HeaderBar, IconTheme, Image, Label, Orientation, Overlay, Paned, ScaleButton,
+    Stack, StackSwitcher, ToggleButton,
 };
 use reoling::StreamQuality;
 use std::cell::{Cell, RefCell};
@@ -39,6 +39,10 @@ pub struct MainWindow {
     bars: GtkBox,
     fullscreen_button: Button,
     stream: DropDown,
+    stop: Button,
+    previous: Button,
+    next: Button,
+    streaming: Cell<bool>,
 
     devices: RefCell<Vec<Device>>,
     passwords: RefCell<HashMap<String, String>>,
@@ -103,12 +107,20 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         });
 
         let header = HeaderBar::new();
+        let brand = GtkBox::new(Orientation::Horizontal, 8);
+        let logo = Image::from_icon_name("de.dersobi.reoling");
+        logo.set_pixel_size(24);
+        let brand_name = Label::new(Some("Reoling"));
+        brand_name.add_css_class("heading");
+        brand.append(&logo);
+        brand.append(&brand_name);
+        header.pack_start(&brand);
+        window.set_titlebar(Some(&header));
+
         let sidebar_toggle = ToggleButton::new();
         sidebar_toggle.set_icon_name(sidebar_icon());
         sidebar_toggle.set_tooltip_text(Some("Show or hide the device list"));
         sidebar_toggle.set_active(true);
-        header.pack_start(&sidebar_toggle);
-        window.set_titlebar(Some(&header));
 
         let pages = Stack::new();
         let switcher = StackSwitcher::new();
@@ -134,9 +146,11 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
 
         let stop = Button::from_icon_name("media-playback-stop-symbolic");
         stop.set_tooltip_text(Some("Stop"));
+        stop.set_sensitive(false);
         let stream = DropDown::from_strings(&["Main stream", "Sub stream"]);
         stream.set_selected(1);
         stream.set_tooltip_text(Some("Stream"));
+        stream.set_sensitive(false);
         let controls = GtkBox::new(Orientation::Horizontal, 8);
         controls.set_margin_top(6);
         controls.set_margin_bottom(6);
@@ -148,10 +162,32 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         controls.append(&spacer);
         controls.append(&stream);
 
+        // Bottom row. Buttons without a function yet stay in place, disabled.
         let previous = Button::from_icon_name("go-previous-symbolic");
         previous.set_tooltip_text(Some("Previous channel"));
+        previous.set_sensitive(false);
         let next = Button::from_icon_name("go-next-symbolic");
         next.set_tooltip_text(Some("Next channel"));
+        next.set_sensitive(false);
+        let scrollview = Button::from_icon_name("media-playlist-repeat-symbolic");
+        scrollview.set_tooltip_text(Some("Scrollview"));
+        scrollview.set_sensitive(false);
+        let volume = ScaleButton::new(
+            0.0,
+            1.0,
+            0.05,
+            &[
+                "audio-volume-muted-symbolic",
+                "audio-volume-high-symbolic",
+                "audio-volume-low-symbolic",
+                "audio-volume-medium-symbolic",
+            ],
+        );
+        volume.set_tooltip_text(Some("Volume"));
+        volume.set_sensitive(false);
+        let split = Button::from_icon_name("view-grid-symbolic");
+        split.set_tooltip_text(Some("Split view"));
+        split.set_sensitive(false);
         let fullscreen_button = Button::from_icon_name("view-fullscreen-symbolic");
         fullscreen_button.set_tooltip_text(Some("Fullscreen"));
         let navigation = GtkBox::new(Orientation::Horizontal, 8);
@@ -159,11 +195,15 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         navigation.set_margin_bottom(6);
         navigation.set_margin_start(8);
         navigation.set_margin_end(8);
+        navigation.append(&sidebar_toggle);
         navigation.append(&previous);
         navigation.append(&next);
+        navigation.append(&scrollview);
         let spacer = GtkBox::new(Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         navigation.append(&spacer);
+        navigation.append(&volume);
+        navigation.append(&split);
         navigation.append(&fullscreen_button);
 
         let bars = GtkBox::new(Orientation::Vertical, 0);
@@ -274,6 +314,10 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             bars,
             fullscreen_button,
             stream,
+            stop,
+            previous,
+            next,
+            streaming: Cell::new(false),
             devices: RefCell::new(Vec::new()),
             passwords: RefCell::new(HashMap::new()),
             save_on_login: RefCell::new(None),
@@ -356,8 +400,8 @@ impl MainWindow {
 
     fn add_device_dialog(self: &Rc<Self>) {
         let this = Rc::clone(self);
-        dialogs::add_device(self.window.upcast_ref(), move |name, target| {
-            let device = Device::new(name, target);
+        dialogs::add_device(self.window.upcast_ref(), move |target| {
+            let device = Device::new(target);
             this.sidebar.add_device(&device);
             this.devices.borrow_mut().push(device.clone());
             device_store::save(&this.devices.borrow());
@@ -453,11 +497,49 @@ impl MainWindow {
     /// drops the pipeline. Events from it are ignored from then on.
     fn stop_session(&self) {
         self.generation.set(self.generation.get() + 1);
+        self.streaming.set(false);
         if let Some(active) = self.active.borrow_mut().take() {
             active.shutdown.notify_one();
             self.sidebar.set_status(&active.key, &Status::Idle);
         }
         self.video.reset();
+        self.update_controls();
+    }
+
+    /// Controls that only make sense with a session, or with a multi-camera
+    /// device (NVR / Home Hub), follow the current state.
+    fn update_controls(&self) {
+        let active = self.active_key();
+        let multi = active
+            .as_deref()
+            .and_then(|k| self.device(k))
+            .map(|d| d.multi_channel)
+            .unwrap_or(false);
+        self.stop.set_sensitive(active.is_some());
+        self.stream.set_sensitive(self.streaming.get());
+        self.previous.set_sensitive(multi);
+        self.next.set_sensitive(multi);
+    }
+
+    /// Takes the device's own name and kind once it has told us.
+    fn apply_identity(&self, key: &str, identity: &reoling::DeviceIdentity) {
+        let text = |s: &Option<String>| s.clone().unwrap_or_default().trim().to_string();
+        let (name, model) = (text(&identity.name), text(&identity.model));
+        let lower = format!("{name} {model}").to_lowercase();
+        let multi = lower.contains("nvr") || lower.contains("hub");
+        if let Some(d) = self.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
+            if !name.is_empty() {
+                d.name = name.clone();
+            }
+            if !name.is_empty() || !model.is_empty() {
+                d.multi_channel = multi;
+            }
+        }
+        if !name.is_empty() {
+            self.sidebar.set_name(key, &name);
+        }
+        device_store::save(&self.devices.borrow());
+        self.update_controls();
     }
 
     fn shutdown_active(&self, wait: bool) {
@@ -489,6 +571,7 @@ impl MainWindow {
             self.sink_request_tx.clone(),
         );
         *self.active.borrow_mut() = Some(Active { key: key.to_string(), shutdown });
+        self.update_controls();
 
         let this = Rc::clone(self);
         let key = key.to_string();
@@ -499,7 +582,8 @@ impl MainWindow {
                     return;
                 }
                 match event {
-                    AppEvent::LoggedIn => {
+                    AppEvent::LoggedIn(identity) => {
+                        this.apply_identity(&key, &identity);
                         this.sidebar.set_status(&key, &Status::Connected);
                         this.show_message("Starting video…");
                         if this.save_on_login.borrow().as_deref() == Some(key.as_str()) {
@@ -518,6 +602,8 @@ impl MainWindow {
                     AppEvent::FrameDelivered => {
                         if this.message.is_visible() {
                             this.message.set_visible(false);
+                            this.streaming.set(true);
+                            this.update_controls();
                         }
                     }
                     AppEvent::Failed(reason) => {
