@@ -204,7 +204,9 @@ fn hardware_key(factory: &gstreamer::ElementFactory) -> (String, String) {
 pub fn hardware_decoders() -> Vec<HardwareDecoder> {
     let mut out: Vec<HardwareDecoder> = Vec::new();
     for (factory, hardware) in video_decoders() {
-        if !hardware {
+        // A rank of zero means decodebin never picks it (and could not plug
+        // the converters its output needs): offering it gives a black picture.
+        if !hardware || original_rank(&factory) <= 0 {
             continue;
         }
         let (key, label) = hardware_key(&factory);
@@ -218,6 +220,14 @@ pub fn hardware_decoders() -> Vec<HardwareDecoder> {
 
 /// The ranks decoders had before we touched any, to restore on "Auto".
 static ORIGINAL_RANKS: OnceLock<Vec<(String, i32)>> = OnceLock::new();
+
+/// A decoder's rank as GStreamer had it, whatever we changed since.
+fn original_rank(factory: &gstreamer::ElementFactory) -> i32 {
+    ORIGINAL_RANKS
+        .get()
+        .and_then(|all| all.iter().find(|(n, _)| *n == factory.name().as_str()))
+        .map_or_else(|| factory.rank().into_glib(), |(_, rank)| *rank)
+}
 
 fn apply_decoding(settings: &Settings) {
     let decoders = video_decoders();
