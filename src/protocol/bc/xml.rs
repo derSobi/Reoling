@@ -19,16 +19,12 @@ pub struct BcXml {
     pub version_info: Option<VersionInfo>,
     #[serde(rename = "ChannelInfoList", skip_serializing_if = "Option::is_none")]
     pub channel_info_list: Option<ChannelInfoList>,
-    #[serde(rename = "OsdDatetime", skip_serializing_if = "Option::is_none")]
-    pub osd_datetime: Option<OsdDatetime>,
+    #[serde(rename = "OsdChannelName", skip_serializing_if = "Option::is_none")]
+    pub osd_channel_name: Option<OsdChannelName>,
 }
 
-/// The on-screen-display settings; all we read is the channel's name.
-#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
-pub struct OsdDatetime {
-    #[serde(rename = "channelName")]
-    pub channel_name: Option<OsdChannelName>,
-}
+/// The channel's on-screen name, from the reply to `MSG_ID_OSD` (the reply
+/// also carries an `OsdDatetime` element, which we ignore).
 
 #[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct OsdChannelName {
@@ -262,11 +258,13 @@ mod channel_info_tests {
 
     #[test]
     fn osd_reply_gives_the_channel_name() {
-        let xml = br#"<?xml version="1.0" encoding="UTF-8"?><body><OsdDatetime version="1.1">
-            <channelName><enable>1</enable><name>Camera 1</name></channelName>
-            <datetime><enable>1</enable></datetime></OsdDatetime></body>"#;
-        let name = BcXml::from_bytes(xml).unwrap().osd_datetime.unwrap().channel_name.unwrap().name;
-        assert_eq!(name.as_deref(), Some("Camera 1"));
+        // Shape of a real NVR reply.
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" ?><body>
+            <OsdDatetime version="1.1"><channelId>6</channelId><enable>1</enable></OsdDatetime>
+            <OsdChannelName version="1.1"><channelId>6</channelId><name>Camera7</name>
+            <enable>1</enable></OsdChannelName></body>"#;
+        let name = BcXml::from_bytes(xml).unwrap().osd_channel_name.unwrap().name;
+        assert_eq!(name.as_deref(), Some("Camera7"));
     }
 
     #[test]
