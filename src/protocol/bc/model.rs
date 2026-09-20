@@ -6,6 +6,9 @@ pub const MSG_ID_LOGOUT: u32 = 2;
 pub const MSG_ID_VIDEO: u32 = 3;
 pub const MSG_ID_VIDEO_STOP: u32 = 4;
 pub const MSG_ID_VERSION: u32 = 80;
+/// Empty request the official app sends after login; the device then starts
+/// pushing its channel list and alarm events.
+pub const MSG_ID_SUBSCRIBE: u32 = 192;
 /// Pushed by NVRs / Home Hubs: the channel list. Not requestable.
 pub const MSG_ID_CHANNEL_INFO: u32 = 145;
 

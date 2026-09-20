@@ -5,10 +5,10 @@
 use crate::ui::device_store::Device;
 use gtk4::prelude::*;
 use gtk4::{
-    Box as GtkBox, Button, Frame, Label, ListBox, ListBoxRow, MenuButton, Orientation, Popover,
+    Box as GtkBox, Button, DropDown, Frame, Label, ListBox, ListBoxRow, MenuButton, Orientation, Popover,
     ScrolledWindow, SelectionMode, SpinButton,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -36,6 +36,10 @@ struct Card {
     dot: Label,
     status: Label,
     spin: SpinButton,
+    /// Shown instead of `spin` once the device has listed its channels.
+    channels: DropDown,
+    channel_ids: Rc<RefCell<Vec<u8>>>,
+    updating: Rc<Cell<bool>>,
 }
 
 pub struct Sidebar {
@@ -145,8 +149,11 @@ impl Sidebar {
         channel_label.set_halign(gtk4::Align::Start);
         let spin = SpinButton::with_range(0.0, 255.0, 1.0);
         spin.set_value(f64::from(device.channel));
+        let channels = DropDown::new(None::<gtk4::StringList>, None::<gtk4::Expression>);
+        channels.set_visible(false);
         channel_row.append(&channel_label);
         channel_row.append(&spin);
+        channel_row.append(&channels);
         card.append(&channel_row);
 
         let frame = Frame::new(None);
@@ -162,6 +169,20 @@ impl Sidebar {
         spin.connect_value_changed(move |spin| {
             if let Some(s) = weak.upgrade() {
                 (s.handlers.on_channel)(&key, spin.value() as u8);
+            }
+        });
+        let channel_ids: Rc<RefCell<Vec<u8>>> = Rc::default();
+        let updating: Rc<Cell<bool>> = Rc::default();
+        let key = device.key.clone();
+        let weak = Rc::downgrade(self);
+        let (ids, guard) = (Rc::clone(&channel_ids), Rc::clone(&updating));
+        channels.connect_selected_notify(move |dd| {
+            if guard.get() {
+                return;
+            }
+            let channel = ids.borrow().get(dd.selected() as usize).copied();
+            if let (Some(channel), Some(s)) = (channel, weak.upgrade()) {
+                (s.handlers.on_channel)(&key, channel);
             }
         });
         let key = device.key.clone();
@@ -181,7 +202,7 @@ impl Sidebar {
             }
         });
 
-        self.cards.borrow_mut().insert(device.key.clone(), Card { row, name, dot, status, spin });
+        self.cards.borrow_mut().insert(device.key.clone(), Card { row, name, dot, status, spin, channels, channel_ids, updating });
         self.set_status(&device.key, &Status::Idle);
     }
 
@@ -205,8 +226,45 @@ impl Sidebar {
 
     pub fn set_channel(&self, key: &str, channel: u8) {
         if let Some(card) = self.cards.borrow().get(key) {
-            card.spin.set_value(f64::from(channel));
+            if card.channels.is_visible() {
+                let index = card.channel_ids.borrow().iter().position(|c| *c == channel);
+                if let Some(index) = index {
+                    card.channels.set_selected(index as u32);
+                }
+            } else {
+                card.spin.set_value(f64::from(channel));
+            }
         }
+    }
+
+    /// Lists the device's connected channels by name instead of the numeric
+    /// selector. Without any, the numeric selector stays.
+    pub fn set_channels(&self, key: &str, channels: &[reoling::ChannelInfo], current: u8) {
+        let cards = self.cards.borrow();
+        let Some(card) = cards.get(key) else { return };
+        let online: Vec<&reoling::ChannelInfo> = channels.iter().filter(|c| c.online).collect();
+        if online.is_empty() {
+            return;
+        }
+        let names: Vec<String> = online
+            .iter()
+            .map(|c| {
+                if c.name.is_empty() {
+                    format!("Channel {}", u16::from(c.channel_id) + 1)
+                } else {
+                    c.name.clone()
+                }
+            })
+            .collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        card.updating.set(true);
+        *card.channel_ids.borrow_mut() = online.iter().map(|c| c.channel_id).collect();
+        card.channels.set_model(Some(&gtk4::StringList::new(&names)));
+        let index = online.iter().position(|c| c.channel_id == current).unwrap_or(0);
+        card.channels.set_selected(index as u32);
+        card.updating.set(false);
+        card.spin.set_visible(false);
+        card.channels.set_visible(true);
     }
 
     pub fn set_status(&self, key: &str, status: &Status) {
