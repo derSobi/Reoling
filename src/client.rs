@@ -137,7 +137,7 @@ fn pushed_update(bc: &Bc) -> Option<DeviceUpdate> {
         }
         return Some(DeviceUpdate::Channels(channels));
     }
-    let name = xml.osd_datetime?.channel_name?.name?.trim().to_string();
+    let name = xml.osd_channel_name?.name?.trim().to_string();
     let channel_id = extension_xml
         .as_deref()
         .and_then(|e| Extension::from_bytes(e).ok())
