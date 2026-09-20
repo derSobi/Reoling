@@ -493,7 +493,30 @@ impl ReolinkClient {
     /// official app sends right after login (192 and 146, seen in a capture
     /// against a Home Hub, which then pushed its channel list) and prints
     /// every reply, decrypted, for a few seconds.
-    pub async fn probe_pushes(&mut self) {
+    pub async fn probe_pushes(&mut self, username: &str) {
+        // The ability query (151) names the sections it wants in its extension.
+        let ability = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<Extension version=\"1.1\">\n<userName>{username}</userName>\n<token>system, streaming, PTZ, IO, security, replay, disk, network, alarm, record, video, image</token>\n</Extension>\n"
+        );
+        {
+            let msg_num = self.next_msg_num();
+            let request = Bc {
+                meta: BcMeta {
+                    msg_id: 151,
+                    channel_id: 0,
+                    stream_type: 0,
+                    msg_num,
+                    response_code: 0,
+                    class: 0x6414,
+                },
+                body: BcBody::Modern(ModernMsg {
+                    extension_xml: Some(ability.into_bytes()),
+                    payload: None,
+                }),
+            };
+            let sent = self.connection.lock().await.send_bc(&request, &self.encryption).await;
+            eprintln!("PROBE sent 151: {sent:?}");
+        }
         // What each channel can do (58, per channel) is what decides which
         // camera controls to offer; shown here to see how the devices word it.
         for channel_id in 0..3u8 {
@@ -523,7 +546,7 @@ impl ReolinkClient {
                 let text = match &bc.body {
                     BcBody::Modern(ModernMsg { payload: Some(p), .. }) => {
                         let t = String::from_utf8_lossy(p);
-                        t.chars().take(6000).map(|c| if c == '\n' { ' ' } else { c }).collect::<String>()
+                        t.chars().take(30000).map(|c| if c == '\n' { ' ' } else { c }).collect::<String>()
                     }
                     other => format!("{other:?}").chars().take(200).collect(),
                 };

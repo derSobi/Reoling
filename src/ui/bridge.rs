@@ -144,7 +144,7 @@ pub fn spawn_device(
             let mut audio = client.take_audio().expect("taken once per client");
             let identity = client.identity().await;
             if std::env::var("REOLING_PROBE_PUSH").is_ok() {
-                client.probe_pushes().await;
+                client.probe_pushes(&username).await;
             }
             let _ = tx.send(DeviceEvent::Connected(identity)).await;
 
