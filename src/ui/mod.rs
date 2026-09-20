@@ -3,4 +3,5 @@
 pub mod bridge;
 pub mod connect_dialog;
 pub mod icon;
+pub mod theme;
 pub mod video_view;
