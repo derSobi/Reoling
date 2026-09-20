@@ -684,6 +684,14 @@ impl MainWindow {
             if channels.len() > 1 {
                 d.multi_channel = true;
             }
+            // The device re-sends its list from time to time, without the names
+            // we had to ask for separately; keep those.
+            let mut channels = channels;
+            for channel in channels.iter_mut().filter(|c| c.name.is_empty()) {
+                if let Some(old) = d.channels.iter().find(|o| o.channel_id == channel.channel_id) {
+                    channel.name = old.name.clone();
+                }
+            }
             d.channels = channels;
         }
         if let Some(d) = self.device(key) {
