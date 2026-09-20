@@ -20,6 +20,19 @@ pub struct DeviceInfoSummary {
     pub resolution_name: Option<String>,
 }
 
+/// What the device says it is, as reported after login.
+#[derive(Debug, Clone, Default)]
+pub struct DeviceIdentity {
+    /// The name the owner gave the device.
+    pub name: Option<String>,
+    /// The model, e.g. a camera, NVR or Home Hub type string.
+    pub model: Option<String>,
+}
+
+/// How long to wait for the device to describe itself before carrying on
+/// without: the name is a nicety, the video must not wait for it.
+const IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Which of the camera's encode profiles to request in `start_video`.
 /// `Main` is full resolution/bitrate; `Sub` is a lower-resolution,
 /// lower-bitrate profile most cameras also encode continuously —
@@ -303,6 +316,42 @@ impl ReolinkClient {
         Ok(DeviceInfoSummary {
             resolution_name: device_info.resolution.and_then(|r| r.name),
         })
+    }
+
+    /// Asks the logged-in device for its name and model. Best effort: any
+    /// failure or silence yields an empty identity rather than an error.
+    pub async fn identity(&mut self) -> DeviceIdentity {
+        let msg_num = self.next_msg_num();
+        let request = Bc {
+            meta: BcMeta {
+                msg_id: MSG_ID_VERSION,
+                channel_id: 0,
+                stream_type: 0,
+                msg_num,
+                response_code: 0,
+                class: 0x6414,
+            },
+            body: BcBody::Modern(ModernMsg { extension_xml: None, payload: None }),
+        };
+        let exchange = async {
+            self.connection.lock().await.send_bc(&request, &self.encryption).await.ok()?;
+            for _ in 0..8 {
+                let reply = self.connection.lock().await.recv_bc(&self.encryption).await.ok()?;
+                if reply.meta.msg_id != MSG_ID_VERSION {
+                    continue;
+                }
+                let BcBody::Modern(ModernMsg { payload: Some(payload), .. }) = reply.body else {
+                    return None;
+                };
+                return BcXml::from_bytes(&payload).ok()?.version_info;
+            }
+            None
+        };
+        let info = tokio::time::timeout(IDENTITY_TIMEOUT, exchange).await.ok().flatten();
+        if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
+            eprintln!("DEBUG identity reply: {info:?}");
+        }
+        info.map(|i| DeviceIdentity { name: i.name, model: i.model }).unwrap_or_default()
     }
 
     /// Diagnostic-only, not used by `login`: sends only the modern

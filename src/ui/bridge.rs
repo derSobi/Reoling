@@ -1,10 +1,10 @@
 use crate::ui::video_view::VideoSink;
-use reoling::{ReolinkClient, StreamQuality, VideoType};
+use reoling::{DeviceIdentity, ReolinkClient, StreamQuality, VideoType};
 use std::net::IpAddr;
 use tokio_stream::StreamExt;
 
 pub enum AppEvent {
-    LoggedIn,
+    LoggedIn(DeviceIdentity),
     /// A frame was pushed straight into GStreamer already. See
     /// `spawn_connection`'s doc comment for why frames no longer travel
     /// through this channel at all.
@@ -102,7 +102,8 @@ pub fn spawn_connection(
                 let _ = tx.send(AppEvent::Failed(e.to_string())).await;
                 return;
             }
-            let _ = tx.send(AppEvent::LoggedIn).await;
+            let identity = client.identity().await;
+            let _ = tx.send(AppEvent::LoggedIn(identity)).await;
 
             let mut frames = match client.start_video(channel_id, quality).await {
                 Ok(f) => f,

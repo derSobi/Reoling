@@ -41,15 +41,10 @@ fn button_row(cancel: &Button, accept: &Button) -> GtkBox {
     buttons
 }
 
-/// "Add device": a UID tab and an IP tab. `on_add` gets the optional display
-/// name and the chosen target.
-pub fn add_device(parent: &Window, on_add: impl Fn(String, ConnectTarget) + 'static) {
+/// "Add device": a UID tab and an IP tab. The device's name is read from the
+/// device itself once connected.
+pub fn add_device(parent: &Window, on_add: impl Fn(ConnectTarget) + 'static) {
     let (window, content) = dialog(parent, "Add device");
-
-    let name = Entry::builder().placeholder_text("Optional").build();
-    let name_grid = Grid::builder().row_spacing(8).column_spacing(12).build();
-    row(&name_grid, 0, "Name", &name);
-    content.append(&name_grid);
 
     let notebook = Notebook::new();
     let uid = Entry::builder().placeholder_text("Device UID").build();
@@ -118,7 +113,7 @@ pub fn add_device(parent: &Window, on_add: impl Fn(String, ConnectTarget) + 'sta
             };
             ConnectTarget::Ip { addr, port }
         };
-        on_add(name.text().to_string(), target);
+        on_add(target);
         w.close();
     });
 

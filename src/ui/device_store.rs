@@ -13,17 +13,18 @@ pub struct Device {
     pub target: ConnectTarget,
     pub username: String,
     pub channel: u8,
+    /// An NVR or Home Hub (several cameras behind one device), as far as the
+    /// device has told us. Unknown until the first successful login.
+    pub multi_channel: bool,
 }
 
 impl Device {
-    pub fn new(name: String, target: ConnectTarget) -> Self {
-        let name = if name.trim().is_empty() {
-            match &target {
-                ConnectTarget::Uid(uid) => uid.clone(),
-                ConnectTarget::Ip { addr, .. } => addr.to_string(),
-            }
-        } else {
-            name.trim().to_string()
+    /// The name is a placeholder (the address) until the device reports its
+    /// own after the first login.
+    pub fn new(target: ConnectTarget) -> Self {
+        let name = match &target {
+            ConnectTarget::Uid(uid) => uid.clone(),
+            ConnectTarget::Ip { addr, .. } => addr.to_string(),
         };
         Self {
             key: format!("{:016x}", rand::random::<u64>()),
@@ -31,6 +32,7 @@ impl Device {
             target,
             username: "admin".to_string(),
             channel: 0,
+            multi_channel: false,
         }
     }
 }
@@ -66,6 +68,7 @@ pub fn load() -> Vec<Device> {
             target,
             username: get("username").unwrap_or_else(|| "admin".to_string()),
             channel: get("channel").and_then(|s| s.parse().ok()).unwrap_or(0),
+            multi_channel: get("multi_channel").as_deref() == Some("true"),
         });
     }
     devices
@@ -85,6 +88,7 @@ pub fn save(devices: &[Device]) {
         }
         file.set_string(&group, "username", &d.username);
         file.set_string(&group, "channel", &d.channel.to_string());
+        file.set_string(&group, "multi_channel", &d.multi_channel.to_string());
     }
     let path = path();
     if let Some(dir) = path.parent() {

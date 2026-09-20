@@ -5,6 +5,7 @@ pub const MSG_ID_LOGIN: u32 = 1;
 pub const MSG_ID_LOGOUT: u32 = 2;
 pub const MSG_ID_VIDEO: u32 = 3;
 pub const MSG_ID_VIDEO_STOP: u32 = 4;
+pub const MSG_ID_VERSION: u32 = 80;
 
 /// Header classes that carry an extra 4-byte `payload_offset` word after the
 /// fixed 20-byte header. All other classes (0x6514 legacy, 0x6614 the
