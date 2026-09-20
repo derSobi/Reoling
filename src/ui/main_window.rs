@@ -575,6 +575,9 @@ impl MainWindow {
             }
             d.channels = channels;
         }
+        if let Some(d) = self.device(key) {
+            self.sidebar.set_channels(key, &d.channels, d.channel);
+        }
         device_store::save(&self.devices.borrow());
         let stream_changed = self.refresh_streams();
         self.update_controls();

@@ -107,6 +107,9 @@ pub fn spawn_connection(
             let mut channel_updates =
                 client.take_channel_updates().expect("taken once per client");
             let identity = client.identity().await;
+            if std::env::var("REOLING_PROBE_PUSH").is_ok() {
+                client.probe_pushes().await;
+            }
             let _ = tx.send(AppEvent::LoggedIn(identity)).await;
 
             let mut frames = match client.start_video(channel_id, quality).await {

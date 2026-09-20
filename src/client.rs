@@ -367,9 +367,29 @@ impl ReolinkClient {
         })
     }
 
+    async fn send_empty_request(&mut self, msg_id: u32) -> crate::Result<()> {
+        let msg_num = self.next_msg_num();
+        let request = Bc {
+            meta: BcMeta {
+                msg_id,
+                channel_id: 0,
+                stream_type: 0,
+                msg_num,
+                response_code: 0,
+                class: 0x6414,
+            },
+            body: BcBody::Modern(ModernMsg { extension_xml: None, payload: None }),
+        };
+        self.connection.lock().await.send_bc(&request, &self.encryption).await
+    }
+
     /// Asks the logged-in device for its name and model. Best effort: any
     /// failure or silence yields an empty identity rather than an error.
     pub async fn identity(&mut self) -> DeviceIdentity {
+        // What the official app sends first after login (seen in a capture
+        // against a Home Hub): it makes an NVR / Home Hub push its channel
+        // list, with the channels' names. Answers are picked up as they come.
+        let _ = self.send_empty_request(MSG_ID_SUBSCRIBE).await;
         let msg_num = self.next_msg_num();
         let request = Bc {
             meta: BcMeta {
@@ -411,6 +431,48 @@ impl ReolinkClient {
             eprintln!("DEBUG identity reply: name={name:?} model={model:?}");
         }
         DeviceIdentity { name, model }
+    }
+
+    /// Diagnostic-only (`REOLING_PROBE_PUSH`): sends the empty requests the
+    /// official app sends right after login (192 and 146, seen in a capture
+    /// against a Home Hub, which then pushed its channel list) and prints
+    /// every reply, decrypted, for a few seconds.
+    pub async fn probe_pushes(&mut self) {
+        for msg_id in [192u32, 146] {
+            let msg_num = self.next_msg_num();
+            let request = Bc {
+                meta: BcMeta {
+                    msg_id,
+                    channel_id: 0,
+                    stream_type: 0,
+                    msg_num,
+                    response_code: 0,
+                    class: 0x6414,
+                },
+                body: BcBody::Modern(ModernMsg { extension_xml: None, payload: None }),
+            };
+            let sent = self.connection.lock().await.send_bc(&request, &self.encryption).await;
+            eprintln!("PROBE sent {msg_id}: {sent:?}");
+        }
+        let listen = async {
+            loop {
+                let Ok(bc) = self.connection.lock().await.recv_bc(&self.encryption).await else {
+                    return;
+                };
+                let text = match &bc.body {
+                    BcBody::Modern(ModernMsg { payload: Some(p), .. }) => {
+                        let t = String::from_utf8_lossy(p);
+                        t.chars().take(6000).map(|c| if c == '\n' { ' ' } else { c }).collect::<String>()
+                    }
+                    other => format!("{other:?}").chars().take(200).collect(),
+                };
+                eprintln!(
+                    "PROBE msg_id={} code={} num={} body={}",
+                    bc.meta.msg_id, bc.meta.response_code, bc.meta.msg_num, text
+                );
+            }
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), listen).await;
     }
 
     /// Diagnostic-only, not used by `login`: sends only the modern
@@ -548,15 +610,14 @@ impl ReolinkClient {
             }
         }
         self.connection.lock().await.send_bc(&request, &self.encryption).await?;
-        // The device may push its channel list between our request and the
-        // answer; that is not the answer.
+        // Pushes (channel lists, alarm events, ...) can come between our
+        // request and the answer; they are not the answer.
         let ack = loop {
             let bc = self.connection.lock().await.recv_bc(&self.encryption).await?;
-            match pushed_channels(&bc) {
-                Some(channels) => {
-                    let _ = self.channel_updates_tx.send(channels);
-                }
-                None => break bc,
+            if let Some(channels) = pushed_channels(&bc) {
+                let _ = self.channel_updates_tx.send(channels);
+            } else if bc.meta.msg_id == MSG_ID_VIDEO {
+                break bc;
             }
         };
         if debug_negotiation {
