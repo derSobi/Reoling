@@ -14,6 +14,9 @@ pub enum Error {
     #[error("protocol error: {0}")]
     ProtocolError(String),
 
+    #[error("timed out waiting for a reply")]
+    ReplyTimeout,
+
     #[error("connection lost")]
     ConnectionLost,
 
