@@ -1052,6 +1052,7 @@ impl MainWindow {
         if let Some(l) = self.links.borrow().get(&key) {
             l.link.stop();
         }
+        self.video.freeze();
         if let Some(sink) = self.video.current_sink() {
             sink.stop_recording();
         }

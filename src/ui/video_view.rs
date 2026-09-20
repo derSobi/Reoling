@@ -465,6 +465,19 @@ impl VideoView {
         }
     }
 
+    /// Freezes the picture where it is, at once: what the pipeline still
+    /// holds (seconds of buffered video) is not shown. `reset` (or a new
+    /// stream) takes the pipeline down later.
+    pub fn freeze(&self) {
+        if let Some(sink) = self.sink.borrow().as_ref() {
+            let pipeline = sink.pipeline.clone();
+            // Off the GTK thread, like the teardown in `reset`.
+            std::thread::spawn(move || {
+                let _ = pipeline.set_state(gstreamer::State::Paused);
+            });
+        }
+    }
+
     /// The pipeline's handle, if a stream has built one.
     pub fn current_sink(&self) -> Option<VideoSink> {
         self.sink.borrow().clone()

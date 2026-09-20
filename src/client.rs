@@ -554,6 +554,11 @@ impl ReolinkClient {
                     "PROBE msg_id={} code={} num={} body={}",
                     bc.meta.msg_id, bc.meta.response_code, bc.meta.msg_num, text
                 );
+                // Keep the app working while probing: the channel list is
+                // among what arrives here.
+                if let Some(update) = pushed_update(&bc) {
+                    let _ = self.channel_updates_tx.send(update);
+                }
             }
         };
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), listen).await;
