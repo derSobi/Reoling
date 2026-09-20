@@ -96,6 +96,9 @@ pub struct ReolinkClient {
     /// during `identity`, while starting video, or mid-stream.
     channel_updates_tx: tokio::sync::mpsc::UnboundedSender<DeviceUpdate>,
     channel_updates_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DeviceUpdate>>,
+    /// AAC (ADTS) frames of the running stream's audio.
+    audio_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    audio_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +251,7 @@ impl ReolinkClient {
     /// is covered separately in `transport::discovery`'s own tests).
     pub fn from_connection(connection: BcConnection, encryption: EncryptionProtocol) -> Self {
         let (channel_updates_tx, channel_updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             connection: Arc::new(Mutex::new(connection)),
             encryption,
@@ -257,7 +261,14 @@ impl ReolinkClient {
             direct_keepalive_task: None,
             channel_updates_tx,
             channel_updates_rx: Some(channel_updates_rx),
+            audio_tx,
+            audio_rx: Some(audio_rx),
         }
+    }
+
+    /// The audio of the streams, as AAC (ADTS) frames. Can be taken once.
+    pub fn take_audio(&mut self) -> Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>> {
+        self.audio_rx.take()
     }
 
     /// The channel lists this device pushes, as they arrive. Can be taken
@@ -690,6 +701,7 @@ impl ReolinkClient {
         let connection = Arc::clone(&self.connection);
         let encryption = self.encryption.clone();
         let channel_updates = self.channel_updates_tx.clone();
+        let audio = self.audio_tx.clone();
         self.video_task = Some(tokio::spawn(async move {
             let mut buffer: Vec<u8> = Vec::new();
             let mut guard = MediaGuard::default();
@@ -739,7 +751,9 @@ impl ReolinkClient {
                                     eprintln!("NEGOTIATION stream info unit: {width}x{height}");
                                 }
                             }
-                            if let BcMediaMessage::Video(frame) = msg {
+                            if let BcMediaMessage::Audio(frame) = msg {
+                                let _ = audio.send(frame);
+                            } else if let BcMediaMessage::Video(frame) = msg {
                                 if tx.send(Ok(frame)).await.is_err() {
                                     return; // receiver dropped
                                 }

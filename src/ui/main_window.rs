@@ -5,6 +5,7 @@ use crate::ui::bridge::{spawn_device, DeviceEvent, DeviceLink, SinkRequest, UidT
 use crate::ui::device_store::{self, Device};
 use crate::ui::sidebar::{Handlers, Sidebar, Status};
 use crate::ui::video_view::VideoView;
+use crate::ui::audio::AudioOutput;
 use crate::ui::settings::Settings;
 use crate::ui::{dialogs, secrets};
 use gtk4::prelude::*;
@@ -17,6 +18,7 @@ use reoling::{looks_multi_channel, StreamProfile};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// How long the window-close and signal handlers give the network threads to
@@ -83,6 +85,7 @@ pub struct MainWindow {
     /// Restored on the next start.
     last_played: RefCell<Option<String>>,
     settings: RefCell<Settings>,
+    audio: Arc<AudioOutput>,
     uid_transport: UidTransport,
     sink_request_tx: tokio::sync::mpsc::Sender<SinkRequest>,
 }
@@ -98,6 +101,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
     let settings = Settings::load();
     settings.apply();
 
+    let audio = Arc::new(AudioOutput::new(settings.volume));
     let video = Rc::new(VideoView::new());
 
     // Every connection's network thread asks here for a `VideoSink` once it
@@ -258,7 +262,15 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             ],
         );
         volume.set_tooltip_text(Some("Volume"));
-        volume.set_sensitive(false);
+        volume.set_value(settings.volume);
+        let w = weak.clone();
+        volume.connect_value_changed(move |_, value| {
+            if let Some(m) = w.upgrade() {
+                m.audio.set_volume(value);
+                m.settings.borrow_mut().volume = value;
+                m.settings.borrow().save();
+            }
+        });
         let split = Button::from_icon_name("view-grid-symbolic");
         split.set_tooltip_text(Some("Split view"));
         split.set_sensitive(false);
@@ -462,6 +474,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             autoplay: RefCell::new(None),
             last_played: RefCell::new(None),
             settings: RefCell::new(settings),
+            audio: Arc::clone(&audio),
             uid_transport,
             sink_request_tx,
         }
@@ -672,6 +685,7 @@ impl MainWindow {
     /// Clears the picture and ends any recording (the pipeline is going).
     fn reset_video(&self) {
         self.video.reset();
+        self.audio.reset();
         self.set_record_button(false);
     }
 
@@ -744,7 +758,9 @@ impl MainWindow {
     fn settings_dialog(self: &Rc<Self>) {
         let this = Rc::clone(self);
         let current = self.settings.borrow().clone();
-        dialogs::settings(self.window.upcast_ref(), &current, move |new| {
+        dialogs::settings(self.window.upcast_ref(), &current, move |mut new| {
+            // The volume slider lives in the main window; keep its value.
+            new.volume = this.settings.borrow().volume;
             let decoding_changed = {
                 let old = this.settings.borrow();
                 old.decoding != new.decoding || old.hardware_decoder != new.hardware_decoder
@@ -838,6 +854,7 @@ impl MainWindow {
                 password,
                 this.uid_transport,
                 this.sink_request_tx.clone(),
+                Arc::clone(&this.audio),
             );
             let events = link.events.clone();
             let id = this.next_link_id.get();
@@ -1039,6 +1056,7 @@ impl MainWindow {
             sink.stop_recording();
         }
         self.set_record_button(false);
+        self.audio.reset();
         *self.playing.borrow_mut() = None;
         *self.last_played.borrow_mut() = None;
         *self.stopped.borrow_mut() = Some(key);

@@ -29,8 +29,10 @@ pub struct VideoFrame {
 pub enum BcMediaMessage {
     Info { width: u32, height: u32 },
     Video(VideoFrame),
-    /// A recognized unit we don't need for the MVP (currently: AAC audio).
-    /// Fully consumed from the buffer even though we discard its contents.
+    /// One AAC audio frame (ADTS).
+    Audio(Vec<u8>),
+    /// A recognized unit we don't use. Fully consumed from the buffer even
+    /// though we discard its contents.
     Skipped,
 }
 
@@ -110,7 +112,8 @@ pub fn parse_one(buf: &[u8]) -> crate::protocol::Result<Option<(BcMediaMessage, 
             if buf.len() < total {
                 return Ok(None);
             }
-            Ok(Some((BcMediaMessage::Skipped, total)))
+            let audio = buf[8..8 + payload_size].to_vec();
+            Ok(Some((BcMediaMessage::Audio(audio), total)))
         }
         other => Err(Error::ProtocolError(format!(
             "unsupported bcmedia magic: {other:#x} (only Info/Iframe/Pframe/Aac are implemented)"
@@ -174,6 +177,20 @@ mod tests {
     fn returns_none_when_more_bytes_are_needed() {
         let bytes = iframe_bytes(&[1, 2, 3]);
         assert!(parse_one(&bytes[..bytes.len() - 1]).unwrap().is_none());
+    }
+
+    #[test]
+    fn aac_unit_yields_its_payload_and_consumes_the_padding() {
+        let payload = [0xFFu8, 0xF1, 0x50, 0x80, 0x01, 0x02, 0x03];
+        let mut unit = Vec::new();
+        unit.extend_from_slice(&MAGIC_HEADER_BCMEDIA_AAC.to_le_bytes());
+        unit.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        unit.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        unit.extend_from_slice(&payload);
+        unit.resize(unit.len() + pad_len(payload.len()), 0);
+        let (msg, used) = parse_one(&unit).unwrap().unwrap();
+        assert_eq!(msg, BcMediaMessage::Audio(payload.to_vec()));
+        assert_eq!(used, unit.len());
     }
 
     #[test]

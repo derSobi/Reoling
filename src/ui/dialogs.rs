@@ -244,6 +244,7 @@ pub fn settings(parent: &Window, current: &Settings, on_change: impl Fn(Settings
 
     let emit = {
         let (theme, decoding, device) = (theme.clone(), decoding.clone(), device.clone());
+        let base = current.clone();
         move || {
             let mode = modes.get(decoding.selected() as usize).map(|(m, _)| *m).unwrap_or_default();
             on_change(Settings {
@@ -256,6 +257,7 @@ pub fn settings(parent: &Window, current: &Settings, on_change: impl Fn(Settings
                 hardware_decoder: (device.selected() > 0)
                     .then(|| hardware.get(device.selected() as usize - 1).map(|d| d.key.clone()))
                     .flatten(),
+                ..base.clone()
             });
         }
     };

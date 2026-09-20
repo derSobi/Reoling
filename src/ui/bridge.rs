@@ -102,6 +102,7 @@ pub fn spawn_device(
     password: String,
     uid_transport: UidTransport,
     sink_request_tx: tokio::sync::mpsc::Sender<SinkRequest>,
+    audio_out: std::sync::Arc<crate::ui::audio::AudioOutput>,
 ) -> DeviceLink {
     let (tx, rx) = async_channel::unbounded();
     let (commands, mut command_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
@@ -140,6 +141,7 @@ pub fn spawn_device(
             }
             let mut channel_updates =
                 client.take_channel_updates().expect("taken once per client");
+            let mut audio = client.take_audio().expect("taken once per client");
             let identity = client.identity().await;
             if std::env::var("REOLING_PROBE_PUSH").is_ok() {
                 client.probe_pushes().await;
@@ -177,6 +179,7 @@ pub fn spawn_device(
                         }
                         Some(Command::Shutdown) | None => break,
                     },
+                    Some(frame) = audio.recv() => audio_out.push(&frame),
                     Some(update) = channel_updates.recv() => {
                         let event = match update {
                             DeviceUpdate::Channels(channels) => {
