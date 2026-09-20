@@ -301,6 +301,18 @@ impl VideoView {
             }
         });
 
+        // `REOLING_DEBUG_DECODER`: which decoder decodebin ended up with.
+        if std::env::var("REOLING_DEBUG_DECODER").is_ok() {
+            pipeline.connect_deep_element_added(|_, _, element| {
+                if let Some(factory) = element.factory() {
+                    let klass = factory.klass();
+                    if klass.contains("Decoder") && klass.contains("Video") {
+                        eprintln!("DECODER {} ({klass})", factory.name());
+                    }
+                }
+            });
+        }
+
         /*
          * Connect gtk4paintablesink to GtkPicture.
          */
@@ -345,10 +357,18 @@ impl VideoView {
     /// Tears the pipeline down so the next `ensure_sink` builds a fresh one
     /// (a different device or stream can have another codec/resolution).
     pub fn reset(&self) {
-        if let Some(sink) = self.sink.borrow_mut().take() {
-            let _ = sink.pipeline.set_state(gstreamer::State::Null);
-        }
+        let old = self.sink.borrow_mut().take();
         self.picture.set_paintable(None::<&gtk4::gdk::Paintable>);
+        if let Some(sink) = old {
+            // Off the GTK thread: taking a pipeline down waits for its
+            // streaming thread, which may itself be waiting for this thread
+            // (the paintable sink hands frames over through the main loop) —
+            // done here, that is a freeze.
+            let pipeline = sink.pipeline;
+            std::thread::spawn(move || {
+                let _ = pipeline.set_state(gstreamer::State::Null);
+            });
+        }
     }
 
     pub fn ensure_sink(&self, video_type: VideoType) -> VideoSink {
