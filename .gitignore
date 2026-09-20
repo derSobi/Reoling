@@ -1,0 +1,25 @@
+# Ignore everything
+*
+
+# Let git walk into directories
+!*/
+
+# Files at the root of the project
+!/.gitignore
+!/Cargo.toml
+!/Cargo.lock
+!/LICENSE
+!/README.md
+
+# GitHub metadata (the Sponsor button)
+!/.github/
+!/.github/FUNDING.yml
+
+# The project's code
+!/src/**
+!/examples/**
+!/data/**
+
+# But not the build output
+/target/
+

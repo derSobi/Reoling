@@ -1,0 +1,45 @@
+[package]
+name = "reoling"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "AGPL-3.0-or-later"
+description = "Reoling, an unofficial Linux client for Reolink cameras, NVRs and Home Hubs over the Baichuan P2P protocol"
+repository = "https://github.com/derSobi/Reoling"
+
+[lib]
+name = "reoling"
+path = "src/lib.rs"
+
+[[bin]]
+name = "reoling"
+path = "src/main.rs"
+
+[dependencies]
+# Wire protocol
+thiserror = "1"
+quick-xml = { version = "0.31", features = ["serialize"] }
+serde = { version = "1", features = ["derive"] }
+aes = "0.8"
+cfb-mode = "0.8"
+md-5 = "0.10"
+crc32fast = "1"
+# Transport and client
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "time", "macros", "io-util"] }
+tokio-stream = "0.1"
+rand = "0.8"
+futures-util = "0.3"
+socket2 = "0.6"
+# Desktop app.
+# v4_6, not v4_10: Ubuntu 22.04 (still an LTS-supported target) ships GTK
+# 4.6 as its baseline. Bumping this feature raises the minimum GTK the
+# compiled binary can run against — only raise it if the app actually
+# needs a newer API.
+gtk4 = { version = "0.9", package = "gtk4", features = ["v4_6"] }
+glib = "0.20"
+async-channel = "2"
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
