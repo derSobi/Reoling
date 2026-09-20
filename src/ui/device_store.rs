@@ -44,11 +44,13 @@ fn path() -> PathBuf {
     glib::user_config_dir().join("reoling").join("devices.ini")
 }
 
-pub fn load() -> Vec<Device> {
+/// The saved devices and the one that was being watched last.
+pub fn load() -> (Vec<Device>, Option<String>) {
     let file = KeyFile::new();
     if file.load_from_file(path(), KeyFileFlags::NONE).is_err() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
+    let last = file.string("app", "last_device").ok().map(|s| s.to_string());
     let mut devices = Vec::new();
     for group in file.groups().iter().map(|g| g.to_string()) {
         let get = |k: &str| file.string(&group, k).ok().map(|s| s.to_string());
@@ -75,11 +77,14 @@ pub fn load() -> Vec<Device> {
             channels: Vec::new(),
         });
     }
-    devices
+    (devices, last)
 }
 
-pub fn save(devices: &[Device]) {
+pub fn save(devices: &[Device], last_device: Option<&str>) {
     let file = KeyFile::new();
+    if let Some(last) = last_device {
+        file.set_string("app", "last_device", last);
+    }
     for d in devices {
         let group = format!("device {}", d.key);
         file.set_string(&group, "name", &d.name);

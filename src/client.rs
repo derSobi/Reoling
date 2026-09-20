@@ -75,6 +75,8 @@ pub struct ReolinkClient {
     encryption: EncryptionProtocol,
     next_msg_num: u16,
     video_task: Option<tokio::task::JoinHandle<()>>,
+    /// The stream `start_video` opened, so `stop_video` can name it.
+    playing: Option<PlayingStream>,
     /// Keeps a direct (non-relay) connection alive — see
     /// `BcConnection::spawn_direct_keepalive`. `None` on a relay connection
     /// or one built via `from_connection`. Held so the handle isn't
@@ -86,6 +88,14 @@ pub struct ReolinkClient {
     /// during `identity`, while starting video, or mid-stream.
     channel_updates_tx: tokio::sync::mpsc::UnboundedSender<Vec<ChannelInfo>>,
     channel_updates_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<ChannelInfo>>>,
+}
+
+#[derive(Debug, Clone)]
+struct PlayingStream {
+    channel_id: u8,
+    handle: u32,
+    stream_name: &'static str,
+    bc_stream_type: u8,
 }
 
 /// The channel list inside a pushed `MSG_ID_CHANNEL_INFO` message, if that is
@@ -211,6 +221,7 @@ impl ReolinkClient {
             encryption,
             next_msg_num: 1,
             video_task: None,
+            playing: None,
             direct_keepalive_task: None,
             channel_updates_tx,
             channel_updates_rx: Some(channel_updates_rx),
@@ -609,6 +620,12 @@ impl ReolinkClient {
                 );
             }
         }
+        self.playing = Some(PlayingStream {
+            channel_id,
+            handle,
+            stream_name: stream_type_str,
+            bc_stream_type: bc_meta_stream_type,
+        });
         self.connection.lock().await.send_bc(&request, &self.encryption).await?;
         // Pushes (channel lists, alarm events, ...) can come between our
         // request and the answer; they are not the answer.
@@ -616,7 +633,9 @@ impl ReolinkClient {
             let bc = self.connection.lock().await.recv_bc(&self.encryption).await?;
             if let Some(channels) = pushed_channels(&bc) {
                 let _ = self.channel_updates_tx.send(channels);
-            } else if bc.meta.msg_id == MSG_ID_VIDEO {
+            } else if bc.meta.msg_id == MSG_ID_VIDEO && bc.meta.msg_num == msg_num {
+                // Same message number as our request: an earlier stream's
+                // leftover frames carry theirs.
                 break bc;
             }
         };
@@ -704,23 +723,57 @@ impl ReolinkClient {
         Ok(ReceiverStream::new(rx))
     }
 
+    /// Stops the stream `start_video` opened (or, if none is known, whatever
+    /// `channel_id` is sending), naming it the way the official app does.
     pub async fn stop_video(&mut self, channel_id: u8) -> crate::Result<()> {
         if let Some(task) = self.video_task.take() {
             task.abort();
         }
+        let playing = self.playing.take();
         let msg_num = self.next_msg_num();
+        let payload = playing.as_ref().map(|p| {
+            BcXml {
+                preview: Some(Preview {
+                    version: XML_VERSION.to_string(),
+                    channel_id: p.channel_id,
+                    handle: p.handle,
+                    stream_type: Some(p.stream_name.to_string()),
+                }),
+                ..Default::default()
+            }
+            .to_bytes()
+        });
         let request = Bc {
             meta: BcMeta {
                 msg_id: MSG_ID_VIDEO_STOP,
-                channel_id,
-                stream_type: 0,
+                channel_id: playing.as_ref().map_or(channel_id, |p| p.channel_id),
+                stream_type: playing.as_ref().map_or(0, |p| p.bc_stream_type),
                 msg_num,
                 response_code: 0,
                 class: 0x6414,
             },
-            body: BcBody::Modern(ModernMsg { extension_xml: None, payload: None }),
+            body: BcBody::Modern(ModernMsg { extension_xml: None, payload }),
         };
         self.connection.lock().await.send_bc(&request, &self.encryption).await
+    }
+
+    /// Reads whatever the device sends while no video is running (pushed
+    /// channel lists, alarm events), forwarding channel lists to
+    /// `take_channel_updates`. Returns only when the connection fails.
+    /// Cancel-safe: partial messages are kept by the connection.
+    pub async fn wait_for_pushes(&mut self) -> crate::Error {
+        loop {
+            let received = self.connection.lock().await.recv_bc(&self.encryption).await;
+            match received {
+                Ok(bc) => {
+                    if let Some(channels) = pushed_channels(&bc) {
+                        let _ = self.channel_updates_tx.send(channels);
+                    }
+                }
+                Err(Error::ReplyTimeout) => {}
+                Err(e) => return e,
+            }
+        }
     }
 
     pub async fn logout(&mut self) -> crate::Result<()> {

@@ -1,17 +1,60 @@
 use crate::ui::video_view::VideoSink;
-use reoling::{ChannelInfo, DeviceIdentity, ReolinkClient, StreamProfile, VideoType};
+use reoling::{ChannelInfo, DeviceIdentity, ReolinkClient, StreamProfile, VideoFrame, VideoType};
 use std::net::IpAddr;
 use tokio_stream::StreamExt;
 
-pub enum AppEvent {
-    LoggedIn(DeviceIdentity),
+/// What a device's connection tells the UI.
+pub enum DeviceEvent {
+    /// Logged in; carries the device's own name and model.
+    Connected(DeviceIdentity),
     /// The device (NVR / Home Hub) described its channels.
     Channels(Vec<ChannelInfo>),
-    /// A frame was pushed straight into GStreamer already. See
-    /// `spawn_connection`'s doc comment for why frames no longer travel
-    /// through this channel at all.
-    FrameDelivered,
-    Failed(String),
+    /// The requested stream's first frame reached GStreamer.
+    Playing,
+    /// The requested stream could not be started or broke off. The device
+    /// itself is still connected.
+    PlayFailed(String),
+    /// The device refused the login.
+    LoginRejected,
+    /// The device could not be reached, or the connection
+    /// died. Nothing more will come.
+    Lost(String),
+}
+
+enum Command {
+    Play { channel: u8, profile: StreamProfile },
+    Stop,
+    Shutdown,
+}
+
+/// The UI's handle on one device's connection (which lives on its own
+/// thread). Dropping it disconnects.
+pub struct DeviceLink {
+    pub events: async_channel::Receiver<DeviceEvent>,
+    commands: tokio::sync::mpsc::UnboundedSender<Command>,
+}
+
+impl DeviceLink {
+    /// Streams the channel (replacing whatever this device was streaming).
+    pub fn play(&self, channel: u8, profile: StreamProfile) {
+        let _ = self.commands.send(Command::Play { channel, profile });
+    }
+
+    /// Stops the stream; the connection stays.
+    pub fn stop(&self) {
+        let _ = self.commands.send(Command::Stop);
+    }
+
+    /// Tells the device we are leaving.
+    pub fn shutdown(&self) {
+        let _ = self.commands.send(Command::Shutdown);
+    }
+}
+
+impl Drop for DeviceLink {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 /// One connection's request for a `VideoSink`, sent to `main.rs`'s
@@ -39,54 +82,36 @@ pub enum UidTransport {
     Udp,
 }
 
-/// Spawns a dedicated tokio runtime on a background OS thread and drives the
-/// whole connect→login→start_video flow there, forwarding progress to the
-/// GTK main loop over an `async-channel` (GTK4/GLib are not thread-safe, so
-/// no widget is ever touched off the main thread).
+/// Connects and logs in to a device on a dedicated thread with its own
+/// tokio runtime, and keeps the connection up: it listens for pushes (the
+/// channel list) and streams a channel on request. GTK is never touched from
+/// there — everything reaches the UI through `DeviceLink::events`.
 ///
 /// **Video frames bypass the GTK main loop entirely** — see
-/// `.plans/reoling-baichuan-p2p-audit-2026-09-16.md` section 34. The
-/// previous design routed every frame through `AppEvent::Frame` to a
-/// `glib::spawn_future_local` task that called `VideoView::push_frame`
-/// directly on the GTK main thread, coupling live-video delivery to
-/// whatever else that thread was doing (layout, redraws, other widget
-/// updates) — exactly the dependency a live source shouldn't have.
-/// `gstreamer::Pipeline`/`AppSrc` are internally thread-safe, so this
-/// function instead asks `main.rs`'s GTK-side responder (via
-/// `sink_request_tx`) for a `VideoSink` handle once, the first time a
-/// frame's codec is known, then pushes every frame — including that
-/// first one — directly from this background thread. The GTK main thread
-/// only ever sees `AppEvent::FrameDelivered { bytes }` afterward, for the
-/// status label, not the frame data itself.
-///
-/// The returned `Notify` lets the caller (`main.rs`'s window-close handler)
-/// ask this background task to disconnect promptly instead of just being
-/// dropped — see `ReolinkClient::disconnect`'s doc comment for why that
-/// matters: without it, the device kept streaming to us until its own idle
-/// timeout, because nothing ever told it we were leaving.
-pub fn spawn_connection(
+/// `.plans/reoling-baichuan-p2p-audit-2026-09-16.md` section 34. Routing
+/// every frame through a `glib` task coupled live video to whatever else the
+/// GTK thread was doing. `gstreamer::Pipeline`/`AppSrc` are thread-safe, so
+/// this thread asks `main_window`'s responder (via `sink_request_tx`) for a
+/// `VideoSink` once per stream, when the first frame shows its codec, then
+/// pushes every frame itself. The UI only hears `Playing`.
+pub fn spawn_device(
     target: ConnectTarget,
     username: String,
     password: String,
-    channel_id: u8,
-    quality: StreamProfile,
     uid_transport: UidTransport,
     sink_request_tx: tokio::sync::mpsc::Sender<SinkRequest>,
-) -> (async_channel::Receiver<AppEvent>, std::sync::Arc<tokio::sync::Notify>) {
+) -> DeviceLink {
     let (tx, rx) = async_channel::unbounded();
-    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-    let shutdown_bg = shutdown.clone();
+    let (commands, mut command_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
 
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
         runtime.block_on(async move {
             let connect_result = match target {
-                // `Udp` (the default) is the plain UDP/P2P session — the
-                // only path the real app targets. `PreferTcp` exists only
-                // for diagnostic A/B testing against the UDP path on real
-                // hardware (`--prefer-tcp`, see `main.rs`); it is never
-                // the default and never should be — the official Reolink
-                // app never uses TCP for the BC protocol.
+                // `Udp` is the plain UDP/P2P session, the only path the real
+                // app targets. `PreferTcp` is diagnostic-only
+                // (`--prefer-tcp`, see `main.rs`); the official Reolink app
+                // never uses TCP for the BC protocol.
                 ConnectTarget::Uid(uid) => match uid_transport {
                     UidTransport::PreferTcp => ReolinkClient::connect_by_uid_prefer_tcp(&uid).await,
                     UidTransport::Udp => ReolinkClient::connect_by_uid(&uid).await,
@@ -96,13 +121,20 @@ pub fn spawn_connection(
             let mut client = match connect_result {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Failed(e.to_string())).await;
+                    let _ = tx.send(DeviceEvent::Lost(e.to_string())).await;
                     return;
                 }
             };
-            if let Err(e) = client.login(&username, &password).await {
-                let _ = tx.send(AppEvent::Failed(e.to_string())).await;
-                return;
+            match client.login(&username, &password).await {
+                Ok(_) => {}
+                Err(reoling::Error::LoginFailed { .. }) => {
+                    let _ = tx.send(DeviceEvent::LoginRejected).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(DeviceEvent::Lost(e.to_string())).await;
+                    return;
+                }
             }
             let mut channel_updates =
                 client.take_channel_updates().expect("taken once per client");
@@ -110,64 +142,83 @@ pub fn spawn_connection(
             if std::env::var("REOLING_PROBE_PUSH").is_ok() {
                 client.probe_pushes().await;
             }
-            let _ = tx.send(AppEvent::LoggedIn(identity)).await;
+            let _ = tx.send(DeviceEvent::Connected(identity)).await;
 
-            let mut frames = match client.start_video(channel_id, quality).await {
-                Ok(f) => f,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Failed(e.to_string())).await;
-                    return;
-                }
-            };
-
-            // Requested lazily from the first frame (its codec is what
-            // ensure_sink needs) and reused for every frame after —
-            // exactly the same lazy-build-once semantics `VideoView` used
-            // to implement internally, just with the request now crossing
-            // a thread boundary once instead of every call happening on
-            // the GTK thread.
+            let mut frames: Option<tokio_stream::wrappers::ReceiverStream<reoling::Result<VideoFrame>>> =
+                None;
             let mut sink: Option<VideoSink> = None;
+            let mut announced = false;
+            let mut channel = 0u8;
 
             loop {
                 tokio::select! {
-                    frame = frames.next() => {
-                        match frame {
-                            Some(Ok(frame)) => {
-                                if sink.is_none() {
-                                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                                    if sink_request_tx.send((frame.video_type, reply_tx)).await.is_err() {
-                                        break; // GTK side gone
-                                    }
-                                    let Ok(built) = reply_rx.await else {
-                                        break; // GTK side gone before replying
-                                    };
-                                    sink = Some(built);
-                                }
-                                sink.as_ref().unwrap().push_frame(&frame);
-                                if tx.send(AppEvent::FrameDelivered).await.is_err() {
-                                    break; // UI side dropped the receiver (window closed)
+                    command = command_rx.recv() => match command {
+                        Some(Command::Play { channel: wanted, profile }) => {
+                            if frames.take().is_some() {
+                                let _ = client.stop_video(channel).await;
+                            }
+                            channel = wanted;
+                            sink = None;
+                            announced = false;
+                            match client.start_video(channel, profile).await {
+                                Ok(f) => frames = Some(f),
+                                Err(e) => {
+                                    let _ = tx.send(DeviceEvent::PlayFailed(e.to_string())).await;
                                 }
                             }
-                            Some(Err(e)) => {
-                                let _ = tx.send(AppEvent::Failed(e.to_string())).await;
-                                break;
-                            }
-                            None => break, // stream ended
                         }
-                    }
+                        Some(Command::Stop) => {
+                            if frames.take().is_some() {
+                                let _ = client.stop_video(channel).await;
+                            }
+                        }
+                        Some(Command::Shutdown) | None => break,
+                    },
                     Some(channels) = channel_updates.recv() => {
-                        if tx.send(AppEvent::Channels(channels)).await.is_err() {
+                        if tx.send(DeviceEvent::Channels(channels)).await.is_err() {
                             break;
                         }
                     }
-                    _ = shutdown_bg.notified() => break,
+                    frame = async {
+                        match frames.as_mut() {
+                            Some(f) => f.next().await,
+                            None => std::future::pending().await,
+                        }
+                    } => match frame {
+                        Some(Ok(frame)) => {
+                            if sink.is_none() {
+                                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                                if sink_request_tx.send((frame.video_type, reply_tx)).await.is_err() {
+                                    break; // GTK side gone
+                                }
+                                let Ok(built) = reply_rx.await else { break };
+                                sink = Some(built);
+                            }
+                            sink.as_ref().expect("just built").push_frame(&frame);
+                            if !announced {
+                                announced = true;
+                                if tx.send(DeviceEvent::Playing).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            frames = None;
+                            let _ = tx.send(DeviceEvent::PlayFailed(e.to_string())).await;
+                        }
+                        None => frames = None,
+                    },
+                    error = client.wait_for_pushes(), if frames.is_none() => {
+                        let _ = tx.send(DeviceEvent::Lost(error.to_string())).await;
+                        break;
+                    }
                 }
             }
-            // Every exit path above ends the session — tell the device
-            // before this task (and the client with it) goes away.
+            // Every exit path ends the session — tell the device before
+            // this task (and the client with it) goes away.
             client.disconnect().await;
         });
     });
 
-    (rx, shutdown)
+    DeviceLink { events: rx, commands }
 }

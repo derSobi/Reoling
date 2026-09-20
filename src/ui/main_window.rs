@@ -1,11 +1,11 @@
 //! The application window: a device sidebar next to a live-view page, with a
 //! playback page reserved behind the header's view switcher.
 
-use crate::ui::bridge::{spawn_connection, AppEvent, SinkRequest, UidTransport};
+use crate::ui::bridge::{spawn_device, DeviceEvent, DeviceLink, SinkRequest, UidTransport};
 use crate::ui::device_store::{self, Device};
 use crate::ui::sidebar::{Handlers, Sidebar, Status};
-use crate::ui::{dialogs, secrets};
 use crate::ui::video_view::VideoView;
+use crate::ui::{dialogs, secrets};
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Button, DropDown, EventControllerKey,
@@ -14,19 +14,23 @@ use gtk4::{
 };
 use reoling::{looks_multi_channel, StreamProfile};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Notify;
 
-/// How long the window-close and signal handlers give the network thread to
-/// get the disconnect packet out before the process goes away.
+/// How long the window-close and signal handlers give the network threads to
+/// get the disconnect packets out before the process goes away.
+/// Space to the left of the logo, matching what the header leaves above and
+/// below it.
+const LOGO_MARGIN: i32 = 5;
+
 const DISCONNECT_GRACE: Duration = Duration::from_millis(200);
 
-struct Active {
-    key: String,
-    shutdown: Arc<Notify>,
+/// A device's live connection. `id` tells a replaced connection's late events
+/// apart from the current one's.
+struct Link {
+    id: u64,
+    link: DeviceLink,
 }
 
 pub struct MainWindow {
@@ -42,8 +46,9 @@ pub struct MainWindow {
     stop: Button,
     previous: Button,
     next: Button,
+    /// Whether the picture on screen is really flowing.
     streaming: Cell<bool>,
-    /// The stream the user prefers, and the ones the current device offers
+    /// The stream the user prefers, and the ones the watched device offers
     /// (what the dropdown lists, in the same order).
     profile: Cell<StreamProfile>,
     stream_options: RefCell<Vec<StreamProfile>>,
@@ -51,10 +56,19 @@ pub struct MainWindow {
 
     devices: RefCell<Vec<Device>>,
     passwords: RefCell<HashMap<String, String>>,
-    /// Device whose password should go into the keyring once login succeeds.
-    save_on_login: RefCell<Option<String>>,
-    active: RefCell<Option<Active>>,
-    generation: Cell<u64>,
+    /// Devices whose password goes into the keyring once they log in.
+    remember: RefCell<HashSet<String>>,
+    /// Every device is connected all the time; streaming is separate.
+    links: RefCell<HashMap<String, Link>>,
+    /// The devices that have logged in on their current link.
+    connected: RefCell<HashSet<String>>,
+    next_link_id: Cell<u64>,
+    /// The device being watched, and the one to watch as soon as it is
+    /// connected.
+    playing: RefCell<Option<String>>,
+    autoplay: RefCell<Option<String>>,
+    /// Restored on the next start.
+    last_played: RefCell<Option<String>>,
     uid_transport: UidTransport,
     sink_request_tx: tokio::sync::mpsc::Sender<SinkRequest>,
 }
@@ -101,10 +115,10 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         let w_channel = w.clone();
         let sidebar = Sidebar::new(Handlers {
             on_add: Box::new(on(MainWindow::add_device_dialog)),
-            on_select: Box::new(with_key(MainWindow::select)),
+            on_select: Box::new(with_key(MainWindow::activate)),
             on_channel: Box::new(move |key, channel| {
                 if let Some(m) = w_channel.upgrade() {
-                    m.channel_changed(key, channel)
+                    m.pick_channel(key, channel)
                 }
             }),
             on_relogin: Box::new(with_key(MainWindow::relogin)),
@@ -115,6 +129,8 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         let brand = GtkBox::new(Orientation::Horizontal, 8);
         let logo = Image::from_icon_name("de.dersobi.reoling");
         logo.set_pixel_size(24);
+        // The header centres it vertically; give it as much room on the left.
+        logo.set_margin_start(LOGO_MARGIN);
         let brand_name = Label::new(Some("Reoling"));
         brand_name.add_css_class("heading");
         brand.append(&logo);
@@ -237,8 +253,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         let w = weak.clone();
         stop.connect_clicked(move |_| {
             if let Some(m) = w.upgrade() {
-                m.stop_session();
-                m.show_message("Stopped");
+                m.stop();
             }
         });
         let w = weak.clone();
@@ -251,8 +266,8 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
                 if let Some(profile) = chosen {
                     m.profile.set(profile);
                 }
-                if let Some(key) = m.active_key() {
-                    m.start_session(&key);
+                if let Some(key) = m.playing_key() {
+                    m.play(&key);
                 }
             }
         });
@@ -311,7 +326,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         let w = weak.clone();
         window.connect_close_request(move |_| {
             if let Some(m) = w.upgrade() {
-                m.shutdown_active(true);
+                m.shutdown_all();
             }
             glib::Propagation::Proceed
         });
@@ -336,20 +351,33 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             refreshing_streams: Cell::new(false),
             devices: RefCell::new(Vec::new()),
             passwords: RefCell::new(HashMap::new()),
-            save_on_login: RefCell::new(None),
-            active: RefCell::new(None),
-            generation: Cell::new(0),
+            remember: RefCell::new(HashSet::new()),
+            links: RefCell::new(HashMap::new()),
+            connected: RefCell::new(HashSet::new()),
+            next_link_id: Cell::new(1),
+            playing: RefCell::new(None),
+            autoplay: RefCell::new(None),
+            last_played: RefCell::new(None),
             uid_transport,
             sink_request_tx,
         }
     });
 
-    for device in device_store::load() {
+    let (devices, last) = device_store::load();
+    *main.last_played.borrow_mut() = last.clone();
+    *main.autoplay.borrow_mut() = last;
+    for device in devices {
         main.sidebar.add_device(&device);
         main.devices.borrow_mut().push(device);
     }
-    if !main.devices.borrow().is_empty() {
+    if main.devices.borrow().is_empty() {
+        main.show_message("Add a device to start");
+    } else {
         main.show_message("Select a device");
+    }
+    let keys: Vec<String> = main.devices.borrow().iter().map(|d| d.key.clone()).collect();
+    for key in keys {
+        main.connect(&key, false);
     }
 
     // SIGINT/SIGTERM bypass the close-request signal; disconnect and quit.
@@ -357,7 +385,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         let m = Rc::clone(&main);
         let app = app.clone();
         glib::source::unix_signal_add_local(signum, move || {
-            m.shutdown_active(true);
+            m.shutdown_all();
             app.quit();
             glib::ControlFlow::Break
         });
@@ -381,16 +409,45 @@ fn sidebar_icon() -> &'static str {
 }
 
 impl MainWindow {
-    fn quality(&self) -> StreamProfile {
-        self.profile.get()
+    fn show_message(&self, text: &str) {
+        self.message.set_text(text);
+        self.message.set_visible(true);
     }
 
-    /// Lists in the dropdown the streams the current device/channel offers.
+    fn device(&self, key: &str) -> Option<Device> {
+        self.devices.borrow().iter().find(|d| d.key == key).cloned()
+    }
+
+    fn persist(&self) {
+        device_store::save(&self.devices.borrow(), self.last_played.borrow().as_deref());
+    }
+
+    fn playing_key(&self) -> Option<String> {
+        self.playing.borrow().clone()
+    }
+
+    fn set_fullscreen(&self, on: bool) {
+        if on {
+            self.window.fullscreen();
+        } else {
+            self.window.unfullscreen();
+        }
+        self.header.set_visible(!on);
+        self.bars.set_visible(!on);
+        self.sidebar.widget().set_visible(!on && self.sidebar_toggle.is_active());
+        self.fullscreen_button.set_icon_name(if on {
+            "view-restore-symbolic"
+        } else {
+            "view-fullscreen-symbolic"
+        });
+    }
+
+    /// Lists in the dropdown the streams the watched device/channel offers.
     /// Keeps the preferred stream if it is offered, else falls back to the
     /// lightest one. Returns whether the stream in use changed.
     fn refresh_streams(&self) -> bool {
         let offered = self
-            .active_key()
+            .playing_key()
             .and_then(|k| self.device(&k))
             .and_then(|d| d.channels.into_iter().find(|c| c.channel_id == d.channel))
             .map(|c| c.streams)
@@ -416,29 +473,19 @@ impl MainWindow {
         chosen != before
     }
 
-    fn active_key(&self) -> Option<String> {
-        self.active.borrow().as_ref().map(|a| a.key.clone())
-    }
-
-    fn show_message(&self, text: &str) {
-        self.message.set_text(text);
-        self.message.set_visible(true);
-    }
-
-    fn set_fullscreen(&self, on: bool) {
-        if on {
-            self.window.fullscreen();
-        } else {
-            self.window.unfullscreen();
-        }
-        self.header.set_visible(!on);
-        self.bars.set_visible(!on);
-        self.sidebar.widget().set_visible(!on && self.sidebar_toggle.is_active());
-        self.fullscreen_button.set_icon_name(if on {
-            "view-restore-symbolic"
-        } else {
-            "view-fullscreen-symbolic"
-        });
+    /// Controls that only make sense while watching, or with a multi-camera
+    /// device (NVR / Home Hub), follow the current state.
+    fn update_controls(&self) {
+        let playing = self.playing_key();
+        let multi = playing
+            .as_deref()
+            .and_then(|k| self.device(k))
+            .map(|d| d.multi_channel)
+            .unwrap_or(false);
+        self.stop.set_sensitive(playing.is_some());
+        self.stream.set_sensitive(self.streaming.get());
+        self.previous.set_sensitive(multi);
+        self.next.set_sensitive(multi);
     }
 
     fn add_device_dialog(self: &Rc<Self>) {
@@ -447,41 +494,9 @@ impl MainWindow {
             let device = Device::new(target);
             this.sidebar.add_device(&device);
             this.devices.borrow_mut().push(device.clone());
-            device_store::save(&this.devices.borrow());
-            this.select(&device.key);
+            this.persist();
+            this.activate(&device.key);
         });
-    }
-
-    fn device(&self, key: &str) -> Option<Device> {
-        self.devices.borrow().iter().find(|d| d.key == key).cloned()
-    }
-
-    /// Click on a card: connect with the remembered password, the keyring's,
-    /// or ask for the login.
-    fn select(self: &Rc<Self>, key: &str) {
-        let Some(device) = self.device(key) else { return };
-        self.sidebar.select(key);
-        if self.passwords.borrow().contains_key(key) {
-            self.start_session(key);
-            return;
-        }
-        let this = Rc::clone(self);
-        let key = key.to_string();
-        glib::spawn_future_local(async move {
-            match secrets::lookup(key.clone()).await {
-                Some(password) => {
-                    this.passwords.borrow_mut().insert(key.clone(), password);
-                    this.start_session(&key);
-                }
-                None => this.ask_login(device),
-            }
-        });
-    }
-
-    fn relogin(self: &Rc<Self>, key: &str) {
-        if let Some(device) = self.device(key) {
-            self.ask_login(device);
-        }
     }
 
     fn ask_login(self: &Rc<Self>, device: Device) {
@@ -495,99 +510,142 @@ impl MainWindow {
                 if let Some(d) = this.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
                     d.username = username;
                 }
-                device_store::save(&this.devices.borrow());
+                this.persist();
                 this.passwords.borrow_mut().insert(key.clone(), password);
                 if remember {
-                    *this.save_on_login.borrow_mut() = Some(key.clone());
+                    this.remember.borrow_mut().insert(key.clone());
                 } else {
                     glib::spawn_future_local(secrets::forget(key.clone()));
                 }
-                this.start_session(&key);
+                this.links.borrow_mut().remove(&key);
+                this.connected.borrow_mut().remove(&key);
+                *this.autoplay.borrow_mut() = Some(key.clone());
+                this.connect(&key, true);
             },
         );
     }
 
-    fn remove(self: &Rc<Self>, key: &str) {
-        if self.active_key().as_deref() == Some(key) {
-            self.stop_session();
-            self.show_message("Select a device");
-        }
-        self.sidebar.remove_device(key);
-        self.devices.borrow_mut().retain(|d| d.key != key);
-        device_store::save(&self.devices.borrow());
-        self.passwords.borrow_mut().remove(key);
-        glib::spawn_future_local(secrets::forget(key.to_string()));
-    }
-
-    fn channel_changed(self: &Rc<Self>, key: &str, channel: u8) {
-        if let Some(d) = self.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
-            d.channel = channel;
-        }
-        device_store::save(&self.devices.borrow());
-        if self.active_key().as_deref() == Some(key) {
-            self.refresh_streams();
-            self.start_session(key);
+    fn relogin(self: &Rc<Self>, key: &str) {
+        if let Some(device) = self.device(key) {
+            self.ask_login(device);
         }
     }
 
-    fn step_channel(&self, delta: i16) {
-        let Some(key) = self.active_key() else { return };
-        let Some(device) = self.device(&key) else { return };
-        let next = (i16::from(device.channel) + delta).clamp(0, 255) as u8;
-        self.sidebar.set_channel(&key, next);
-    }
-
-    /// Ends the current session (if any): tells the device we are leaving and
-    /// drops the pipeline. Events from it are ignored from then on.
-    fn stop_session(&self) {
-        self.generation.set(self.generation.get() + 1);
-        self.streaming.set(false);
-        if let Some(active) = self.active.borrow_mut().take() {
-            active.shutdown.notify_one();
-            self.sidebar.set_status(&active.key, &Status::Idle);
+    /// Opens the device's connection (login, name, channels) without
+    /// streaming anything. With `interactive`, asks for the login when no
+    /// password is known.
+    fn connect(self: &Rc<Self>, key: &str, interactive: bool) {
+        if self.links.borrow().contains_key(key) {
+            return;
         }
-        self.video.reset();
-        self.update_controls();
-    }
-
-    /// Controls that only make sense with a session, or with a multi-camera
-    /// device (NVR / Home Hub), follow the current state.
-    fn update_controls(&self) {
-        let active = self.active_key();
-        let multi = active
-            .as_deref()
-            .and_then(|k| self.device(k))
-            .map(|d| d.multi_channel)
-            .unwrap_or(false);
-        self.stop.set_sensitive(active.is_some());
-        self.stream.set_sensitive(self.streaming.get());
-        self.previous.set_sensitive(multi);
-        self.next.set_sensitive(multi);
-    }
-
-    /// Takes the channel list the device pushed. Several channels means an
-    /// NVR / Home Hub whatever its model string says. Returns whether the
-    /// stream to play changed (the caller then restarts the session).
-    fn apply_channels(&self, key: &str, channels: Vec<reoling::ChannelInfo>) -> bool {
-        if let Some(d) = self.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
-            if channels.len() > 1 {
-                d.multi_channel = true;
+        let Some(device) = self.device(key) else { return };
+        self.sidebar.set_status(key, &Status::Connecting);
+        let this = Rc::clone(self);
+        let key = key.to_string();
+        glib::spawn_future_local(async move {
+            let cached = this.passwords.borrow().get(&key).cloned();
+            let password = match cached {
+                Some(p) => Some(p),
+                None => secrets::lookup(key.clone()).await,
+            };
+            let Some(password) = password else {
+                this.sidebar.set_status(&key, &Status::LoginNeeded("No saved password".into()));
+                if interactive {
+                    this.ask_login(device);
+                }
+                return;
+            };
+            if this.links.borrow().contains_key(&key) || this.device(&key).is_none() {
+                return; // connected or removed while the keyring answered
             }
-            d.channels = channels;
+            this.passwords.borrow_mut().insert(key.clone(), password.clone());
+            let link = spawn_device(
+                device.target.clone(),
+                device.username.clone(),
+                password,
+                this.uid_transport,
+                this.sink_request_tx.clone(),
+            );
+            let events = link.events.clone();
+            let id = this.next_link_id.get();
+            this.next_link_id.set(id + 1);
+            this.links.borrow_mut().insert(key.clone(), Link { id, link });
+            while let Ok(event) = events.recv().await {
+                if this.links.borrow().get(&key).map(|l| l.id) != Some(id) {
+                    break; // replaced or removed
+                }
+                this.on_event(&key, event);
+            }
+        });
+    }
+
+    fn on_event(self: &Rc<Self>, key: &str, event: DeviceEvent) {
+        match event {
+            DeviceEvent::Connected(identity) => {
+                self.connected.borrow_mut().insert(key.to_string());
+                self.sidebar.set_status(key, &Status::Connected);
+                self.apply_identity(key, &identity);
+                if self.remember.borrow_mut().remove(key) {
+                    let password = self.passwords.borrow().get(key).cloned();
+                    let name = self.device(key).map(|d| d.name).unwrap_or_default();
+                    if let Some(password) = password {
+                        glib::spawn_future_local(secrets::store(key.to_string(), name, password));
+                    }
+                }
+                if self.autoplay.borrow().as_deref() == Some(key) {
+                    self.autoplay.borrow_mut().take();
+                    self.play(key);
+                }
+            }
+            DeviceEvent::Channels(channels) => {
+                self.apply_channels(key, channels);
+                if self.playing_key().as_deref() == Some(key) && self.refresh_streams() {
+                    self.play(key); // the stream we started is not on offer
+                }
+            }
+            DeviceEvent::Playing => {
+                if self.playing_key().as_deref() == Some(key) {
+                    self.message.set_visible(false);
+                    self.streaming.set(true);
+                    self.update_controls();
+                }
+            }
+            DeviceEvent::PlayFailed(reason) => {
+                if self.playing_key().as_deref() == Some(key) {
+                    self.streaming.set(false);
+                    self.show_message(&reason);
+                    self.update_controls();
+                }
+            }
+            DeviceEvent::LoginRejected => {
+                self.links.borrow_mut().remove(key);
+                self.connected.borrow_mut().remove(key);
+                self.passwords.borrow_mut().remove(key);
+                glib::spawn_future_local(secrets::forget(key.to_string()));
+                self.sidebar.set_status(key, &Status::LoginNeeded("Incorrect password".into()));
+                self.lost_playing(key, "Incorrect password");
+            }
+            DeviceEvent::Lost(reason) => {
+                self.links.borrow_mut().remove(key);
+                self.connected.borrow_mut().remove(key);
+                self.sidebar.set_status(key, &Status::Failed(reason.clone()));
+                self.lost_playing(key, &reason);
+            }
         }
-        if let Some(d) = self.device(key) {
-            self.sidebar.set_channels(key, &d.channels, d.channel);
+    }
+
+    fn lost_playing(&self, key: &str, reason: &str) {
+        if self.playing_key().as_deref() == Some(key) {
+            *self.playing.borrow_mut() = None;
+            self.streaming.set(false);
+            self.video.reset();
+            self.show_message(reason);
+            self.update_controls();
         }
-        device_store::save(&self.devices.borrow());
-        let stream_changed = self.refresh_streams();
-        self.update_controls();
-        stream_changed
     }
 
     /// Takes the device's own name and kind once it has told us.
-    /// Returns whether the stream to play changed as a result (the caller
-    /// then restarts the session).
-    fn apply_identity(&self, key: &str, identity: &reoling::DeviceIdentity) -> bool {
+    fn apply_identity(&self, key: &str, identity: &reoling::DeviceIdentity) {
         let text = |s: &Option<String>| s.clone().unwrap_or_default().trim().to_string();
         let (name, model) = (text(&identity.name), text(&identity.model));
         let multi = looks_multi_channel(&name, &model);
@@ -602,100 +660,127 @@ impl MainWindow {
         if !name.is_empty() {
             self.sidebar.set_name(key, &name);
         }
-        device_store::save(&self.devices.borrow());
-        let stream_changed = self.refresh_streams();
+        self.persist();
         self.update_controls();
-        stream_changed
     }
 
-    fn shutdown_active(&self, wait: bool) {
-        if let Some(active) = self.active.borrow().as_ref() {
-            active.shutdown.notify_one();
-            if wait {
-                std::thread::sleep(DISCONNECT_GRACE);
+    /// Takes the channel list the device pushed. Several channels means an
+    /// NVR / Home Hub whatever its model string says.
+    fn apply_channels(self: &Rc<Self>, key: &str, channels: Vec<reoling::ChannelInfo>) {
+        if let Some(d) = self.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
+            if channels.len() > 1 {
+                d.multi_channel = true;
             }
+            d.channels = channels;
+        }
+        if let Some(d) = self.device(key) {
+            self.sidebar.set_channels(key, &d.channels, d.channel);
+        }
+        self.persist();
+        self.update_controls();
+    }
+
+    /// A click on a device's card: watch it (connecting first if need be).
+    fn activate(self: &Rc<Self>, key: &str) {
+        if self.device(key).is_none() {
+            return;
+        }
+        if self.connected.borrow().contains(key) {
+            self.play(key);
+        } else {
+            *self.autoplay.borrow_mut() = Some(key.to_string());
+            self.connect(key, true);
         }
     }
 
-    fn start_session(self: &Rc<Self>, key: &str) {
-        self.stop_session();
+    /// A click on one of a device's channels.
+    fn pick_channel(self: &Rc<Self>, key: &str, channel: u8) {
+        if let Some(d) = self.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
+            d.channel = channel;
+        }
+        self.persist();
+        self.activate(key);
+    }
+
+    /// Streams the device's current channel, stopping whatever else was on.
+    fn play(self: &Rc<Self>, key: &str) {
         let Some(device) = self.device(key) else { return };
-        let Some(password) = self.passwords.borrow().get(key).cloned() else { return };
-
-        let generation = self.generation.get();
+        let other = self.playing_key().filter(|k| k != key);
+        if let Some(other) = other {
+            if let Some(l) = self.links.borrow().get(&other) {
+                l.link.stop();
+            }
+        }
+        self.video.reset();
+        *self.playing.borrow_mut() = Some(key.to_string());
+        *self.last_played.borrow_mut() = Some(key.to_string());
+        self.streaming.set(false);
+        self.refresh_streams();
+        self.persist();
         self.sidebar.select(key);
-        self.sidebar.set_status(key, &Status::Connecting);
-        self.show_message("Connecting…");
-
-        let (receiver, shutdown) = spawn_connection(
-            device.target.clone(),
-            device.username.clone(),
-            password.clone(),
-            device.channel,
-            self.quality(),
-            self.uid_transport,
-            self.sink_request_tx.clone(),
-        );
-        *self.active.borrow_mut() = Some(Active { key: key.to_string(), shutdown });
+        self.sidebar.mark_channel(key, device.channel);
+        self.show_message("Starting…");
+        if let Some(l) = self.links.borrow().get(key) {
+            l.link.play(device.channel, self.profile.get());
+        }
         self.update_controls();
+    }
 
-        let this = Rc::clone(self);
-        let key = key.to_string();
-        glib::spawn_future_local(async move {
-            let mut failed = false;
-            while let Ok(event) = receiver.recv().await {
-                if this.generation.get() != generation {
-                    return;
-                }
-                match event {
-                    AppEvent::LoggedIn(identity) => {
-                        if this.apply_identity(&key, &identity) {
-                            // The stream we started is not one this device
-                            // offers; begin again on one it does.
-                            this.start_session(&key);
-                            return;
-                        }
-                        this.sidebar.set_status(&key, &Status::Connected);
-                        this.show_message("Starting video…");
-                        if this.save_on_login.borrow().as_deref() == Some(key.as_str()) {
-                            this.save_on_login.borrow_mut().take();
-                            let name =
-                                this.device(&key).map(|d| d.name).unwrap_or_default();
-                            glib::spawn_future_local(secrets::store(
-                                key.clone(),
-                                name,
-                                password.clone(),
-                            ));
-                        }
-                    }
-                    AppEvent::Channels(channels) => {
-                        if this.apply_channels(&key, channels) {
-                            this.start_session(&key);
-                            return;
-                        }
-                    }
-                    // Frames already went straight into GStreamer; this only
-                    // tells us the first one arrived.
-                    AppEvent::FrameDelivered => {
-                        if this.message.is_visible() {
-                            this.message.set_visible(false);
-                            this.streaming.set(true);
-                            this.update_controls();
-                        }
-                    }
-                    AppEvent::Failed(reason) => {
-                        failed = true;
-                        // A rejected password must not be reused silently.
-                        this.passwords.borrow_mut().remove(&key);
-                        this.sidebar.set_status(&key, &Status::Failed(reason.clone()));
-                        this.show_message(&reason);
-                    }
-                }
+    /// The stop button: stops the stream and forgets it as the one to
+    /// restore on the next start.
+    fn stop(&self) {
+        if let Some(key) = self.playing_key() {
+            if let Some(l) = self.links.borrow().get(&key) {
+                l.link.stop();
             }
-            if this.generation.get() == generation && !failed {
-                this.sidebar.set_status(&key, &Status::Idle);
-                this.show_message("Stream ended");
-            }
-        });
+        }
+        *self.playing.borrow_mut() = None;
+        *self.last_played.borrow_mut() = None;
+        self.streaming.set(false);
+        self.video.reset();
+        self.show_message("Stopped");
+        self.persist();
+        self.update_controls();
+    }
+
+    fn step_channel(self: &Rc<Self>, delta: i32) {
+        let Some(key) = self.playing_key() else { return };
+        let Some(device) = self.device(&key) else { return };
+        let ids: Vec<u8> = device.channels.iter().filter(|c| c.online).map(|c| c.channel_id).collect();
+        let Some(index) = ids.iter().position(|c| *c == device.channel) else { return };
+        let next = (index as i32 + delta).rem_euclid(ids.len() as i32) as usize;
+        self.pick_channel(&key, ids[next]);
+    }
+
+    fn remove(self: &Rc<Self>, key: &str) {
+        if self.playing_key().as_deref() == Some(key) {
+            *self.playing.borrow_mut() = None;
+            self.streaming.set(false);
+            self.video.reset();
+            self.show_message("Select a device");
+            self.update_controls();
+        }
+        if self.last_played.borrow().as_deref() == Some(key) {
+            *self.last_played.borrow_mut() = None;
+        }
+        self.links.borrow_mut().remove(key); // dropping the link disconnects
+        self.connected.borrow_mut().remove(key);
+        self.sidebar.remove_device(key);
+        self.devices.borrow_mut().retain(|d| d.key != key);
+        self.persist();
+        self.passwords.borrow_mut().remove(key);
+        glib::spawn_future_local(secrets::forget(key.to_string()));
+    }
+
+    /// Tells every device we are leaving; the threads need a moment to get
+    /// the packets out before the process exits.
+    fn shutdown_all(&self) {
+        let links = self.links.borrow();
+        for l in links.values() {
+            l.link.shutdown();
+        }
+        if !links.is_empty() {
+            std::thread::sleep(DISCONNECT_GRACE);
+        }
     }
 }

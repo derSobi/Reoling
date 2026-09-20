@@ -376,7 +376,7 @@ impl BcConnection {
 
         tokio::time::timeout(RECV_TIMEOUT, self.recv_bc_loop(enc))
             .await
-            .map_err(|_| Error::ProtocolError("timed out waiting for a reply".to_string()))?
+            .map_err(|_| Error::ReplyTimeout)?
     }
 
     async fn recv_bc_loop(&mut self, enc: &EncryptionProtocol) -> crate::Result<Bc> {
