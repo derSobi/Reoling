@@ -341,6 +341,15 @@ impl VideoView {
     /// exists rather than rebuilding (matches this file's prior
     /// lazy-build-once behavior; a mid-session codec change was never
     /// supported before this either).
+    /// Tears the pipeline down so the next `ensure_sink` builds a fresh one
+    /// (a different device or stream can have another codec/resolution).
+    pub fn reset(&self) {
+        if let Some(sink) = self.sink.borrow_mut().take() {
+            let _ = sink.pipeline.set_state(gstreamer::State::Null);
+        }
+        self.picture.set_paintable(None::<&gtk4::gdk::Paintable>);
+    }
+
     pub fn ensure_sink(&self, video_type: VideoType) -> VideoSink {
         if self.sink.borrow().is_none() {
             let sink = self.build_sink(video_type);

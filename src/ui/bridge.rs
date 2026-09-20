@@ -1,15 +1,14 @@
 use crate::ui::video_view::VideoSink;
-use reoling::{DeviceInfoSummary, ReolinkClient, StreamQuality, VideoType};
+use reoling::{ReolinkClient, StreamQuality, VideoType};
 use std::net::IpAddr;
 use tokio_stream::StreamExt;
 
 pub enum AppEvent {
-    LoggedIn(DeviceInfoSummary),
-    /// A frame was pushed straight into GStreamer already — this carries
-    /// only its byte size, for the status label, not the frame itself.
-    /// See `spawn_connection`'s doc comment for why frames no longer
-    /// travel through this channel at all.
-    FrameDelivered { bytes: usize },
+    LoggedIn,
+    /// A frame was pushed straight into GStreamer already. See
+    /// `spawn_connection`'s doc comment for why frames no longer travel
+    /// through this channel at all.
+    FrameDelivered,
     Failed(String),
 }
 
@@ -21,6 +20,7 @@ pub type SinkRequest = (VideoType, tokio::sync::oneshot::Sender<VideoSink>);
 
 /// How the user chose to reach the device — set by the explicit UID/IP
 /// toggle in the connect dialog, never inferred or auto-detected.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectTarget {
     Uid(String),
     Ip { addr: IpAddr, port: u16 },
@@ -98,14 +98,11 @@ pub fn spawn_connection(
                     return;
                 }
             };
-            let device_info = match client.login(&username, &password).await {
-                Ok(info) => info,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Failed(e.to_string())).await;
-                    return;
-                }
-            };
-            let _ = tx.send(AppEvent::LoggedIn(device_info)).await;
+            if let Err(e) = client.login(&username, &password).await {
+                let _ = tx.send(AppEvent::Failed(e.to_string())).await;
+                return;
+            }
+            let _ = tx.send(AppEvent::LoggedIn).await;
 
             let mut frames = match client.start_video(channel_id, quality).await {
                 Ok(f) => f,
@@ -138,9 +135,8 @@ pub fn spawn_connection(
                                     };
                                     sink = Some(built);
                                 }
-                                let bytes = frame.data.len();
                                 sink.as_ref().unwrap().push_frame(&frame);
-                                if tx.send(AppEvent::FrameDelivered { bytes }).await.is_err() {
+                                if tx.send(AppEvent::FrameDelivered).await.is_err() {
                                     break; // UI side dropped the receiver (window closed)
                                 }
                             }
