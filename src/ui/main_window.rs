@@ -281,7 +281,9 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
                     m.profile.set(profile);
                 }
                 if let Some(key) = m.playing_key() {
-                    m.play(&key);
+                    // Not from inside the dropdown's own handler: its popup
+                    // is still closing.
+                    glib::idle_add_local_once(move || m.play(&key));
                 }
             }
         });
@@ -478,11 +480,21 @@ impl MainWindow {
             StreamProfile::Extern => "Extern stream",
             StreamProfile::Sub => "Sub stream",
         };
-        self.refreshing_streams.set(true);
-        let names: Vec<&str> = offered.iter().map(label).collect();
-        self.stream.set_model(Some(&gtk4::StringList::new(&names)));
-        self.stream.set_selected(offered.iter().position(|p| *p == chosen).unwrap_or(0) as u32);
-        self.refreshing_streams.set(false);
+        // Touch the dropdown only where it differs: this runs from its own
+        // "selected" handler too, and rebuilding a dropdown whose popup is
+        // still open from inside that handler freezes GTK.
+        let index = offered.iter().position(|p| *p == chosen).unwrap_or(0) as u32;
+        if *self.stream_options.borrow() != offered {
+            self.refreshing_streams.set(true);
+            let names: Vec<&str> = offered.iter().map(label).collect();
+            self.stream.set_model(Some(&gtk4::StringList::new(&names)));
+            self.stream.set_selected(index);
+            self.refreshing_streams.set(false);
+        } else if self.stream.selected() != index {
+            self.refreshing_streams.set(true);
+            self.stream.set_selected(index);
+            self.refreshing_streams.set(false);
+        }
         *self.stream_options.borrow_mut() = offered;
         self.profile.set(chosen);
         chosen != before
