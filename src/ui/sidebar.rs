@@ -150,7 +150,6 @@ impl Sidebar {
         unfold.add_css_class("flat");
         unfold.set_tooltip_text(Some("Channels"));
         unfold.set_visible(false);
-        title_row.append(&unfold);
         let name = Label::new(Some(&device.name));
         name.add_css_class("heading");
         name.set_halign(gtk4::Align::Start);
@@ -184,8 +183,14 @@ impl Sidebar {
         head.append(&status_row);
         card.append(&head);
 
+        // The channels, with the fold arrow beside them.
         let channel_list = GtkBox::new(Orientation::Vertical, 2);
-        card.append(&channel_list);
+        channel_list.set_hexpand(true);
+        let channel_area = GtkBox::new(Orientation::Horizontal, 4);
+        channel_area.append(&channel_list);
+        unfold.set_valign(gtk4::Align::Start);
+        channel_area.append(&unfold);
+        card.append(&channel_area);
         let channel_buttons: Rc<RefCell<Vec<(u8, ToggleButton)>>> = Rc::default();
         let current = Rc::new(Cell::new(device.channel));
 

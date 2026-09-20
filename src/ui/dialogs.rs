@@ -1,10 +1,11 @@
 //! Modal dialogs: add a device, log in to a device.
 
 use crate::ui::bridge::ConnectTarget;
+use crate::ui::settings::{self, Decoding, Settings, Theme};
 use gtk4::prelude::*;
 use gtk4::{
-    Box as GtkBox, Button, CheckButton, Entry, Grid, Label, Notebook, Orientation, PasswordEntry,
-    Window,
+    Box as GtkBox, Button, CheckButton, DropDown, Entry, Grid, Label, Notebook, Orientation,
+    PasswordEntry, StringList, Window,
 };
 
 fn dialog(parent: &Window, title: &str) -> (Window, GtkBox) {
@@ -165,4 +166,114 @@ pub fn login(
 
     window.present();
     password.grab_focus();
+}
+
+/// The application settings. Every change is applied at once through
+/// `on_change`, which gets the full settings.
+pub fn settings(parent: &Window, current: &Settings, on_change: impl Fn(Settings) + 'static) {
+    let (window, content) = dialog(parent, "Settings");
+    window.set_default_width(420);
+
+    let heading = |text: &str| {
+        let l = Label::new(Some(text));
+        l.add_css_class("heading");
+        l.set_halign(gtk4::Align::Start);
+        l
+    };
+
+    let grid = Grid::builder().row_spacing(10).column_spacing(12).build();
+    content.append(&heading("Appearance"));
+    let theme = DropDown::new(Some(StringList::new(&["Auto", "Light", "Dark"])), None::<gtk4::Expression>);
+    theme.set_selected(match current.theme {
+        Theme::Auto => 0,
+        Theme::Light => 1,
+        Theme::Dark => 2,
+    });
+    row(&grid, 0, "Theme", &theme);
+    content.append(&grid);
+
+    content.append(&heading("Video"));
+    let hardware = settings::hardware_decoders();
+    // Without any hardware decoder there is nothing to choose to force.
+    let modes: Vec<(Decoding, &str)> = [(Decoding::Auto, "Auto"), (Decoding::Hardware, "Hardware"), (Decoding::Software, "Software")]
+        .into_iter()
+        .filter(|(m, _)| *m != Decoding::Hardware || !hardware.is_empty())
+        .collect();
+    let labels: Vec<&str> = modes.iter().map(|(_, l)| *l).collect();
+    let decoding = DropDown::new(Some(StringList::new(&labels)), None::<gtk4::Expression>);
+    decoding.set_selected(modes.iter().position(|(m, _)| *m == current.decoding).unwrap_or(0) as u32);
+
+    let mut device_labels = vec!["Automatic".to_string()];
+    device_labels.extend(hardware.iter().map(|d| d.label.clone()));
+    let device_labels: Vec<&str> = device_labels.iter().map(String::as_str).collect();
+    let device = DropDown::new(Some(StringList::new(&device_labels)), None::<gtk4::Expression>);
+    device.set_selected(
+        current
+            .hardware_decoder
+            .as_ref()
+            .and_then(|k| hardware.iter().position(|d| &d.key == k))
+            .map_or(0, |i| i as u32 + 1),
+    );
+    let video_grid = Grid::builder().row_spacing(10).column_spacing(12).build();
+    row(&video_grid, 0, "Decoding", &decoding);
+    let device_label = Label::new(Some("Decoder"));
+    device_label.set_halign(gtk4::Align::End);
+    video_grid.attach(&device_label, 0, 1, 1, 1);
+    device.set_hexpand(true);
+    video_grid.attach(&device, 1, 1, 1, 1);
+    content.append(&video_grid);
+
+    let note = Label::new(Some("Decoding applies to streams started afterwards."));
+    note.add_css_class("dim-label");
+    note.set_halign(gtk4::Align::Start);
+    content.append(&note);
+
+    // The decoder choice only matters with hardware decoding and, being a
+    // choice, only when there is more than one.
+    let show_device = {
+        let (decoding, device, device_label) = (decoding.clone(), device.clone(), device_label.clone());
+        let modes = modes.clone();
+        let count = hardware.len();
+        move || {
+            let hw = modes.get(decoding.selected() as usize).map(|(m, _)| *m) == Some(Decoding::Hardware);
+            device.set_visible(hw && count > 1);
+            device_label.set_visible(hw && count > 1);
+        }
+    };
+    show_device();
+
+    let emit = {
+        let (theme, decoding, device) = (theme.clone(), decoding.clone(), device.clone());
+        move || {
+            let mode = modes.get(decoding.selected() as usize).map(|(m, _)| *m).unwrap_or_default();
+            on_change(Settings {
+                theme: match theme.selected() {
+                    1 => Theme::Light,
+                    2 => Theme::Dark,
+                    _ => Theme::Auto,
+                },
+                decoding: mode,
+                hardware_decoder: (device.selected() > 0)
+                    .then(|| hardware.get(device.selected() as usize - 1).map(|d| d.key.clone()))
+                    .flatten(),
+            });
+        }
+    };
+    let emit = std::rc::Rc::new(emit);
+    for dd in [&theme, &decoding, &device] {
+        let emit = std::rc::Rc::clone(&emit);
+        let show_device = show_device.clone();
+        dd.connect_selected_notify(move |_| {
+            show_device();
+            emit();
+        });
+    }
+
+    let close = Button::with_label("Close");
+    close.set_halign(gtk4::Align::End);
+    let w = window.clone();
+    close.connect_clicked(move |_| w.close());
+    content.append(&close);
+
+    window.present();
 }

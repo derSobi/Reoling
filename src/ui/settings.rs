@@ -1,0 +1,258 @@
+//! Application settings: colour theme and video decoding. Stored in a small
+//! key file next to the device list and applied at start and on change.
+
+use glib::translate::{FromGlib, IntoGlib};
+use gstreamer::prelude::*;
+use gtk4::glib::{self, KeyFile, KeyFileFlags};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Theme {
+    /// Whatever the system is set to.
+    #[default]
+    Auto,
+    Light,
+    Dark,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Decoding {
+    /// GStreamer's own choice (what `decodebin` ranks highest).
+    #[default]
+    Auto,
+    Hardware,
+    Software,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Settings {
+    pub theme: Theme,
+    pub decoding: Decoding,
+    /// With `Decoding::Hardware`: the decoder group to use (see
+    /// `hardware_decoders`); `None` leaves the pick among them to GStreamer.
+    pub hardware_decoder: Option<String>,
+}
+
+fn path() -> PathBuf {
+    glib::user_config_dir().join("reoling").join("settings.ini")
+}
+
+impl Settings {
+    pub fn load() -> Self {
+        let file = KeyFile::new();
+        if file.load_from_file(path(), KeyFileFlags::NONE).is_err() {
+            return Self::default();
+        }
+        let get = |k: &str| file.string("settings", k).ok().map(|s| s.to_string());
+        Self {
+            theme: match get("theme").as_deref() {
+                Some("light") => Theme::Light,
+                Some("dark") => Theme::Dark,
+                _ => Theme::Auto,
+            },
+            decoding: match get("decoding").as_deref() {
+                Some("hardware") => Decoding::Hardware,
+                Some("software") => Decoding::Software,
+                _ => Decoding::Auto,
+            },
+            hardware_decoder: get("hardware_decoder").filter(|s| !s.is_empty()),
+        }
+    }
+
+    pub fn save(&self) {
+        let file = KeyFile::new();
+        file.set_string(
+            "settings",
+            "theme",
+            match self.theme {
+                Theme::Auto => "auto",
+                Theme::Light => "light",
+                Theme::Dark => "dark",
+            },
+        );
+        file.set_string(
+            "settings",
+            "decoding",
+            match self.decoding {
+                Decoding::Auto => "auto",
+                Decoding::Hardware => "hardware",
+                Decoding::Software => "software",
+            },
+        );
+        file.set_string("settings", "hardware_decoder", self.hardware_decoder.as_deref().unwrap_or(""));
+        let path = path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = file.save_to_file(&path) {
+            eprintln!("could not save the settings: {e}");
+        }
+    }
+
+    /// Applies both settings. Decoding takes effect for streams started
+    /// afterwards.
+    pub fn apply(&self) {
+        apply_theme(self.theme);
+        apply_decoding(self);
+    }
+}
+
+// --- theme -----------------------------------------------------------------
+
+/// What the system had set when we started, to go back to on "Auto".
+struct SystemTheme {
+    name: Option<String>,
+    prefers_dark: bool,
+}
+
+static SYSTEM_THEME: OnceLock<SystemTheme> = OnceLock::new();
+
+/// Whether a GTK 4 theme of this name is installed.
+fn theme_installed(name: &str) -> bool {
+    let mut dirs = vec![
+        glib::home_dir().join(".themes"),
+        glib::user_data_dir().join("themes"),
+    ];
+    dirs.extend(glib::system_data_dirs().into_iter().map(|d| d.join("themes")));
+    dirs.iter().any(|d| d.join(name).join("gtk-4.0").is_dir())
+}
+
+/// Light and dark are usually separate themes of one family ("Yaru" and
+/// "Yaru-dark"), and a "-dark" theme ignores the dark-preference flag, so
+/// the variant is picked by name where one exists.
+fn apply_theme(theme: Theme) {
+    let Some(settings) = gtk4::Settings::default() else { return };
+    let system = SYSTEM_THEME.get_or_init(|| SystemTheme {
+        name: settings.gtk_theme_name().map(|n| n.to_string()),
+        prefers_dark: settings.is_gtk_application_prefer_dark_theme(),
+    });
+    let system_name = system.name.clone().unwrap_or_default();
+    let base = system_name.trim_end_matches("-dark").to_string();
+    let (name, dark) = match theme {
+        Theme::Auto => (system_name, system.prefers_dark),
+        Theme::Light => (base, false),
+        Theme::Dark => {
+            let variant = format!("{base}-dark");
+            (if theme_installed(&variant) { variant } else { system_name }, true)
+        }
+    };
+    if !name.is_empty() {
+        settings.set_gtk_theme_name(Some(&name));
+    }
+    settings.set_gtk_application_prefer_dark_theme(dark);
+}
+
+// --- decoding --------------------------------------------------------------
+
+static FORCE_SOFTWARE: AtomicBool = AtomicBool::new(false);
+
+/// Whether new pipelines must use software decoders only.
+pub fn force_software() -> bool {
+    FORCE_SOFTWARE.load(Ordering::Relaxed)
+}
+
+/// One hardware decoder (a GPU or a decoding engine), possibly offering both
+/// H.264 and H.265.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HardwareDecoder {
+    pub key: String,
+    pub label: String,
+}
+
+/// The video decoder factories GStreamer knows, with whether each is
+/// hardware, for H.264/H.265 (the codecs the devices send).
+fn video_decoders() -> Vec<(gstreamer::ElementFactory, bool)> {
+    let registry = gstreamer::Registry::get();
+    registry
+        .features(gstreamer::ElementFactory::static_type())
+        .into_iter()
+        .filter_map(|f| f.downcast::<gstreamer::ElementFactory>().ok())
+        .filter(|f| {
+            let klass = f.klass();
+            klass.contains("Decoder") && klass.contains("Video")
+        })
+        .filter(|f| {
+            f.static_pad_templates().iter().any(|t| {
+                t.direction() == gstreamer::PadDirection::Sink
+                    && (t.caps().to_string().contains("video/x-h264")
+                        || t.caps().to_string().contains("video/x-h265"))
+            })
+        })
+        .map(|f| {
+            let hardware = f.klass().contains("Hardware");
+            (f, hardware)
+        })
+        .collect()
+}
+
+/// A hardware decoder factory's device: its plugin plus, for VA-API, the GPU
+/// named in its long name.
+fn hardware_key(factory: &gstreamer::ElementFactory) -> (String, String) {
+    let long = factory.metadata("long-name").unwrap_or_default();
+    let device = long.split_once(" in ").map(|(_, d)| d.to_string()).unwrap_or_default();
+    let plugin = factory.plugin_name().map(|p| p.to_string()).unwrap_or_default();
+    let label = long
+        .replace(" H.264", "")
+        .replace(" H.265", "")
+        .replace(" Decoder", "");
+    (format!("{plugin}|{device}"), label)
+}
+
+/// The hardware decoders on this machine, one entry per device.
+pub fn hardware_decoders() -> Vec<HardwareDecoder> {
+    let mut out: Vec<HardwareDecoder> = Vec::new();
+    for (factory, hardware) in video_decoders() {
+        if !hardware {
+            continue;
+        }
+        let (key, label) = hardware_key(&factory);
+        if !out.iter().any(|d| d.key == key) {
+            out.push(HardwareDecoder { key, label });
+        }
+    }
+    out.sort_by(|a, b| a.label.cmp(&b.label));
+    out
+}
+
+/// The ranks decoders had before we touched any, to restore on "Auto".
+static ORIGINAL_RANKS: OnceLock<Vec<(String, i32)>> = OnceLock::new();
+
+fn apply_decoding(settings: &Settings) {
+    let decoders = video_decoders();
+    let originals = ORIGINAL_RANKS.get_or_init(|| {
+        decoders
+            .iter()
+            .map(|(f, _)| (f.name().to_string(), f.rank().into_glib()))
+            .collect()
+    });
+    let restore = |f: &gstreamer::ElementFactory| {
+        if let Some((_, rank)) = originals.iter().find(|(n, _)| *n == f.name().as_str()) {
+            f.set_rank(unsafe { gstreamer::Rank::from_glib(*rank) });
+        }
+    };
+    let never = |f: &gstreamer::ElementFactory| f.set_rank(gstreamer::Rank::NONE);
+
+    let chosen = settings
+        .hardware_decoder
+        .as_ref()
+        .filter(|key| hardware_decoders().iter().any(|d| &d.key == *key));
+    for (factory, hardware) in &decoders {
+        restore(factory);
+        if settings.decoding != Decoding::Hardware {
+            continue;
+        }
+        // Hardware only: software decoders are never picked; with a chosen
+        // device, the other devices are not either.
+        let excluded = if *hardware {
+            chosen.is_some_and(|key| hardware_key(factory).0 != *key)
+        } else {
+            true
+        };
+        if excluded {
+            never(factory);
+        }
+    }
+    FORCE_SOFTWARE.store(settings.decoding == Decoding::Software, Ordering::Relaxed);
+}

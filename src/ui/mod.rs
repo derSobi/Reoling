@@ -6,5 +6,6 @@ pub mod dialogs;
 pub mod icon;
 pub mod main_window;
 pub mod secrets;
+pub mod settings;
 pub mod sidebar;
 pub mod video_view;

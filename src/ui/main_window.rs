@@ -5,6 +5,7 @@ use crate::ui::bridge::{spawn_device, DeviceEvent, DeviceLink, SinkRequest, UidT
 use crate::ui::device_store::{self, Device};
 use crate::ui::sidebar::{Handlers, Sidebar, Status};
 use crate::ui::video_view::VideoView;
+use crate::ui::settings::Settings;
 use crate::ui::{dialogs, secrets};
 use gtk4::prelude::*;
 use gtk4::{
@@ -69,6 +70,7 @@ pub struct MainWindow {
     autoplay: RefCell<Option<String>>,
     /// Restored on the next start.
     last_played: RefCell<Option<String>>,
+    settings: RefCell<Settings>,
     uid_transport: UidTransport,
     sink_request_tx: tokio::sync::mpsc::Sender<SinkRequest>,
 }
@@ -80,6 +82,9 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         .default_width(1100)
         .default_height(700)
         .build();
+
+    let settings = Settings::load();
+    settings.apply();
 
     let video = Rc::new(VideoView::new());
 
@@ -136,6 +141,15 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         brand.append(&logo);
         brand.append(&brand_name);
         header.pack_start(&brand);
+        let settings_button = Button::from_icon_name("preferences-system-symbolic");
+        settings_button.set_tooltip_text(Some("Settings"));
+        header.pack_end(&settings_button);
+        let w = weak.clone();
+        settings_button.connect_clicked(move |_| {
+            if let Some(m) = w.upgrade() {
+                m.settings_dialog();
+            }
+        });
         window.set_titlebar(Some(&header));
 
         let sidebar_toggle = ToggleButton::new();
@@ -358,6 +372,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             playing: RefCell::new(None),
             autoplay: RefCell::new(None),
             last_played: RefCell::new(None),
+            settings: RefCell::new(settings),
             uid_transport,
             sink_request_tx,
         }
@@ -486,6 +501,26 @@ impl MainWindow {
         self.stream.set_sensitive(self.streaming.get());
         self.previous.set_sensitive(multi);
         self.next.set_sensitive(multi);
+    }
+
+    fn settings_dialog(self: &Rc<Self>) {
+        let this = Rc::clone(self);
+        let current = self.settings.borrow().clone();
+        dialogs::settings(self.window.upcast_ref(), &current, move |new| {
+            let decoding_changed = {
+                let old = this.settings.borrow();
+                old.decoding != new.decoding || old.hardware_decoder != new.hardware_decoder
+            };
+            new.apply();
+            new.save();
+            *this.settings.borrow_mut() = new;
+            // A running stream keeps its decoder; restart it to use the new one.
+            if decoding_changed {
+                if let Some(key) = this.playing_key() {
+                    this.play(&key);
+                }
+            }
+        });
     }
 
     fn add_device_dialog(self: &Rc<Self>) {

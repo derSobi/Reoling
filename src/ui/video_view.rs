@@ -194,6 +194,7 @@ impl VideoView {
          * systems.
          */
         let decodebin = gstreamer::ElementFactory::make("decodebin")
+            .property("force-sw-decoders", crate::ui::settings::force_software())
             .build()
             .expect("decodebin element missing — install gstreamer1.0-plugins-base");
 
