@@ -16,6 +16,8 @@ pub struct Device {
     /// An NVR or Home Hub (several cameras behind one device), as far as the
     /// device has told us. Unknown until the first successful login.
     pub multi_channel: bool,
+    /// What the device reported about its channels this run (not saved).
+    pub channels: Vec<reoling::ChannelInfo>,
 }
 
 impl Device {
@@ -33,6 +35,7 @@ impl Device {
             username: "admin".to_string(),
             channel: 0,
             multi_channel: false,
+            channels: Vec::new(),
         }
     }
 }
@@ -69,6 +72,7 @@ pub fn load() -> Vec<Device> {
             username: get("username").unwrap_or_else(|| "admin".to_string()),
             channel: get("channel").and_then(|s| s.parse().ok()).unwrap_or(0),
             multi_channel: get("multi_channel").as_deref() == Some("true"),
+            channels: Vec::new(),
         });
     }
     devices

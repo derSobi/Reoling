@@ -17,6 +17,65 @@ pub struct BcXml {
     pub preview: Option<Preview>,
     #[serde(rename = "VersionInfo", skip_serializing_if = "Option::is_none")]
     pub version_info: Option<VersionInfo>,
+    #[serde(rename = "ChannelInfoList", skip_serializing_if = "Option::is_none")]
+    pub channel_info_list: Option<ChannelInfoList>,
+}
+
+/// An NVR / Home Hub's description of its channels.
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ChannelInfoList {
+    #[serde(rename = "ChannelInfo", default)]
+    pub channels: Vec<ChannelInfoXml>,
+}
+
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ChannelInfoXml {
+    #[serde(rename = "channelId")]
+    pub channel_id: Option<u8>,
+    #[serde(rename = "devName")]
+    pub name: Option<String>,
+    pub state: Option<String>,
+    /// Comma separated, e.g. `mainStream,subStream,externStream`.
+    #[serde(rename = "streamSupport")]
+    pub stream_support: Option<String>,
+}
+
+impl ChannelInfoList {
+    /// The channels that exist, skipping the "none" placeholders an NVR
+    /// sends for empty slots. A channel that does not list its streams is
+    /// given main and sub, which every camera has.
+    pub fn into_channels(self) -> Vec<crate::client::ChannelInfo> {
+        use crate::client::{ChannelInfo, StreamProfile};
+        self.channels
+            .into_iter()
+            .filter_map(|c| {
+                let state = c.state.unwrap_or_default().trim().to_lowercase();
+                let name = c.name.unwrap_or_default().trim().to_string();
+                if state == "none" && name.is_empty() {
+                    return None;
+                }
+                let listed = c.stream_support.unwrap_or_default().to_lowercase();
+                let mut streams: Vec<StreamProfile> = [
+                    ("mainstream", StreamProfile::Main),
+                    ("externstream", StreamProfile::Extern),
+                    ("substream", StreamProfile::Sub),
+                ]
+                .into_iter()
+                .filter(|(word, _)| listed.split(',').any(|s| s.trim() == *word))
+                .map(|(_, p)| p)
+                .collect();
+                if streams.is_empty() {
+                    streams = vec![StreamProfile::Main, StreamProfile::Sub];
+                }
+                Some(ChannelInfo {
+                    channel_id: c.channel_id?,
+                    name,
+                    online: state == "connect",
+                    streams,
+                })
+            })
+            .collect()
+    }
 }
 
 /// The device's own description of itself (reply to `MSG_ID_VERSION`): the
@@ -179,5 +238,32 @@ mod tests {
         let sample = br#"<?xml version="1.0" encoding="UTF-8"?><body><Encryption version="1.1"><type>md5</type><nonce>AAAABBBBCCCCDDDD</nonce></Encryption></body>"#;
         let parsed = BcXml::from_bytes(sample).unwrap();
         assert_eq!(parsed.encryption.unwrap().nonce, "AAAABBBBCCCCDDDD");
+    }
+}
+
+#[cfg(test)]
+mod channel_info_tests {
+    use super::*;
+    use crate::client::StreamProfile;
+
+    #[test]
+    fn channel_list_gives_names_state_and_streams() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?><body><ChannelInfoList version="1.1">
+            <ChannelInfo><channelId>0</channelId><devName>Garden</devName><state>connect</state>
+              <streamSupport>
+                mainStream,subStream,externStream
+              </streamSupport></ChannelInfo>
+            <ChannelInfo><channelId>1</channelId><devName>Door</devName><state>connect</state></ChannelInfo>
+            <ChannelInfo><channelId>2</channelId><state>none</state><streamSupport>none</streamSupport></ChannelInfo>
+            </ChannelInfoList></body>"#;
+        let channels = BcXml::from_bytes(xml).unwrap().channel_info_list.unwrap().into_channels();
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[0].name, "Garden");
+        assert!(channels[0].online);
+        assert_eq!(
+            channels[0].streams,
+            [StreamProfile::Main, StreamProfile::Extern, StreamProfile::Sub]
+        );
+        assert_eq!(channels[1].streams, [StreamProfile::Main, StreamProfile::Sub]);
     }
 }

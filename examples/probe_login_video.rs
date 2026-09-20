@@ -5,7 +5,7 @@
 //! history) so run this directly in your own terminal.
 //! Usage: cargo run --example probe_login_video -- <UID>
 //!    or: cargo run --example probe_login_video -- --tcp <IP:PORT>
-use reoling::client::{ReolinkClient, StreamQuality};
+use reoling::client::{ReolinkClient, StreamProfile};
 use std::io::Write;
 use tokio_stream::StreamExt;
 
@@ -23,7 +23,7 @@ async fn main() {
     let empty_nonce_probe = args.iter().any(|a| a == "--empty-nonce");
     let prefer_direct = args.iter().any(|a| a == "--prefer-direct");
     let prefer_tcp = args.iter().any(|a| a == "--prefer-tcp");
-    let quality = if args.iter().any(|a| a == "--sub-stream") { StreamQuality::Sub } else { StreamQuality::Main };
+    let quality = if args.iter().any(|a| a == "--sub-stream") { StreamProfile::Sub } else { StreamProfile::Main };
     let channel_id: u8 = args
         .iter()
         .position(|a| a == "--channel")
