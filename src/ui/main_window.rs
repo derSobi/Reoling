@@ -1069,7 +1069,12 @@ impl MainWindow {
     fn stop_or_play(self: &Rc<Self>) {
         if self.playing_key().is_some() {
             self.stop();
-        } else if let Some(key) = self.stopped.borrow().clone() {
+            return;
+        }
+        // Copied out first: `play` changes `stopped`, so a borrow must not
+        // still be held when it runs.
+        let stopped = self.stopped.borrow().clone();
+        if let Some(key) = stopped {
             self.play(&key);
         }
     }
