@@ -494,6 +494,11 @@ impl ReolinkClient {
     /// against a Home Hub, which then pushed its channel list) and prints
     /// every reply, decrypted, for a few seconds.
     pub async fn probe_pushes(&mut self) {
+        // What each channel can do (58, per channel) is what decides which
+        // camera controls to offer; shown here to see how the devices word it.
+        for channel_id in 0..3u8 {
+            self.request_for_channel(MSG_ID_ABILITY_SUPPORT, channel_id).await;
+        }
         for msg_id in [192u32, 146] {
             let msg_num = self.next_msg_num();
             let request = Bc {
@@ -809,6 +814,14 @@ impl ReolinkClient {
     /// `take_channel_updates` as `DeviceUpdate::ChannelName`.
     pub async fn request_channel_names(&mut self, channel_ids: &[u8]) {
         for &channel_id in channel_ids {
+            self.request_for_channel(MSG_ID_OSD, channel_id).await;
+        }
+    }
+
+    /// An empty request about one channel (the channel travels in the
+    /// extension, as in the official app's requests for OSD settings).
+    async fn request_for_channel(&mut self, msg_id: u32, channel_id: u8) {
+        {
             let msg_num = self.next_msg_num();
             let extension = Extension {
                 version: XML_VERSION.to_string(),
@@ -817,7 +830,7 @@ impl ReolinkClient {
             };
             let request = Bc {
                 meta: BcMeta {
-                    msg_id: MSG_ID_OSD,
+                    msg_id,
                     channel_id,
                     stream_type: 0,
                     msg_num,
