@@ -61,6 +61,12 @@ fn show_channels(buttons: &[(u8, ToggleButton)], unfolded: bool, current: u8) {
     for (id, button) in buttons {
         button.set_visible(unfolded || Some(*id) == shown);
     }
+    if std::env::var("REOLING_DEBUG_UI").is_ok() {
+        eprintln!(
+            "UI show_channels: {} buttons, unfolded={unfolded} current={current} shown={shown:?}",
+            buttons.len()
+        );
+    }
 }
 
 pub struct Sidebar {
@@ -267,6 +273,9 @@ impl Sidebar {
             Status::Failed(reason) => (false, "Not connected", Some(reason.as_str())),
             Status::LoginNeeded(reason) => (false, "Login required", Some(reason.as_str())),
         };
+        if std::env::var("REOLING_DEBUG_UI").is_ok() {
+            eprintln!("UI set_status {key}: {status:?}");
+        }
         card.dot.remove_css_class("dim-label");
         card.dot.remove_css_class("status-connected");
         card.status.remove_css_class("dim-label");

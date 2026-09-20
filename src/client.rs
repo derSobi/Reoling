@@ -112,6 +112,20 @@ fn pushed_update(bc: &Bc) -> Option<DeviceUpdate> {
     if bc.meta.msg_id != MSG_ID_CHANNEL_INFO && bc.meta.msg_id != MSG_ID_OSD {
         return None;
     }
+    if bc.meta.msg_id == MSG_ID_OSD && std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
+        let body = match &bc.body {
+            BcBody::Modern(ModernMsg { payload: Some(p), .. }) => String::from_utf8_lossy(p)
+                .chars()
+                .take(1500)
+                .map(|c| if c == '\n' { ' ' } else { c })
+                .collect::<String>(),
+            other => format!("{other:?}"),
+        };
+        eprintln!(
+            "DEBUG osd reply: channel={} code={} body={body}",
+            bc.meta.channel_id, bc.meta.response_code
+        );
+    }
     let BcBody::Modern(ModernMsg { extension_xml, payload: Some(payload) }) = &bc.body else {
         return None;
     };
