@@ -430,8 +430,10 @@ impl ReolinkClient {
     /// failure or silence yields an empty identity rather than an error.
     pub async fn identity(&mut self) -> DeviceIdentity {
         // What the official app sends first after login (seen in a capture
-        // against a Home Hub): it makes an NVR / Home Hub push its channel
-        // list, with the channels' names. Answers are picked up as they come.
+        // against a Home Hub, and confirmed by a probe: the Hub pushes its
+        // channel list, with the channels' names, only after these two).
+        // Answers are picked up as they come.
+        let _ = self.send_empty_request(MSG_ID_STREAM_INFO).await;
         let _ = self.send_empty_request(MSG_ID_SUBSCRIBE).await;
         let msg_num = self.next_msg_num();
         let request = Bc {
