@@ -1,5 +1,5 @@
 use crate::ui::video_view::VideoSink;
-use reoling::{DeviceIdentity, ReolinkClient, StreamQuality, VideoType};
+use reoling::{DeviceIdentity, ReolinkClient, StreamProfile, VideoType};
 use std::net::IpAddr;
 use tokio_stream::StreamExt;
 
@@ -67,7 +67,7 @@ pub fn spawn_connection(
     username: String,
     password: String,
     channel_id: u8,
-    quality: StreamQuality,
+    quality: StreamProfile,
     uid_transport: UidTransport,
     sink_request_tx: tokio::sync::mpsc::Sender<SinkRequest>,
 ) -> (async_channel::Receiver<AppEvent>, std::sync::Arc<tokio::sync::Notify>) {

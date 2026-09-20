@@ -12,7 +12,7 @@ use gtk4::{
     GestureClick, HeaderBar, IconTheme, Image, Label, Orientation, Overlay, Paned, ScaleButton,
     Stack, StackSwitcher, ToggleButton,
 };
-use reoling::StreamQuality;
+use reoling::{looks_multi_channel, StreamProfile};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -43,6 +43,11 @@ pub struct MainWindow {
     previous: Button,
     next: Button,
     streaming: Cell<bool>,
+    /// The stream the user prefers, and the ones the current device offers
+    /// (what the dropdown lists, in the same order).
+    profile: Cell<StreamProfile>,
+    stream_options: RefCell<Vec<StreamProfile>>,
+    refreshing_streams: Cell<bool>,
 
     devices: RefCell<Vec<Device>>,
     passwords: RefCell<HashMap<String, String>>,
@@ -237,8 +242,15 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             }
         });
         let w = weak.clone();
-        stream.connect_selected_notify(move |_| {
+        stream.connect_selected_notify(move |dropdown| {
             if let Some(m) = w.upgrade() {
+                if m.refreshing_streams.get() {
+                    return;
+                }
+                let chosen = m.stream_options.borrow().get(dropdown.selected() as usize).copied();
+                if let Some(profile) = chosen {
+                    m.profile.set(profile);
+                }
                 if let Some(key) = m.active_key() {
                     m.start_session(&key);
                 }
@@ -318,6 +330,10 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             previous,
             next,
             streaming: Cell::new(false),
+            // Start on the lightest stream; heavier ones are opt-in.
+            profile: Cell::new(StreamProfile::Sub),
+            stream_options: RefCell::new(vec![StreamProfile::Main, StreamProfile::Sub]),
+            refreshing_streams: Cell::new(false),
             devices: RefCell::new(Vec::new()),
             passwords: RefCell::new(HashMap::new()),
             save_on_login: RefCell::new(None),
@@ -365,12 +381,39 @@ fn sidebar_icon() -> &'static str {
 }
 
 impl MainWindow {
-    fn quality(&self) -> StreamQuality {
-        if self.stream.selected() == 0 {
-            StreamQuality::Main
+    fn quality(&self) -> StreamProfile {
+        self.profile.get()
+    }
+
+    /// Lists in the dropdown the streams the current device/channel offers.
+    /// Keeps the preferred stream if it is offered, else falls back to the
+    /// lightest one. Returns whether the stream in use changed.
+    fn refresh_streams(&self) -> bool {
+        let offered = self
+            .active_key()
+            .and_then(|k| self.device(&k))
+            .and_then(|d| d.channels.into_iter().find(|c| c.channel_id == d.channel))
+            .map(|c| c.streams)
+            .unwrap_or_else(|| vec![StreamProfile::Main, StreamProfile::Sub]);
+        let before = self.profile.get();
+        let chosen = if offered.contains(&before) {
+            before
         } else {
-            StreamQuality::Sub
-        }
+            offered.last().copied().unwrap_or(StreamProfile::Sub)
+        };
+        let label = |p: &StreamProfile| match p {
+            StreamProfile::Main => "Main stream",
+            StreamProfile::Extern => "Extern stream",
+            StreamProfile::Sub => "Sub stream",
+        };
+        self.refreshing_streams.set(true);
+        let names: Vec<&str> = offered.iter().map(label).collect();
+        self.stream.set_model(Some(&gtk4::StringList::new(&names)));
+        self.stream.set_selected(offered.iter().position(|p| *p == chosen).unwrap_or(0) as u32);
+        self.refreshing_streams.set(false);
+        *self.stream_options.borrow_mut() = offered;
+        self.profile.set(chosen);
+        chosen != before
     }
 
     fn active_key(&self) -> Option<String> {
@@ -482,6 +525,7 @@ impl MainWindow {
         }
         device_store::save(&self.devices.borrow());
         if self.active_key().as_deref() == Some(key) {
+            self.refresh_streams();
             self.start_session(key);
         }
     }
@@ -521,12 +565,13 @@ impl MainWindow {
         self.next.set_sensitive(multi);
     }
 
-    /// Takes the device's own name and kind once it has told us.
-    fn apply_identity(&self, key: &str, identity: &reoling::DeviceIdentity) {
+    /// Takes the device's own name, kind and channels once it has told us.
+    /// Returns whether the stream to play changed as a result (the caller
+    /// then restarts the session).
+    fn apply_identity(&self, key: &str, identity: &reoling::DeviceIdentity) -> bool {
         let text = |s: &Option<String>| s.clone().unwrap_or_default().trim().to_string();
         let (name, model) = (text(&identity.name), text(&identity.model));
-        let lower = format!("{name} {model}").to_lowercase();
-        let multi = lower.contains("nvr") || lower.contains("hub");
+        let multi = looks_multi_channel(&name, &model) || identity.channels.len() > 1;
         if let Some(d) = self.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
             if !name.is_empty() {
                 d.name = name.clone();
@@ -534,12 +579,17 @@ impl MainWindow {
             if !name.is_empty() || !model.is_empty() {
                 d.multi_channel = multi;
             }
+            if !identity.channels.is_empty() {
+                d.channels = identity.channels.clone();
+            }
         }
         if !name.is_empty() {
             self.sidebar.set_name(key, &name);
         }
         device_store::save(&self.devices.borrow());
+        let stream_changed = self.refresh_streams();
         self.update_controls();
+        stream_changed
     }
 
     fn shutdown_active(&self, wait: bool) {
@@ -583,7 +633,12 @@ impl MainWindow {
                 }
                 match event {
                     AppEvent::LoggedIn(identity) => {
-                        this.apply_identity(&key, &identity);
+                        if this.apply_identity(&key, &identity) {
+                            // The stream we started is not one this device
+                            // offers; begin again on one it does.
+                            this.start_session(&key);
+                            return;
+                        }
                         this.sidebar.set_status(&key, &Status::Connected);
                         this.show_message("Starting video…");
                         if this.save_on_login.borrow().as_deref() == Some(key.as_str()) {

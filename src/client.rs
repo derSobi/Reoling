@@ -27,22 +27,41 @@ pub struct DeviceIdentity {
     pub name: Option<String>,
     /// The model, e.g. a camera, NVR or Home Hub type string.
     pub model: Option<String>,
+    /// Empty when the device did not describe its channels (single cameras).
+    pub channels: Vec<ChannelInfo>,
+}
+
+/// Whether a device of this name/model is an NVR or Home Hub (several
+/// cameras behind one device) rather than a single camera.
+pub fn looks_multi_channel(name: &str, model: &str) -> bool {
+    let text = format!("{name} {model}").to_lowercase();
+    text.contains("nvr") || text.contains("hub")
 }
 
 /// How long to wait for the device to describe itself before carrying on
 /// without: the name is a nicety, the video must not wait for it.
-const IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Which of the camera's encode profiles to request in `start_video`.
-/// `Main` is full resolution/bitrate; `Sub` is a lower-resolution,
-/// lower-bitrate profile most cameras also encode continuously —
-/// matches the `<streamType>`/`handle` fields real Reolink apps
-/// (Windows/Mac/`leolink`) expose as a user-facing quality picker.
+/// Which of the device's streams to request in `start_video`. `Main` is
+/// full resolution/bitrate; `Sub` is the lowest-bitrate one; `Extern` sits
+/// between them on many cameras (on some it is another lens). Which of them
+/// a channel really has is up to the device — see `ChannelInfo::streams`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum StreamQuality {
+pub enum StreamProfile {
     #[default]
     Main,
+    Extern,
     Sub,
+}
+
+/// One channel as the device describes it (NVR / Home Hub push after login).
+#[derive(Debug, Clone)]
+pub struct ChannelInfo {
+    pub channel_id: u8,
+    pub name: String,
+    pub online: bool,
+    /// The streams the channel offers, highest quality first.
+    pub streams: Vec<StreamProfile>,
 }
 
 /// Mirrors `transport::discovery`'s established pattern of bounding every
@@ -333,25 +352,47 @@ impl ReolinkClient {
             },
             body: BcBody::Modern(ModernMsg { extension_xml: None, payload: None }),
         };
+        // The device answers with its version info; an NVR / Home Hub also
+        // pushes its channel list around login (message 145), possibly
+        // before our request is answered — take both from whatever arrives.
+        let mut info: Option<VersionInfo> = None;
+        let mut channels: Vec<ChannelInfo> = Vec::new();
         let exchange = async {
-            self.connection.lock().await.send_bc(&request, &self.encryption).await.ok()?;
-            for _ in 0..8 {
-                let reply = self.connection.lock().await.recv_bc(&self.encryption).await.ok()?;
-                if reply.meta.msg_id != MSG_ID_VERSION {
-                    continue;
-                }
-                let BcBody::Modern(ModernMsg { payload: Some(payload), .. }) = reply.body else {
-                    return None;
-                };
-                return BcXml::from_bytes(&payload).ok()?.version_info;
+            if self.connection.lock().await.send_bc(&request, &self.encryption).await.is_err() {
+                return;
             }
-            None
+            for _ in 0..16 {
+                let Ok(reply) = self.connection.lock().await.recv_bc(&self.encryption).await
+                else {
+                    return;
+                };
+                let BcBody::Modern(ModernMsg { payload: Some(payload), .. }) = reply.body else {
+                    continue;
+                };
+                let Ok(xml) = BcXml::from_bytes(&payload) else { continue };
+                if let Some(v) = xml.version_info {
+                    info = Some(v);
+                }
+                if let Some(list) = xml.channel_info_list {
+                    channels = list.into_channels();
+                }
+                let multi = info.as_ref().is_some_and(|v| {
+                    looks_multi_channel(
+                        v.name.as_deref().unwrap_or_default(),
+                        v.model.as_deref().unwrap_or_default(),
+                    )
+                });
+                if info.is_some() && (!multi || !channels.is_empty()) {
+                    return;
+                }
+            }
         };
-        let info = tokio::time::timeout(IDENTITY_TIMEOUT, exchange).await.ok().flatten();
+        let _ = tokio::time::timeout(IDENTITY_TIMEOUT, exchange).await;
+        let (name, model) = info.map(|i| (i.name, i.model)).unwrap_or_default();
         if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
-            eprintln!("DEBUG identity reply: {info:?}");
+            eprintln!("DEBUG identity reply: name={name:?} model={model:?} channels={channels:?}");
         }
-        info.map(|i| DeviceIdentity { name: i.name, model: i.model }).unwrap_or_default()
+        DeviceIdentity { name, model, channels }
     }
 
     /// Diagnostic-only, not used by `login`: sends only the modern
@@ -415,7 +456,7 @@ impl ReolinkClient {
     pub async fn start_video(
         &mut self,
         channel_id: u8,
-        quality: StreamQuality,
+        quality: StreamProfile,
     ) -> crate::Result<ReceiverStream<crate::Result<VideoFrame>>> {
         self.start_video_with_trace(channel_id, quality, None).await
     }
@@ -427,7 +468,7 @@ impl ReolinkClient {
     pub async fn start_video_with_trace(
         &mut self,
         channel_id: u8,
-        quality: StreamQuality,
+        quality: StreamProfile,
         trace: Option<Arc<crate::media_trace::MediaTrace>>,
     ) -> crate::Result<ReceiverStream<crate::Result<VideoFrame>>> {
         let msg_num = self.next_msg_num();
@@ -443,8 +484,9 @@ impl ReolinkClient {
         // (section 21). Treat as unverified until confirmed against real
         // hardware requesting a Sub stream.
         let (handle, stream_type_str, bc_meta_stream_type) = match quality {
-            StreamQuality::Main => (0, "mainStream", 0),
-            StreamQuality::Sub => (256, "subStream", 1),
+            StreamProfile::Main => (0, "mainStream", 0),
+            StreamProfile::Sub => (256, "subStream", 1),
+            StreamProfile::Extern => (1024, "externStream", 0),
         };
         let request = Bc {
             meta: BcMeta {
@@ -814,7 +856,7 @@ mod tests {
 
         let _device_info = client.login("admin", "swordfish").await.unwrap();
 
-        let mut frames = client.start_video(0, StreamQuality::Main).await.unwrap();
+        let mut frames = client.start_video(0, StreamProfile::Main).await.unwrap();
         let frame = frames.next().await.unwrap().unwrap();
         assert_eq!(frame.data, vec![0, 0, 0, 1, 0x67]);
         assert_eq!(frame.microseconds, 999);
@@ -844,7 +886,7 @@ mod tests {
 
         let _device_info = client.login("admin", "swordfish").await.unwrap();
 
-        let mut frames = client.start_video(0, StreamQuality::Main).await.unwrap();
+        let mut frames = client.start_video(0, StreamProfile::Main).await.unwrap();
         let frame = frames.next().await.unwrap().unwrap();
         assert_eq!(frame.data, vec![0, 0, 0, 1, 0x67]);
         assert_eq!(frame.microseconds, 999);
