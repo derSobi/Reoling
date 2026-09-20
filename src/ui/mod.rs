@@ -1,5 +1,6 @@
 //! The GTK4 desktop app: main window, sidebar, dialogs, the network bridge
 //! and the GStreamer video view.
+pub mod audio;
 pub mod bridge;
 pub mod device_store;
 pub mod dialogs;

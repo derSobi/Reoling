@@ -26,17 +26,30 @@ pub enum Decoding {
     Software,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Settings {
     pub theme: Theme,
     pub decoding: Decoding,
     /// With `Decoding::Hardware`: the decoder group to use (see
     /// `hardware_decoders`); `None` leaves the pick among them to GStreamer.
     pub hardware_decoder: Option<String>,
+    /// 0.0..=1.0
+    pub volume: f64,
 }
 
 fn path() -> PathBuf {
     glib::user_config_dir().join("reoling").join("settings.ini")
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: Theme::default(),
+            decoding: Decoding::default(),
+            hardware_decoder: None,
+            volume: 0.5,
+        }
+    }
 }
 
 impl Settings {
@@ -58,6 +71,7 @@ impl Settings {
                 _ => Decoding::Auto,
             },
             hardware_decoder: get("hardware_decoder").filter(|s| !s.is_empty()),
+            volume: get("volume").and_then(|v| v.parse().ok()).map_or(0.5, |v: f64| v.clamp(0.0, 1.0)),
         }
     }
 
@@ -81,6 +95,7 @@ impl Settings {
                 Decoding::Software => "software",
             },
         );
+        file.set_string("settings", "volume", &self.volume.to_string());
         file.set_string("settings", "hardware_decoder", self.hardware_decoder.as_deref().unwrap_or(""));
         let path = path();
         if let Some(dir) = path.parent() {

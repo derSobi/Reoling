@@ -79,7 +79,7 @@ fn main() {
                                 }
                             }
                         }
-                        BcMediaMessage::Skipped => {}
+                        BcMediaMessage::Audio(_) | BcMediaMessage::Skipped => {}
                     }
                 }
                 Ok(None) => break,
