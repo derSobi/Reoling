@@ -11,7 +11,7 @@ use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Button, DropDown, EventControllerKey,
     GestureClick, HeaderBar, IconTheme, Image, Label, Orientation, Overlay, Paned, ScaleButton,
-    Stack, StackSwitcher, ToggleButton,
+    Revealer, RevealerTransitionType, Stack, StackSwitcher, ToggleButton,
 };
 use reoling::{looks_multi_channel, StreamProfile};
 use std::cell::{Cell, RefCell};
@@ -45,6 +45,18 @@ pub struct MainWindow {
     fullscreen_button: Button,
     stream: DropDown,
     stop: Button,
+    snapshot: Button,
+    record: ToggleButton,
+    /// Set while the code, not the user, flips the record button.
+    updating_record: Cell<bool>,
+    notice: Label,
+    notice_generation: Cell<u64>,
+    live: GtkBox,
+    fullscreen_bar: Revealer,
+    bar_generation: Cell<u64>,
+    pointer_on_bar: Cell<bool>,
+    /// The device whose stream the user stopped; the Play button restarts it.
+    stopped: RefCell<Option<String>>,
     previous: Button,
     next: Button,
     /// Whether the picture on screen is really flowing.
@@ -179,6 +191,24 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         overlay.set_child(Some(picture));
         overlay.add_overlay(&message);
 
+        // A short confirmation ("Snapshot saved…") near the top of the video.
+        let notice = Label::new(None);
+        notice.add_css_class("osd");
+        notice.set_halign(gtk4::Align::Center);
+        notice.set_valign(gtk4::Align::Start);
+        notice.set_margin_top(12);
+        notice.set_visible(false);
+        notice.set_can_target(false);
+        overlay.add_overlay(&notice);
+
+        // In fullscreen the controls slide in over the bottom of the video
+        // whenever the pointer moves.
+        let fullscreen_bar = Revealer::new();
+        fullscreen_bar.set_transition_type(RevealerTransitionType::SlideUp);
+        fullscreen_bar.set_valign(gtk4::Align::End);
+        fullscreen_bar.set_visible(false);
+        overlay.add_overlay(&fullscreen_bar);
+
         let stop = Button::from_icon_name("media-playback-stop-symbolic");
         stop.set_tooltip_text(Some("Stop"));
         stop.set_sensitive(false);
@@ -192,6 +222,15 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         controls.set_margin_start(8);
         controls.set_margin_end(8);
         controls.append(&stop);
+        let snapshot = Button::from_icon_name("camera-photo-symbolic");
+        snapshot.set_tooltip_text(Some("Save a snapshot"));
+        snapshot.set_sensitive(false);
+        let record = ToggleButton::new();
+        record.set_icon_name("media-record-symbolic");
+        record.set_tooltip_text(Some("Record"));
+        record.set_sensitive(false);
+        controls.append(&snapshot);
+        controls.append(&record);
         let spacer = GtkBox::new(Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         controls.append(&spacer);
@@ -267,9 +306,47 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         let w = weak.clone();
         stop.connect_clicked(move |_| {
             if let Some(m) = w.upgrade() {
-                m.stop();
+                m.stop_or_play();
             }
         });
+        let w = weak.clone();
+        snapshot.connect_clicked(move |_| {
+            if let Some(m) = w.upgrade() {
+                m.take_snapshot();
+            }
+        });
+        let w = weak.clone();
+        record.connect_toggled(move |button| {
+            if let Some(m) = w.upgrade() {
+                if !m.updating_record.get() {
+                    m.toggle_recording(button.is_active());
+                }
+            }
+        });
+        // Fullscreen: any pointer movement brings the controls up for a while.
+        let w = weak.clone();
+        let motion = gtk4::EventControllerMotion::new();
+        motion.connect_motion(move |_, _, _| {
+            if let Some(m) = w.upgrade() {
+                m.show_fullscreen_bar();
+            }
+        });
+        overlay.add_controller(motion);
+        let w = weak.clone();
+        let over_bar = gtk4::EventControllerMotion::new();
+        over_bar.connect_enter(move |_, _, _| {
+            if let Some(m) = w.upgrade() {
+                m.pointer_on_bar.set(true);
+            }
+        });
+        let w = weak.clone();
+        over_bar.connect_leave(move |_| {
+            if let Some(m) = w.upgrade() {
+                m.pointer_on_bar.set(false);
+                m.show_fullscreen_bar();
+            }
+        });
+        bars.add_controller(over_bar);
         let w = weak.clone();
         stream.connect_selected_notify(move |dropdown| {
             if let Some(m) = w.upgrade() {
@@ -358,6 +435,16 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             fullscreen_button,
             stream,
             stop,
+            snapshot,
+            record,
+            updating_record: Cell::new(false),
+            notice,
+            notice_generation: Cell::new(0),
+            live: live.clone(),
+            fullscreen_bar,
+            bar_generation: Cell::new(0),
+            pointer_on_bar: Cell::new(false),
+            stopped: RefCell::new(None),
             previous,
             next,
             streaming: Cell::new(false),
@@ -443,20 +530,149 @@ impl MainWindow {
         self.playing.borrow().clone()
     }
 
-    fn set_fullscreen(&self, on: bool) {
+    fn set_fullscreen(self: &Rc<Self>, on: bool) {
         if on {
             self.window.fullscreen();
+            // The control rows move onto the video, as a bar that slides in.
+            self.live.remove(&self.bars);
+            self.fullscreen_bar.set_child(Some(&self.bars));
+            self.bars.add_css_class("osd");
+            self.fullscreen_bar.set_visible(true);
+            self.fullscreen_bar.set_reveal_child(true);
+            self.show_fullscreen_bar();
         } else {
             self.window.unfullscreen();
+            self.fullscreen_bar.set_reveal_child(false);
+            self.fullscreen_bar.set_child(None::<&gtk4::Widget>);
+            self.fullscreen_bar.set_visible(false);
+            self.bars.remove_css_class("osd");
+            self.live.append(&self.bars);
+            self.bar_generation.set(self.bar_generation.get() + 1);
         }
         self.header.set_visible(!on);
-        self.bars.set_visible(!on);
+        self.sidebar_toggle.set_visible(!on);
         self.sidebar.widget().set_visible(!on && self.sidebar_toggle.is_active());
         self.fullscreen_button.set_icon_name(if on {
             "view-restore-symbolic"
         } else {
             "view-fullscreen-symbolic"
         });
+        self.fullscreen_button.set_tooltip_text(Some(if on { "Normal window" } else { "Fullscreen" }));
+    }
+
+    /// Brings the fullscreen controls up and hides them again after a pause
+    /// in pointer movement (never while the pointer is on them).
+    fn show_fullscreen_bar(self: &Rc<Self>) {
+        if !self.window.is_fullscreen() {
+            return;
+        }
+        self.fullscreen_bar.set_reveal_child(true);
+        let generation = self.bar_generation.get() + 1;
+        self.bar_generation.set(generation);
+        let this = Rc::clone(self);
+        glib::timeout_add_local_once(Duration::from_millis(2500), move || {
+            if this.bar_generation.get() == generation
+                && this.window.is_fullscreen()
+                && !this.pointer_on_bar.get()
+            {
+                this.fullscreen_bar.set_reveal_child(false);
+            }
+        });
+    }
+
+    /// A short message over the video.
+    fn notify(self: &Rc<Self>, text: &str) {
+        self.notice.set_text(text);
+        self.notice.set_visible(true);
+        let generation = self.notice_generation.get() + 1;
+        self.notice_generation.set(generation);
+        let this = Rc::clone(self);
+        glib::timeout_add_local_once(Duration::from_secs(4), move || {
+            if this.notice_generation.get() == generation {
+                this.notice.set_visible(false);
+            }
+        });
+    }
+
+    /// `~/Pictures/Reoling` or `~/Videos/Reoling`, created on demand.
+    fn media_dir(kind: glib::UserDirectory) -> Option<std::path::PathBuf> {
+        let dir = glib::user_special_dir(kind)?.join("Reoling");
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir)
+    }
+
+    /// `<device>-<channel>-<date>-<time>.<extension>` for what is playing.
+    fn media_file_name(&self, extension: &str) -> String {
+        let device = self.playing_key().and_then(|k| self.device(&k));
+        let name = device
+            .as_ref()
+            .map(|d| format!("{}-ch{}", d.name, u16::from(d.channel) + 1))
+            .unwrap_or_else(|| "Reoling".to_string());
+        let name: String = name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+            .collect();
+        let now = glib::DateTime::now_local()
+            .ok()
+            .and_then(|t| t.format("%Y%m%d-%H%M%S").ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        format!("{name}-{now}.{extension}")
+    }
+
+    fn take_snapshot(self: &Rc<Self>) {
+        let Some(texture) = self.video.snapshot() else {
+            self.notify("Nothing to save yet");
+            return;
+        };
+        let Some(dir) = Self::media_dir(glib::UserDirectory::Pictures) else {
+            self.notify("Could not create the Pictures/Reoling folder");
+            return;
+        };
+        let path = dir.join(self.media_file_name("png"));
+        match texture.save_to_png(&path) {
+            Ok(()) => self.notify(&format!("Snapshot saved to {}", path.display())),
+            Err(e) => self.notify(&format!("Could not save the snapshot: {e}")),
+        }
+    }
+
+    fn toggle_recording(self: &Rc<Self>, on: bool) {
+        let Some(sink) = self.video.current_sink() else {
+            self.set_record_button(false);
+            return;
+        };
+        if !on {
+            if sink.stop_recording() {
+                self.notify("Recording saved");
+            }
+            return;
+        }
+        let Some(dir) = Self::media_dir(glib::UserDirectory::Videos) else {
+            self.notify("Could not create the Videos/Reoling folder");
+            self.set_record_button(false);
+            return;
+        };
+        let path = dir.join(self.media_file_name("mkv"));
+        match sink.start_recording(&path) {
+            Ok(()) => self.notify(&format!("Recording to {}", path.display())),
+            Err(e) => {
+                self.notify(&format!("Could not record: {e}"));
+                self.set_record_button(false);
+            }
+        }
+    }
+
+    /// Sets the record button without triggering a recording change.
+    fn set_record_button(&self, on: bool) {
+        self.updating_record.set(true);
+        self.record.set_active(on);
+        self.updating_record.set(false);
+    }
+
+    /// Clears the picture and ends any recording (the pipeline is going).
+    fn reset_video(&self) {
+        self.video.reset();
+        self.set_record_button(false);
     }
 
     /// Lists in the dropdown the streams the watched device/channel offers.
@@ -509,7 +725,17 @@ impl MainWindow {
             .and_then(|k| self.device(k))
             .map(|d| d.multi_channel)
             .unwrap_or(false);
-        self.stop.set_sensitive(playing.is_some());
+        let stopped = self.stopped.borrow().is_some();
+        let (icon, tip) = if playing.is_none() && stopped {
+            ("media-playback-start-symbolic", "Play")
+        } else {
+            ("media-playback-stop-symbolic", "Stop")
+        };
+        self.stop.set_icon_name(icon);
+        self.stop.set_tooltip_text(Some(tip));
+        self.stop.set_sensitive(playing.is_some() || stopped);
+        self.snapshot.set_sensitive(self.streaming.get());
+        self.record.set_sensitive(self.streaming.get());
         self.stream.set_sensitive(self.streaming.get());
         self.previous.set_sensitive(multi);
         self.next.set_sensitive(multi);
@@ -695,10 +921,14 @@ impl MainWindow {
     }
 
     fn lost_playing(&self, key: &str, reason: &str) {
+        if self.stopped.borrow().as_deref() == Some(key) {
+            *self.stopped.borrow_mut() = None;
+            self.update_controls();
+        }
         if self.playing_key().as_deref() == Some(key) {
             *self.playing.borrow_mut() = None;
             self.streaming.set(false);
-            self.video.reset();
+            self.reset_video();
             self.show_message(reason);
             self.update_controls();
         }
@@ -779,7 +1009,8 @@ impl MainWindow {
                 l.link.stop();
             }
         }
-        self.video.reset();
+        self.reset_video();
+        *self.stopped.borrow_mut() = None;
         *self.playing.borrow_mut() = Some(key.to_string());
         *self.last_played.borrow_mut() = Some(key.to_string());
         self.streaming.set(false);
@@ -796,19 +1027,33 @@ impl MainWindow {
 
     /// The stop button: stops the stream and forgets it as the one to
     /// restore on the next start.
+    /// The stop button: stops the stream and leaves the last picture on
+    /// screen; the button becomes Play. Also forgets the stream as the one to
+    /// restore on the next start.
     fn stop(&self) {
-        if let Some(key) = self.playing_key() {
-            if let Some(l) = self.links.borrow().get(&key) {
-                l.link.stop();
-            }
+        let Some(key) = self.playing_key() else { return };
+        if let Some(l) = self.links.borrow().get(&key) {
+            l.link.stop();
         }
+        if let Some(sink) = self.video.current_sink() {
+            sink.stop_recording();
+        }
+        self.set_record_button(false);
         *self.playing.borrow_mut() = None;
         *self.last_played.borrow_mut() = None;
+        *self.stopped.borrow_mut() = Some(key);
         self.streaming.set(false);
-        self.video.reset();
-        self.show_message("Stopped");
         self.persist();
         self.update_controls();
+    }
+
+    /// The button beside the picture: Stop while streaming, Play after.
+    fn stop_or_play(self: &Rc<Self>) {
+        if self.playing_key().is_some() {
+            self.stop();
+        } else if let Some(key) = self.stopped.borrow().clone() {
+            self.play(&key);
+        }
     }
 
     fn step_channel(self: &Rc<Self>, delta: i32) {
@@ -824,12 +1069,15 @@ impl MainWindow {
         if self.playing_key().as_deref() == Some(key) {
             *self.playing.borrow_mut() = None;
             self.streaming.set(false);
-            self.video.reset();
+            self.reset_video();
             self.show_message("Select a device");
             self.update_controls();
         }
         if self.last_played.borrow().as_deref() == Some(key) {
             *self.last_played.borrow_mut() = None;
+        }
+        if self.stopped.borrow().as_deref() == Some(key) {
+            *self.stopped.borrow_mut() = None;
         }
         self.links.borrow_mut().remove(key); // dropping the link disconnects
         self.connected.borrow_mut().remove(key);

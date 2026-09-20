@@ -59,6 +59,93 @@ pub struct VideoSink {
     appsrc: AppSrc,
     pipeline: gstreamer::Pipeline,
     pts_state: Arc<Mutex<PtsState>>,
+    /// The file being recorded to, if any; fed by the same `push_frame`.
+    recorder: Arc<Mutex<Option<Recorder>>>,
+    video_type: VideoType,
+}
+
+/// Writes the incoming H.264/H.265 units into a Matroska file (which stays
+/// playable even if the app dies mid-recording).
+struct Recorder {
+    appsrc: AppSrc,
+    pipeline: gstreamer::Pipeline,
+    /// Recording begins at a keyframe: nothing is playable before one.
+    waiting_for_keyframe: bool,
+    first_pts: Option<gstreamer::ClockTime>,
+}
+
+impl Recorder {
+    fn start(path: &std::path::Path, video_type: VideoType) -> Result<Self, String> {
+        let (parse, media) = match video_type {
+            VideoType::H264 => ("h264parse", "video/x-h264"),
+            VideoType::H265 => ("h265parse", "video/x-h265"),
+        };
+        let make = |name: &str| {
+            gstreamer::ElementFactory::make(name)
+                .build()
+                .map_err(|e| format!("{name} is missing: {e}"))
+        };
+        let appsrc = make("appsrc")?
+            .downcast::<AppSrc>()
+            .map_err(|_| "appsrc is not an AppSrc".to_string())?;
+        appsrc.set_caps(Some(
+            &gstreamer::Caps::builder(media)
+                .field("stream-format", "byte-stream")
+                .field("alignment", "au")
+                .build(),
+        ));
+        appsrc.set_format(gstreamer::Format::Time);
+        let parser = gstreamer::ElementFactory::make(parse)
+            .property_from_str("config-interval", "-1")
+            .build()
+            .map_err(|e| format!("{parse} is missing: {e}"))?;
+        let mux = make("matroskamux")?;
+        let file = gstreamer::ElementFactory::make("filesink")
+            .property("location", path.to_string_lossy().to_string())
+            .build()
+            .map_err(|e| format!("filesink is missing: {e}"))?;
+        let pipeline = gstreamer::Pipeline::new();
+        pipeline
+            .add_many([appsrc.upcast_ref(), &parser, &mux, &file])
+            .map_err(|e| e.to_string())?;
+        gstreamer::Element::link_many([appsrc.upcast_ref(), &parser, &mux, &file])
+            .map_err(|e| e.to_string())?;
+        pipeline.set_state(gstreamer::State::Playing).map_err(|e| e.to_string())?;
+        Ok(Self { appsrc, pipeline, waiting_for_keyframe: true, first_pts: None })
+    }
+
+    fn push(&mut self, frame: &VideoFrame, pts: gstreamer::ClockTime) {
+        if self.waiting_for_keyframe {
+            if !frame.is_keyframe {
+                return;
+            }
+            self.waiting_for_keyframe = false;
+        }
+        let first = *self.first_pts.get_or_insert(pts);
+        let at = pts.saturating_sub(first);
+        let mut buffer = gstreamer::Buffer::from_slice(frame.data.clone());
+        {
+            let b = buffer.get_mut().expect("new buffer");
+            b.set_pts(at);
+            b.set_dts(at);
+        }
+        let _ = self.appsrc.push_buffer(buffer);
+    }
+
+    /// Finishes the file. Waiting for the muxer to write its end takes a
+    /// moment, so it happens on its own thread.
+    fn finish(self) {
+        std::thread::spawn(move || {
+            let _ = self.appsrc.end_of_stream();
+            if let Some(bus) = self.pipeline.bus() {
+                let _ = bus.timed_pop_filtered(
+                    gstreamer::ClockTime::from_seconds(5),
+                    &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+                );
+            }
+            let _ = self.pipeline.set_state(gstreamer::State::Null);
+        });
+    }
 }
 
 pub struct VideoView {
@@ -342,7 +429,13 @@ impl VideoView {
             .set_state(gstreamer::State::Playing)
             .expect("failed to start GStreamer pipeline");
 
-        VideoSink { appsrc, pipeline, pts_state: Arc::new(Mutex::new(PtsState::default())) }
+        VideoSink {
+            appsrc,
+            pipeline,
+            pts_state: Arc::new(Mutex::new(PtsState::default())),
+            recorder: Arc::new(Mutex::new(None)),
+            video_type,
+        }
     }
 
     /// Returns a `Send`-safe handle to this view's `appsrc`, building the
@@ -360,6 +453,7 @@ impl VideoView {
         let old = self.sink.borrow_mut().take();
         self.picture.set_paintable(None::<&gtk4::gdk::Paintable>);
         if let Some(sink) = old {
+            sink.stop_recording();
             // Off the GTK thread: taking a pipeline down waits for its
             // streaming thread, which may itself be waiting for this thread
             // (the paintable sink hands frames over through the main loop) —
@@ -369,6 +463,26 @@ impl VideoView {
                 let _ = pipeline.set_state(gstreamer::State::Null);
             });
         }
+    }
+
+    /// The pipeline's handle, if a stream has built one.
+    pub fn current_sink(&self) -> Option<VideoSink> {
+        self.sink.borrow().clone()
+    }
+
+    /// The picture on screen right now, as a texture.
+    pub fn snapshot(&self) -> Option<gtk4::gdk::Texture> {
+        use gtk4::prelude::*;
+        let paintable = self.picture.paintable()?;
+        let (width, height) = (paintable.intrinsic_width(), paintable.intrinsic_height());
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        let snapshot = gtk4::Snapshot::new();
+        paintable.snapshot(snapshot.upcast_ref::<gtk4::gdk::Snapshot>(), f64::from(width), f64::from(height));
+        let node = snapshot.to_node()?;
+        let renderer = self.picture.native()?.renderer()?;
+        Some(renderer.render_texture(&node, None))
     }
 
     pub fn ensure_sink(&self, video_type: VideoType) -> VideoSink {
@@ -381,6 +495,23 @@ impl VideoView {
 }
 
 impl VideoSink {
+    /// Starts recording what this sink shows to `path`.
+    pub fn start_recording(&self, path: &std::path::Path) -> Result<(), String> {
+        let recorder = Recorder::start(path, self.video_type)?;
+        *self.recorder.lock().expect("recorder mutex poisoned") = Some(recorder);
+        Ok(())
+    }
+
+    /// Ends the recording, if one is running. Returns whether one was.
+    pub fn stop_recording(&self) -> bool {
+        let recorder = self.recorder.lock().expect("recorder mutex poisoned").take();
+        let was = recorder.is_some();
+        if let Some(recorder) = recorder {
+            recorder.finish();
+        }
+        was
+    }
+
     /// Push one complete H.264/H.265 access unit into appsrc. Safe to call
     /// from any thread — see `VideoSink`'s own doc comment.
     ///
@@ -458,6 +589,10 @@ impl VideoSink {
             );
         }
         drop(state);
+
+        if let Some(recorder) = self.recorder.lock().expect("recorder mutex poisoned").as_mut() {
+            recorder.push(frame, pts);
+        }
 
         /*
          * VideoFrame::data already represents one complete access unit.
