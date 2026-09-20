@@ -27,20 +27,19 @@ pub struct DeviceIdentity {
     pub name: Option<String>,
     /// The model, e.g. a camera, NVR or Home Hub type string.
     pub model: Option<String>,
-    /// Empty when the device did not describe its channels (single cameras).
-    pub channels: Vec<ChannelInfo>,
 }
 
 /// Whether a device of this name/model is an NVR or Home Hub (several
 /// cameras behind one device) rather than a single camera.
 pub fn looks_multi_channel(name: &str, model: &str) -> bool {
     let text = format!("{name} {model}").to_lowercase();
-    text.contains("nvr") || text.contains("hub")
+    // "RLN…" are Reolink's NVR model numbers.
+    text.contains("nvr") || text.contains("hub") || model.to_lowercase().starts_with("rln")
 }
 
 /// How long to wait for the device to describe itself before carrying on
 /// without: the name is a nicety, the video must not wait for it.
-const IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Which of the device's streams to request in `start_video`. `Main` is
 /// full resolution/bitrate; `Sub` is the lowest-bitrate one; `Extern` sits
@@ -83,6 +82,26 @@ pub struct ReolinkClient {
     /// running for the process's lifetime regardless); never polled
     /// directly.
     direct_keepalive_task: Option<tokio::task::JoinHandle<()>>,
+    /// Channel lists the device pushes (NVR / Home Hub) whenever it likes —
+    /// during `identity`, while starting video, or mid-stream.
+    channel_updates_tx: tokio::sync::mpsc::UnboundedSender<Vec<ChannelInfo>>,
+    channel_updates_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<ChannelInfo>>>,
+}
+
+/// The channel list inside a pushed `MSG_ID_CHANNEL_INFO` message, if that is
+/// what `bc` is.
+fn pushed_channels(bc: &Bc) -> Option<Vec<ChannelInfo>> {
+    if bc.meta.msg_id != MSG_ID_CHANNEL_INFO {
+        return None;
+    }
+    let BcBody::Modern(ModernMsg { payload: Some(payload), .. }) = &bc.body else {
+        return None;
+    };
+    let channels = BcXml::from_bytes(payload).ok()?.channel_info_list?.into_channels();
+    if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
+        eprintln!("DEBUG channel list pushed: {channels:?}");
+    }
+    Some(channels)
 }
 
 /// The camera truncates the hex MD5 digest of `input` to 31 characters
@@ -186,13 +205,24 @@ impl ReolinkClient {
     /// `BcConnection` (used directly in tests to skip P2P discovery, which
     /// is covered separately in `transport::discovery`'s own tests).
     pub fn from_connection(connection: BcConnection, encryption: EncryptionProtocol) -> Self {
+        let (channel_updates_tx, channel_updates_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             connection: Arc::new(Mutex::new(connection)),
             encryption,
             next_msg_num: 1,
             video_task: None,
             direct_keepalive_task: None,
+            channel_updates_tx,
+            channel_updates_rx: Some(channel_updates_rx),
         }
+    }
+
+    /// The channel lists this device pushes, as they arrive. Can be taken
+    /// once.
+    pub fn take_channel_updates(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<Vec<ChannelInfo>>> {
+        self.channel_updates_rx.take()
     }
 
     /// Whether the P2P handshake delivered a relay login nonce (see
@@ -352,11 +382,7 @@ impl ReolinkClient {
             },
             body: BcBody::Modern(ModernMsg { extension_xml: None, payload: None }),
         };
-        // The device answers with its version info; an NVR / Home Hub also
-        // pushes its channel list around login (message 145), possibly
-        // before our request is answered — take both from whatever arrives.
         let mut info: Option<VersionInfo> = None;
-        let mut channels: Vec<ChannelInfo> = Vec::new();
         let exchange = async {
             if self.connection.lock().await.send_bc(&request, &self.encryption).await.is_err() {
                 return;
@@ -366,33 +392,25 @@ impl ReolinkClient {
                 else {
                     return;
                 };
-                let BcBody::Modern(ModernMsg { payload: Some(payload), .. }) = reply.body else {
+                if let Some(channels) = pushed_channels(&reply) {
+                    let _ = self.channel_updates_tx.send(channels);
                     continue;
-                };
-                let Ok(xml) = BcXml::from_bytes(&payload) else { continue };
-                if let Some(v) = xml.version_info {
-                    info = Some(v);
                 }
-                if let Some(list) = xml.channel_info_list {
-                    channels = list.into_channels();
+                if reply.meta.msg_id != MSG_ID_VERSION {
+                    continue;
                 }
-                let multi = info.as_ref().is_some_and(|v| {
-                    looks_multi_channel(
-                        v.name.as_deref().unwrap_or_default(),
-                        v.model.as_deref().unwrap_or_default(),
-                    )
-                });
-                if info.is_some() && (!multi || !channels.is_empty()) {
-                    return;
+                if let BcBody::Modern(ModernMsg { payload: Some(payload), .. }) = reply.body {
+                    info = BcXml::from_bytes(&payload).ok().and_then(|x| x.version_info);
                 }
+                return;
             }
         };
         let _ = tokio::time::timeout(IDENTITY_TIMEOUT, exchange).await;
         let (name, model) = info.map(|i| (i.name, i.model)).unwrap_or_default();
         if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
-            eprintln!("DEBUG identity reply: name={name:?} model={model:?} channels={channels:?}");
+            eprintln!("DEBUG identity reply: name={name:?} model={model:?}");
         }
-        DeviceIdentity { name, model, channels }
+        DeviceIdentity { name, model }
     }
 
     /// Diagnostic-only, not used by `login`: sends only the modern
@@ -530,7 +548,17 @@ impl ReolinkClient {
             }
         }
         self.connection.lock().await.send_bc(&request, &self.encryption).await?;
-        let ack = self.connection.lock().await.recv_bc(&self.encryption).await?;
+        // The device may push its channel list between our request and the
+        // answer; that is not the answer.
+        let ack = loop {
+            let bc = self.connection.lock().await.recv_bc(&self.encryption).await?;
+            match pushed_channels(&bc) {
+                Some(channels) => {
+                    let _ = self.channel_updates_tx.send(channels);
+                }
+                None => break bc,
+            }
+        };
         if debug_negotiation {
             eprintln!(
                 "NEGOTIATION preview reply: response_code={} class={:#x} body={:?}",
@@ -547,6 +575,7 @@ impl ReolinkClient {
         let (tx, rx) = channel(32);
         let connection = Arc::clone(&self.connection);
         let encryption = self.encryption.clone();
+        let channel_updates = self.channel_updates_tx.clone();
         self.video_task = Some(tokio::spawn(async move {
             let mut buffer: Vec<u8> = Vec::new();
             let mut guard = MediaGuard::default();
@@ -561,6 +590,10 @@ impl ReolinkClient {
                         }
                     }
                 };
+                if let Some(channels) = pushed_channels(&bc) {
+                    let _ = channel_updates.send(channels);
+                    continue;
+                }
                 if bc.meta.msg_id != MSG_ID_VIDEO {
                     continue;
                 }

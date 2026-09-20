@@ -1,10 +1,12 @@
 use crate::ui::video_view::VideoSink;
-use reoling::{DeviceIdentity, ReolinkClient, StreamProfile, VideoType};
+use reoling::{ChannelInfo, DeviceIdentity, ReolinkClient, StreamProfile, VideoType};
 use std::net::IpAddr;
 use tokio_stream::StreamExt;
 
 pub enum AppEvent {
     LoggedIn(DeviceIdentity),
+    /// The device (NVR / Home Hub) described its channels.
+    Channels(Vec<ChannelInfo>),
     /// A frame was pushed straight into GStreamer already. See
     /// `spawn_connection`'s doc comment for why frames no longer travel
     /// through this channel at all.
@@ -102,6 +104,8 @@ pub fn spawn_connection(
                 let _ = tx.send(AppEvent::Failed(e.to_string())).await;
                 return;
             }
+            let mut channel_updates =
+                client.take_channel_updates().expect("taken once per client");
             let identity = client.identity().await;
             let _ = tx.send(AppEvent::LoggedIn(identity)).await;
 
@@ -146,6 +150,11 @@ pub fn spawn_connection(
                                 break;
                             }
                             None => break, // stream ended
+                        }
+                    }
+                    Some(channels) = channel_updates.recv() => {
+                        if tx.send(AppEvent::Channels(channels)).await.is_err() {
+                            break;
                         }
                     }
                     _ = shutdown_bg.notified() => break,

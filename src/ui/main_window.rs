@@ -565,22 +565,35 @@ impl MainWindow {
         self.next.set_sensitive(multi);
     }
 
-    /// Takes the device's own name, kind and channels once it has told us.
+    /// Takes the channel list the device pushed. Several channels means an
+    /// NVR / Home Hub whatever its model string says. Returns whether the
+    /// stream to play changed (the caller then restarts the session).
+    fn apply_channels(&self, key: &str, channels: Vec<reoling::ChannelInfo>) -> bool {
+        if let Some(d) = self.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
+            if channels.len() > 1 {
+                d.multi_channel = true;
+            }
+            d.channels = channels;
+        }
+        device_store::save(&self.devices.borrow());
+        let stream_changed = self.refresh_streams();
+        self.update_controls();
+        stream_changed
+    }
+
+    /// Takes the device's own name and kind once it has told us.
     /// Returns whether the stream to play changed as a result (the caller
     /// then restarts the session).
     fn apply_identity(&self, key: &str, identity: &reoling::DeviceIdentity) -> bool {
         let text = |s: &Option<String>| s.clone().unwrap_or_default().trim().to_string();
         let (name, model) = (text(&identity.name), text(&identity.model));
-        let multi = looks_multi_channel(&name, &model) || identity.channels.len() > 1;
+        let multi = looks_multi_channel(&name, &model);
         if let Some(d) = self.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
             if !name.is_empty() {
                 d.name = name.clone();
             }
             if !name.is_empty() || !model.is_empty() {
                 d.multi_channel = multi;
-            }
-            if !identity.channels.is_empty() {
-                d.channels = identity.channels.clone();
             }
         }
         if !name.is_empty() {
@@ -650,6 +663,12 @@ impl MainWindow {
                                 name,
                                 password.clone(),
                             ));
+                        }
+                    }
+                    AppEvent::Channels(channels) => {
+                        if this.apply_channels(&key, channels) {
+                            this.start_session(&key);
+                            return;
                         }
                     }
                     // Frames already went straight into GStreamer; this only
