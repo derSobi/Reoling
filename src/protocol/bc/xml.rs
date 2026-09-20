@@ -19,6 +19,20 @@ pub struct BcXml {
     pub version_info: Option<VersionInfo>,
     #[serde(rename = "ChannelInfoList", skip_serializing_if = "Option::is_none")]
     pub channel_info_list: Option<ChannelInfoList>,
+    #[serde(rename = "OsdDatetime", skip_serializing_if = "Option::is_none")]
+    pub osd_datetime: Option<OsdDatetime>,
+}
+
+/// The on-screen-display settings; all we read is the channel's name.
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct OsdDatetime {
+    #[serde(rename = "channelName")]
+    pub channel_name: Option<OsdChannelName>,
+}
+
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct OsdChannelName {
+    pub name: Option<String>,
 }
 
 /// An NVR / Home Hub's description of its channels.
@@ -245,6 +259,15 @@ mod tests {
 mod channel_info_tests {
     use super::*;
     use crate::client::StreamProfile;
+
+    #[test]
+    fn osd_reply_gives_the_channel_name() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?><body><OsdDatetime version="1.1">
+            <channelName><enable>1</enable><name>Camera 1</name></channelName>
+            <datetime><enable>1</enable></datetime></OsdDatetime></body>"#;
+        let name = BcXml::from_bytes(xml).unwrap().osd_datetime.unwrap().channel_name.unwrap().name;
+        assert_eq!(name.as_deref(), Some("Camera 1"));
+    }
 
     #[test]
     fn channel_list_gives_names_state_and_streams() {

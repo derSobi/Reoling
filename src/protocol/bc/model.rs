@@ -6,6 +6,8 @@ pub const MSG_ID_LOGOUT: u32 = 2;
 pub const MSG_ID_VIDEO: u32 = 3;
 pub const MSG_ID_VIDEO_STOP: u32 = 4;
 pub const MSG_ID_VERSION: u32 = 80;
+/// On-screen-display settings of a channel; carries the channel's name.
+pub const MSG_ID_OSD: u32 = 44;
 /// Empty request the official app sends after login; the device then starts
 /// pushing its channel list and alarm events.
 pub const MSG_ID_SUBSCRIBE: u32 = 192;

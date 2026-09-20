@@ -444,8 +444,11 @@ impl VideoSink {
         let mut buffer = gstreamer::Buffer::from_slice(frame.data.clone());
         buffer.get_mut().unwrap().set_pts(pts);
 
-        if let Err(err) = self.appsrc.push_buffer(buffer) {
-            eprintln!("failed to push video buffer into appsrc: {err:?}");
+        match self.appsrc.push_buffer(buffer) {
+            // The pipeline was torn down (stream stopped or replaced) while
+            // frames were still on their way: expected, not worth a message.
+            Ok(_) | Err(gstreamer::FlowError::Flushing) => {}
+            Err(err) => eprintln!("failed to push video buffer into appsrc: {err:?}"),
         }
     }
 }

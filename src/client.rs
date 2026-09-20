@@ -20,6 +20,14 @@ pub struct DeviceInfoSummary {
     pub resolution_name: Option<String>,
 }
 
+/// Something the device told us without being asked, or as the answer to a
+/// request whose reader was busy streaming.
+#[derive(Debug, Clone)]
+pub enum DeviceUpdate {
+    Channels(Vec<ChannelInfo>),
+    ChannelName { channel_id: u8, name: String },
+}
+
 /// What the device says it is, as reported after login.
 #[derive(Debug, Clone, Default)]
 pub struct DeviceIdentity {
@@ -86,8 +94,8 @@ pub struct ReolinkClient {
     direct_keepalive_task: Option<tokio::task::JoinHandle<()>>,
     /// Channel lists the device pushes (NVR / Home Hub) whenever it likes —
     /// during `identity`, while starting video, or mid-stream.
-    channel_updates_tx: tokio::sync::mpsc::UnboundedSender<Vec<ChannelInfo>>,
-    channel_updates_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<ChannelInfo>>>,
+    channel_updates_tx: tokio::sync::mpsc::UnboundedSender<DeviceUpdate>,
+    channel_updates_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DeviceUpdate>>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,20 +106,30 @@ struct PlayingStream {
     bc_stream_type: u8,
 }
 
-/// The channel list inside a pushed `MSG_ID_CHANNEL_INFO` message, if that is
-/// what `bc` is.
-fn pushed_channels(bc: &Bc) -> Option<Vec<ChannelInfo>> {
-    if bc.meta.msg_id != MSG_ID_CHANNEL_INFO {
+/// What `bc` tells us, if it is a pushed channel list or the answer to a
+/// channel-name request.
+fn pushed_update(bc: &Bc) -> Option<DeviceUpdate> {
+    if bc.meta.msg_id != MSG_ID_CHANNEL_INFO && bc.meta.msg_id != MSG_ID_OSD {
         return None;
     }
-    let BcBody::Modern(ModernMsg { payload: Some(payload), .. }) = &bc.body else {
+    let BcBody::Modern(ModernMsg { extension_xml, payload: Some(payload) }) = &bc.body else {
         return None;
     };
-    let channels = BcXml::from_bytes(payload).ok()?.channel_info_list?.into_channels();
-    if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
-        eprintln!("DEBUG channel list pushed: {channels:?}");
+    let xml = BcXml::from_bytes(payload).ok()?;
+    if let Some(list) = xml.channel_info_list {
+        let channels = list.into_channels();
+        if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
+            eprintln!("DEBUG channel list pushed: {channels:?}");
+        }
+        return Some(DeviceUpdate::Channels(channels));
     }
-    Some(channels)
+    let name = xml.osd_datetime?.channel_name?.name?.trim().to_string();
+    let channel_id = extension_xml
+        .as_deref()
+        .and_then(|e| Extension::from_bytes(e).ok())
+        .and_then(|e| e.channel_id)
+        .unwrap_or(bc.meta.channel_id);
+    Some(DeviceUpdate::ChannelName { channel_id, name })
 }
 
 /// The camera truncates the hex MD5 digest of `input` to 31 characters
@@ -232,7 +250,7 @@ impl ReolinkClient {
     /// once.
     pub fn take_channel_updates(
         &mut self,
-    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<Vec<ChannelInfo>>> {
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<DeviceUpdate>> {
         self.channel_updates_rx.take()
     }
 
@@ -423,8 +441,8 @@ impl ReolinkClient {
                 else {
                     return;
                 };
-                if let Some(channels) = pushed_channels(&reply) {
-                    let _ = self.channel_updates_tx.send(channels);
+                if let Some(update) = pushed_update(&reply) {
+                    let _ = self.channel_updates_tx.send(update);
                     continue;
                 }
                 if reply.meta.msg_id != MSG_ID_VERSION {
@@ -631,8 +649,8 @@ impl ReolinkClient {
         // request and the answer; they are not the answer.
         let ack = loop {
             let bc = self.connection.lock().await.recv_bc(&self.encryption).await?;
-            if let Some(channels) = pushed_channels(&bc) {
-                let _ = self.channel_updates_tx.send(channels);
+            if let Some(update) = pushed_update(&bc) {
+                let _ = self.channel_updates_tx.send(update);
             } else if bc.meta.msg_id == MSG_ID_VIDEO && bc.meta.msg_num == msg_num {
                 // Same message number as our request: an earlier stream's
                 // leftover frames carry theirs.
@@ -670,8 +688,8 @@ impl ReolinkClient {
                         }
                     }
                 };
-                if let Some(channels) = pushed_channels(&bc) {
-                    let _ = channel_updates.send(channels);
+                if let Some(update) = pushed_update(&bc) {
+                    let _ = channel_updates.send(update);
                     continue;
                 }
                 if bc.meta.msg_id != MSG_ID_VIDEO {
@@ -757,6 +775,34 @@ impl ReolinkClient {
         self.connection.lock().await.send_bc(&request, &self.encryption).await
     }
 
+    /// Asks for the names of these channels. The answers come back through
+    /// `take_channel_updates` as `DeviceUpdate::ChannelName`.
+    pub async fn request_channel_names(&mut self, channel_ids: &[u8]) {
+        for &channel_id in channel_ids {
+            let msg_num = self.next_msg_num();
+            let extension = Extension {
+                version: XML_VERSION.to_string(),
+                channel_id: Some(channel_id),
+                ..Default::default()
+            };
+            let request = Bc {
+                meta: BcMeta {
+                    msg_id: MSG_ID_OSD,
+                    channel_id,
+                    stream_type: 0,
+                    msg_num,
+                    response_code: 0,
+                    class: 0x6414,
+                },
+                body: BcBody::Modern(ModernMsg {
+                    extension_xml: Some(extension.to_bytes()),
+                    payload: None,
+                }),
+            };
+            let _ = self.connection.lock().await.send_bc(&request, &self.encryption).await;
+        }
+    }
+
     /// Reads whatever the device sends while no video is running (pushed
     /// channel lists, alarm events), forwarding channel lists to
     /// `take_channel_updates`. Returns only when the connection fails.
@@ -766,8 +812,8 @@ impl ReolinkClient {
             let received = self.connection.lock().await.recv_bc(&self.encryption).await;
             match received {
                 Ok(bc) => {
-                    if let Some(channels) = pushed_channels(&bc) {
-                        let _ = self.channel_updates_tx.send(channels);
+                    if let Some(update) = pushed_update(&bc) {
+                        let _ = self.channel_updates_tx.send(update);
                     }
                 }
                 Err(Error::ReplyTimeout) => {}

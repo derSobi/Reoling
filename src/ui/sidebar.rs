@@ -8,9 +8,9 @@ use crate::ui::device_store::Device;
 use gtk4::prelude::*;
 use gtk4::{
     Box as GtkBox, Button, Frame, GestureClick, Label, ListBox, ListBoxRow, MenuButton,
-    Orientation, Popover, Revealer, ScrolledWindow, SelectionMode, ToggleButton,
+    Orientation, Popover, ScrolledWindow, SelectionMode, ToggleButton,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -45,7 +45,22 @@ struct Card {
     unfold: ToggleButton,
     channel_list: GtkBox,
     /// The channel buttons, in list order, with their channel numbers.
-    channel_buttons: RefCell<Vec<(u8, ToggleButton)>>,
+    channel_buttons: Rc<RefCell<Vec<(u8, ToggleButton)>>>,
+    /// The channel being watched (or last watched): what the folded list
+    /// shows.
+    current: Rc<Cell<u8>>,
+}
+
+/// Folded, only the current channel shows; unfolded, all of them.
+fn show_channels(buttons: &[(u8, ToggleButton)], unfolded: bool, current: u8) {
+    let shown = if buttons.iter().any(|(id, _)| *id == current) {
+        Some(current)
+    } else {
+        buttons.first().map(|(id, _)| *id)
+    };
+    for (id, button) in buttons {
+        button.set_visible(unfolded || Some(*id) == shown);
+    }
 }
 
 pub struct Sidebar {
@@ -55,7 +70,9 @@ pub struct Sidebar {
     handlers: Handlers,
 }
 
-const STATUS_CLASSES: [&str; 4] = ["dim-label", "success", "warning", "error"];
+/// The connected dot in the theme's accent colour. The colour is the
+/// theme's own named one, not ours.
+const DOT_CSS: &str = ".status-connected { color: @theme_selected_bg_color; }";
 
 impl Sidebar {
     pub fn new(handlers: Handlers) -> Rc<Self> {
@@ -76,6 +93,16 @@ impl Sidebar {
         head.append(&title);
         head.append(&add);
         root.append(&head);
+
+        let provider = gtk4::CssProvider::new();
+        provider.load_from_data(DOT_CSS);
+        if let Some(display) = gtk4::gdk::Display::default() {
+            gtk4::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
 
         let list = ListBox::new();
         list.set_selection_mode(SelectionMode::Single);
@@ -152,9 +179,9 @@ impl Sidebar {
         card.append(&head);
 
         let channel_list = GtkBox::new(Orientation::Vertical, 2);
-        let revealer = Revealer::new();
-        revealer.set_child(Some(&channel_list));
-        card.append(&revealer);
+        card.append(&channel_list);
+        let channel_buttons: Rc<RefCell<Vec<(u8, ToggleButton)>>> = Rc::default();
+        let current = Rc::new(Cell::new(device.channel));
 
         let frame = Frame::new(None);
         frame.set_child(Some(&card));
@@ -173,9 +200,9 @@ impl Sidebar {
         });
         head.add_controller(click);
 
-        let revealer_for_unfold = revealer.clone();
+        let (buttons, watched) = (Rc::clone(&channel_buttons), Rc::clone(&current));
         unfold.connect_toggled(move |t| {
-            revealer_for_unfold.set_reveal_child(t.is_active());
+            show_channels(&buttons.borrow(), t.is_active(), watched.get());
             t.set_icon_name(if t.is_active() { "pan-down-symbolic" } else { "pan-end-symbolic" });
         });
 
@@ -205,7 +232,8 @@ impl Sidebar {
                 status,
                 unfold,
                 channel_list,
-                channel_buttons: RefCell::new(Vec::new()),
+                channel_buttons,
+                current,
             },
         );
         self.set_status(&device.key, &Status::Failed("Not connected yet".to_string()));
@@ -233,18 +261,21 @@ impl Sidebar {
     pub fn set_status(&self, key: &str, status: &Status) {
         let cards = self.cards.borrow();
         let Some(card) = cards.get(key) else { return };
-        let (class, text, tooltip) = match status {
-            Status::Connecting => ("warning", "Connecting…", None),
-            Status::Connected => ("success", "Connected", None),
-            Status::Failed(reason) => ("error", "Not connected", Some(reason.as_str())),
-            Status::LoginNeeded(reason) => ("warning", "Login required", Some(reason.as_str())),
+        let (connected, text, tooltip) = match status {
+            Status::Connecting => (false, "Connecting…", None),
+            Status::Connected => (true, "Connected", None),
+            Status::Failed(reason) => (false, "Not connected", Some(reason.as_str())),
+            Status::LoginNeeded(reason) => (false, "Login required", Some(reason.as_str())),
         };
-        for c in STATUS_CLASSES {
-            card.dot.remove_css_class(c);
-            card.status.remove_css_class(c);
+        card.dot.remove_css_class("dim-label");
+        card.dot.remove_css_class("status-connected");
+        card.status.remove_css_class("dim-label");
+        if connected {
+            card.dot.add_css_class("status-connected");
+        } else {
+            card.dot.add_css_class("dim-label");
+            card.status.add_css_class("dim-label");
         }
-        card.dot.add_css_class(class);
-        card.status.add_css_class(class);
         card.status.set_text(text);
         card.status.set_tooltip_text(tooltip);
     }
@@ -288,18 +319,20 @@ impl Sidebar {
             buttons.push((channel.channel_id, button));
         }
         card.unfold.set_visible(!online.is_empty());
-        if !online.is_empty() && !card.unfold.is_active() {
-            card.unfold.set_active(true);
-        }
+        card.current.set(current);
+        show_channels(&buttons, card.unfold.is_active(), current);
         *card.channel_buttons.borrow_mut() = buttons;
     }
 
     /// Marks the channel being watched.
     pub fn mark_channel(&self, key: &str, channel: u8) {
         if let Some(card) = self.cards.borrow().get(key) {
-            for (id, button) in card.channel_buttons.borrow().iter() {
+            card.current.set(channel);
+            let buttons = card.channel_buttons.borrow();
+            for (id, button) in buttons.iter() {
                 button.set_active(*id == channel);
             }
+            show_channels(&buttons, card.unfold.is_active(), channel);
         }
     }
 }

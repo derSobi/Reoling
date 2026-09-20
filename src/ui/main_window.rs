@@ -603,6 +603,19 @@ impl MainWindow {
                     self.play(key); // the stream we started is not on offer
                 }
             }
+            DeviceEvent::ChannelName { channel_id, name } => {
+                if name.is_empty() {
+                    return;
+                }
+                if let Some(d) = self.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
+                    if let Some(c) = d.channels.iter_mut().find(|c| c.channel_id == channel_id) {
+                        c.name = name;
+                    }
+                }
+                if let Some(d) = self.device(key) {
+                    self.sidebar.set_channels(key, &d.channels, d.channel);
+                }
+            }
             DeviceEvent::Playing => {
                 if self.playing_key().as_deref() == Some(key) {
                     self.message.set_visible(false);

@@ -1,5 +1,5 @@
 use crate::ui::video_view::VideoSink;
-use reoling::{ChannelInfo, DeviceIdentity, ReolinkClient, StreamProfile, VideoFrame, VideoType};
+use reoling::{ChannelInfo, DeviceIdentity, DeviceUpdate, ReolinkClient, StreamProfile, VideoFrame, VideoType};
 use std::net::IpAddr;
 use tokio_stream::StreamExt;
 
@@ -9,6 +9,8 @@ pub enum DeviceEvent {
     Connected(DeviceIdentity),
     /// The device (NVR / Home Hub) described its channels.
     Channels(Vec<ChannelInfo>),
+    /// A channel's name, asked for because the channel list had none.
+    ChannelName { channel_id: u8, name: String },
     /// The requested stream's first frame reached GStreamer.
     Playing,
     /// The requested stream could not be started or broke off. The device
@@ -149,6 +151,7 @@ pub fn spawn_device(
             let mut sink: Option<VideoSink> = None;
             let mut announced = false;
             let mut channel = 0u8;
+            let mut asked_names: std::collections::HashSet<u8> = std::collections::HashSet::new();
 
             loop {
                 tokio::select! {
@@ -174,8 +177,25 @@ pub fn spawn_device(
                         }
                         Some(Command::Shutdown) | None => break,
                     },
-                    Some(channels) = channel_updates.recv() => {
-                        if tx.send(DeviceEvent::Channels(channels)).await.is_err() {
+                    Some(update) = channel_updates.recv() => {
+                        let event = match update {
+                            DeviceUpdate::Channels(channels) => {
+                                // An NVR's list carries no names; ask for the
+                                // ones we do not have (once per channel).
+                                let unnamed: Vec<u8> = channels
+                                    .iter()
+                                    .filter(|c| c.online && c.name.is_empty())
+                                    .map(|c| c.channel_id)
+                                    .filter(|id| asked_names.insert(*id))
+                                    .collect();
+                                client.request_channel_names(&unnamed).await;
+                                DeviceEvent::Channels(channels)
+                            }
+                            DeviceUpdate::ChannelName { channel_id, name } => {
+                                DeviceEvent::ChannelName { channel_id, name }
+                            }
+                        };
+                        if tx.send(event).await.is_err() {
                             break;
                         }
                     }
