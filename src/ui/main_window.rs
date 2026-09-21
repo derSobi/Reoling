@@ -48,6 +48,9 @@ pub struct MainWindow {
     stream: DropDown,
     stop: Button,
     snapshot: Button,
+    siren: Button,
+    spotlight: ToggleButton,
+    updating_spotlight: Cell<bool>,
     record: ToggleButton,
     /// Set while the code, not the user, flips the record button.
     updating_record: Cell<bool>,
@@ -235,6 +238,21 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         record.set_sensitive(false);
         controls.append(&snapshot);
         controls.append(&record);
+        controls.append(&gtk4::Separator::new(Orientation::Vertical));
+        // Camera controls, per channel. Talk is not built yet.
+        let talk = Button::from_icon_name("audio-input-microphone-symbolic");
+        talk.set_tooltip_text(Some("Talk"));
+        talk.set_sensitive(false);
+        let siren = Button::from_icon_name(icon_of(&["alarm-symbolic", "dialog-warning-symbolic"]));
+        siren.set_tooltip_text(Some("Sound the siren"));
+        siren.set_sensitive(false);
+        let spotlight = ToggleButton::new();
+        spotlight.set_icon_name(icon_of(&["weather-clear-symbolic", "keyboard-brightness-symbolic"]));
+        spotlight.set_tooltip_text(Some("Spotlight"));
+        spotlight.set_sensitive(false);
+        controls.append(&talk);
+        controls.append(&siren);
+        controls.append(&spotlight);
         let spacer = GtkBox::new(Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         controls.append(&spacer);
@@ -319,6 +337,21 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         stop.connect_clicked(move |_| {
             if let Some(m) = w.upgrade() {
                 m.stop_or_play();
+            }
+        });
+        let w = weak.clone();
+        siren.connect_clicked(move |_| {
+            if let Some(m) = w.upgrade() {
+                m.control(|link, channel| link.siren(channel));
+            }
+        });
+        let w = weak.clone();
+        spotlight.connect_toggled(move |button| {
+            if let Some(m) = w.upgrade() {
+                if !m.updating_spotlight.get() {
+                    let on = button.is_active();
+                    m.control(move |link, channel| link.spotlight(channel, on));
+                }
             }
         });
         let w = weak.clone();
@@ -448,6 +481,9 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             stream,
             stop,
             snapshot,
+            siren,
+            spotlight,
+            updating_spotlight: Cell::new(false),
             record,
             updating_record: Cell::new(false),
             notice,
@@ -510,6 +546,16 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
 
     window.present();
     main
+}
+
+/// The first of these icons the theme has (the last if none).
+fn icon_of(names: &[&'static str]) -> &'static str {
+    let has = |name: &str| {
+        gtk4::gdk::Display::default()
+            .map(|d| IconTheme::for_display(&d).has_icon(name))
+            .unwrap_or(false)
+    };
+    names.iter().copied().find(|n| has(n)).unwrap_or(names[names.len() - 1])
 }
 
 fn sidebar_icon() -> &'static str {
@@ -633,6 +679,21 @@ impl MainWindow {
         format!("{name}-{now}.{extension}")
     }
 
+    /// Sends a control command to the channel being watched.
+    fn control(self: &Rc<Self>, send: impl FnOnce(&crate::ui::bridge::DeviceLink, u8)) {
+        let Some(key) = self.playing_key() else { return };
+        let Some(device) = self.device(&key) else { return };
+        if let Some(l) = self.links.borrow().get(&key) {
+            send(&l.link, device.channel);
+        }
+    }
+
+    fn set_spotlight_button(&self, on: bool) {
+        self.updating_spotlight.set(true);
+        self.spotlight.set_active(on);
+        self.updating_spotlight.set(false);
+    }
+
     fn take_snapshot(self: &Rc<Self>) {
         let Some(texture) = self.video.snapshot() else {
             self.notify("Nothing to save yet");
@@ -749,6 +810,8 @@ impl MainWindow {
         self.stop.set_tooltip_text(Some(tip));
         self.stop.set_sensitive(playing.is_some() || stopped);
         self.snapshot.set_sensitive(self.streaming.get());
+        self.siren.set_sensitive(self.streaming.get());
+        self.spotlight.set_sensitive(self.streaming.get());
         self.record.set_sensitive(self.streaming.get());
         self.stream.set_sensitive(self.streaming.get());
         self.previous.set_sensitive(multi);
@@ -906,6 +969,25 @@ impl MainWindow {
                     self.sidebar.set_channels(key, &d.channels, d.channel);
                 }
             }
+            DeviceEvent::ControlReply { msg_id, code } => {
+                let (name, ok) = match msg_id {
+                    263 => ("Siren", code == 200),
+                    _ => ("Spotlight", code == 200),
+                };
+                if ok {
+                    self.notify(&if msg_id == 263 { "Siren sounding".to_string() } else { "Spotlight command sent".to_string() });
+                } else {
+                    self.notify(&format!("{name}: the camera refused (code {code})"));
+                    if msg_id != 263 {
+                        // It did not switch; show the truth.
+                        let on = self.spotlight.is_active();
+                        self.set_spotlight_button(!on);
+                    }
+                }
+            }
+            DeviceEvent::ControlFailed(reason) => {
+                self.notify(&format!("Command not sent: {reason}"));
+            }
             DeviceEvent::Playing => {
                 if self.playing_key().as_deref() == Some(key) {
                     self.message.set_visible(false);
@@ -1027,6 +1109,7 @@ impl MainWindow {
             }
         }
         self.reset_video();
+        self.set_spotlight_button(false);
         *self.stopped.borrow_mut() = None;
         *self.playing.borrow_mut() = Some(key.to_string());
         *self.last_played.borrow_mut() = Some(key.to_string());
