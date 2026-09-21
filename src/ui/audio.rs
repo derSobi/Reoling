@@ -6,11 +6,9 @@ use gstreamer::prelude::*;
 use gstreamer_app::AppSrc;
 use std::sync::Mutex;
 
-/// Audio and video travel in separate pipelines; both hold their data for
-/// this long before playing (video does the same, see `video_view`), which
-/// keeps sound and picture together.
-const LATENCY: gstreamer::ClockTime = gstreamer::ClockTime::from_seconds(3);
-
+/// Audio and video travel in separate pipelines; both hold their data back
+/// for the configured latency (see `settings::latency`), which keeps sound
+/// and picture together.
 struct Running {
     appsrc: AppSrc,
     pipeline: gstreamer::Pipeline,
@@ -60,7 +58,9 @@ impl AudioOutput {
         let elements = [appsrc.upcast_ref(), &parse, &decoder, &convert, &resample, &vol, &sink];
         pipeline.add_many(elements).map_err(|e| e.to_string())?;
         gstreamer::Element::link_many(elements).map_err(|e| e.to_string())?;
-        pipeline.set_latency(LATENCY);
+        pipeline.set_latency(gstreamer::ClockTime::from_mseconds(
+            crate::ui::settings::latency().as_millis() as u64,
+        ));
         pipeline.set_state(gstreamer::State::Playing).map_err(|e| e.to_string())?;
         Ok(Running { appsrc, pipeline, volume: vol })
     }

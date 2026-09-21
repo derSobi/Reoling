@@ -6,13 +6,14 @@ use crate::ui::device_store::{self, Device};
 use crate::ui::sidebar::{Handlers, Sidebar, Status};
 use crate::ui::video_view::VideoView;
 use crate::ui::audio::{AudioOutput, Microphone};
+use crate::ui::remote::{self, RemoteControl};
 use crate::ui::settings::Settings;
 use crate::ui::{dialogs, secrets};
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Button, DropDown, EventControllerKey,
     GestureClick, HeaderBar, IconTheme, Image, Label, Orientation, Overlay, Paned, ScaleButton,
-    MenuButton, Popover, Revealer, RevealerTransitionType, Stack, StackSwitcher, ToggleButton,
+    Revealer, RevealerTransitionType, Stack, StackSwitcher, ToggleButton,
 };
 use reoling::{looks_multi_channel, StreamProfile};
 use std::cell::{Cell, RefCell};
@@ -53,7 +54,8 @@ pub struct MainWindow {
     snapshot: Button,
     siren: Button,
     spotlight: ToggleButton,
-    ptz: MenuButton,
+    ptz: Button,
+    remote: Rc<RemoteControl>,
     talk: ToggleButton,
     updating_talk: Cell<bool>,
     /// A talk was asked for and the camera has not answered yet.
@@ -269,54 +271,34 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         spotlight.set_icon_name(icon_of(&["weather-clear-symbolic", "keyboard-brightness-symbolic"]));
         spotlight.set_tooltip_text(Some("Spotlight"));
         spotlight.set_sensitive(false);
-        // Pan/tilt: a pad that moves the camera while a direction is held.
-        let ptz = MenuButton::new();
-        ptz.set_icon_name(icon_of(&["input-dpad-symbolic", "object-move-symbolic", "find-location-symbolic"]));
-        ptz.set_tooltip_text(Some("Move the camera"));
+        // The camera's remote control opens in a window of its own.
+        let ptz = Button::from_icon_name(icon_of(&["input-dpad-symbolic", "object-move-symbolic", "find-location-symbolic"]));
+        ptz.set_tooltip_text(Some("Camera control"));
         ptz.set_sensitive(false);
-        let pad = gtk4::Grid::builder().row_spacing(4).column_spacing(4).margin_top(8).margin_bottom(8).margin_start(8).margin_end(8).build();
-        for (row, col, label, command) in [
-            (0, 1, "↑", "up"),
-            (1, 0, "←", "left"),
-            (1, 2, "→", "right"),
-            (2, 1, "↓", "down"),
-        ] {
-            // Moves while held: the camera goes on until told to stop.
-            let button = Button::with_label(label);
-            let hold = GestureClick::new();
-            hold.set_propagation_phase(gtk4::PropagationPhase::Capture);
-            let w = weak.clone();
-            hold.connect_pressed(move |_, _, _, _| {
-                if let Some(m) = w.upgrade() {
-                    m.control(move |link, channel| link.ptz(channel, command, PTZ_SPEED));
-                }
-            });
-            let w = weak.clone();
-            hold.connect_released(move |_, _, _, _| {
-                if let Some(m) = w.upgrade() {
-                    m.control(|link, channel| link.ptz(channel, "stop", 0));
-                }
-            });
-            let w = weak.clone();
-            hold.connect_stopped(move |_| {
-                if let Some(m) = w.upgrade() {
-                    m.control(|link, channel| link.ptz(channel, "stop", 0));
-                }
-            });
-            button.add_controller(hold);
-            pad.attach(&button, col, row, 1, 1);
-        }
-        let ptz_popover = Popover::new();
-        ptz_popover.set_child(Some(&pad));
-        // Closing the pad while a direction is held must not leave the camera
-        // moving.
         let w = weak.clone();
-        ptz_popover.connect_closed(move |_| {
+        ptz.connect_clicked(move |_| {
             if let Some(m) = w.upgrade() {
-                m.control(|link, channel| link.ptz(channel, "stop", 0));
+                m.open_remote();
             }
         });
-        ptz.set_popover(Some(&ptz_popover));
+        let (w_move, w_stop, w_zoom) = (weak.clone(), weak.clone(), weak.clone());
+        let remote = RemoteControl::new(remote::Handlers {
+            on_move: Box::new(move |command| {
+                if let Some(m) = w_move.upgrade() {
+                    m.control(move |link, channel| link.ptz(channel, command, PTZ_SPEED));
+                }
+            }),
+            on_stop: Box::new(move || {
+                if let Some(m) = w_stop.upgrade() {
+                    m.control(|link, channel| link.ptz(channel, "stop", 0));
+                }
+            }),
+            on_zoom: Box::new(move |position| {
+                if let Some(m) = w_zoom.upgrade() {
+                    m.control(move |link, channel| link.set_zoom(channel, position));
+                }
+            }),
+        });
         controls.append(&talk);
         controls.append(&siren);
         controls.append(&spotlight);
@@ -552,6 +534,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             siren,
             spotlight,
             ptz,
+            remote,
             talk,
             updating_talk: Cell::new(false),
             talk_pending: Cell::new(false),
@@ -762,6 +745,27 @@ impl MainWindow {
         }
     }
 
+    fn open_remote(&self) {
+        if self.remote.is_visible() {
+            self.remote.hide();
+        } else {
+            self.remote.present();
+            self.query_zoom();
+        }
+    }
+
+    /// Asks the watched camera where its zoom stands, if it has one.
+    fn query_zoom(&self) {
+        let has_zoom = self
+            .playing_key()
+            .and_then(|k| self.device(&k))
+            .and_then(|d| d.abilities.get(&d.channel).copied())
+            .is_some_and(|a| a.zoom);
+        if has_zoom {
+            self.control(|link, channel| link.query_zoom_focus(channel));
+        }
+    }
+
     fn set_talk_button(&self, on: bool) {
         self.updating_talk.set(true);
         self.talk.set_active(on);
@@ -964,7 +968,13 @@ impl MainWindow {
         }
         self.talk.set_tooltip_text(Some(if can_talk { "Talk" } else { "This camera has no two-way audio" }));
         self.ptz.set_sensitive(self.streaming.get() && has_ptz);
-        self.ptz.set_tooltip_text(Some(if has_ptz { "Move the camera" } else { "This camera cannot move" }));
+        let (move_ok, zoom_ok) = abilities.map_or((false, false), |a| (a.pan || a.tilt, a.zoom));
+        self.remote.set_enabled(self.streaming.get() && move_ok, self.streaming.get() && zoom_ok);
+        if let Some(d) = playing.as_deref().and_then(|k| self.device(k)) {
+            let camera = d.channels.iter().find(|c| c.channel_id == d.channel).map(|c| c.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("Channel {}", u16::from(d.channel) + 1));
+            self.remote.set_target(&format!("{} — {camera}", d.name));
+        }
+        self.ptz.set_tooltip_text(Some(if has_ptz { "Camera control" } else { "This camera cannot move" }));
         self.siren.set_sensitive(self.streaming.get() && siren);
         self.spotlight.set_sensitive(self.streaming.get() && spotlight);
         self.siren.set_tooltip_text(Some(if siren { "Sound the siren" } else { "This camera has no siren" }));
@@ -984,7 +994,9 @@ impl MainWindow {
             new.volume = this.settings.borrow().volume;
             let decoding_changed = {
                 let old = this.settings.borrow();
-                old.decoding != new.decoding || old.hardware_decoder != new.hardware_decoder
+                old.decoding != new.decoding
+                    || old.hardware_decoder != new.hardware_decoder
+                    || old.latency != new.latency
             };
             new.apply();
             new.save();
@@ -1132,7 +1144,7 @@ impl MainWindow {
                     self.talk_answered(code);
                     return;
                 }
-                if msg_id == 18 {
+                if msg_id == 18 || msg_id == 295 {
                     if code != 200 {
                         self.notify(&format!("Move: the camera refused (code {code})"));
                     }
@@ -1159,6 +1171,12 @@ impl MainWindow {
                 }
                 self.update_controls();
             }
+            DeviceEvent::ZoomFocus { channel_id, zoom } => {
+                let watching = self.playing_key().and_then(|k| self.device(&k)).is_some_and(|d| d.channel == channel_id);
+                if let (true, Some((min, max, current))) = (watching, zoom) {
+                    self.remote.set_zoom_range(min, max, current);
+                }
+            }
             DeviceEvent::ControlFailed(reason) => {
                 self.notify(&format!("Command not sent: {reason}"));
             }
@@ -1167,6 +1185,7 @@ impl MainWindow {
                     self.message.set_visible(false);
                     self.streaming.set(true);
                     self.update_controls();
+                    self.query_zoom();
                 }
             }
             DeviceEvent::PlayFailed(reason) => {

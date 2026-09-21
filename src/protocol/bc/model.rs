@@ -15,6 +15,9 @@ pub const MSG_ID_TALK_ABILITY: u32 = 10;
 pub const MSG_ID_TALK_STOP: u32 = 11;
 pub const MSG_ID_TALK_CONFIG: u32 = 201;
 pub const MSG_ID_TALK_DATA: u32 = 202;
+/// Zoom and focus positions of a camera: read (294) and set (295).
+pub const MSG_ID_GET_ZOOM_FOCUS: u32 = 294;
+pub const MSG_ID_SET_ZOOM_FOCUS: u32 = 295;
 /// Pan/tilt movement of a camera.
 pub const MSG_ID_PTZ: u32 = 18;
 /// Per-channel support table (which camera has a siren, spotlight, ...).

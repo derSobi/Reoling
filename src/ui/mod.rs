@@ -6,6 +6,7 @@ pub mod device_store;
 pub mod dialogs;
 pub mod icon;
 pub mod main_window;
+pub mod remote;
 pub mod secrets;
 pub mod settings;
 pub mod sidebar;

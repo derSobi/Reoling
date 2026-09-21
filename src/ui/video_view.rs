@@ -423,7 +423,9 @@ impl VideoView {
          * rendering, matching the `queue`'s own 3s capacity above so the
          * reserve it asks for can actually be held.
          */
-        pipeline.set_latency(gstreamer::ClockTime::from_seconds(3));
+        pipeline.set_latency(gstreamer::ClockTime::from_mseconds(
+            crate::ui::settings::latency().as_millis() as u64,
+        ));
 
         pipeline
             .set_state(gstreamer::State::Playing)

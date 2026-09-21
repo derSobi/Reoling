@@ -48,6 +48,8 @@ pub enum DeviceUpdate {
     ChannelName { channel_id: u8, name: String },
     /// What each channel's camera can do.
     Abilities(Vec<(u8, ChannelAbilities)>),
+    /// Where a camera's zoom stands and how far it goes.
+    ZoomFocus { channel_id: u8, zoom: Option<(u32, u32, u32)>, focus: Option<(u32, u32, u32)> },
     /// The device's answer to a control command (siren, spotlight).
     ControlReply { msg_id: u32, code: u16 },
 }
@@ -163,6 +165,14 @@ fn talk_config_xml(channel_id: u8) -> Vec<u8> {
     ))
 }
 
+/// Sets the zoom position, as the official app does (`zoomPos`; lengths 177
+/// to 179 bytes as captured for positions of one to three digits).
+fn zoom_xml(channel_id: u8, position: u32) -> Vec<u8> {
+    control_xml(&format!(
+        "<StartZoomFocus version=\"1.1\">\n<channelId>{channel_id}</channelId>\n<command>zoomPos</command>\n<movePos>{position}</movePos>\n</StartZoomFocus>\n"
+    ))
+}
+
 /// The spotlight command: on or off, with the 180 s duration both of the
 /// official app's messages carried (177 bytes each, as captured).
 fn spotlight_xml(channel_id: u8, on: bool) -> Vec<u8> {
@@ -178,6 +188,7 @@ fn pushed_update(bc: &Bc) -> Option<DeviceUpdate> {
     if bc.meta.msg_id == MSG_ID_PLAY_SIREN
         || bc.meta.msg_id == MSG_ID_SPOTLIGHT
         || bc.meta.msg_id == MSG_ID_PTZ
+        || bc.meta.msg_id == MSG_ID_SET_ZOOM_FOCUS
         || bc.meta.msg_id == MSG_ID_TALK_CONFIG
     {
         return Some(DeviceUpdate::ControlReply {
@@ -188,6 +199,7 @@ fn pushed_update(bc: &Bc) -> Option<DeviceUpdate> {
     if bc.meta.msg_id != MSG_ID_CHANNEL_INFO
         && bc.meta.msg_id != MSG_ID_OSD
         && bc.meta.msg_id != MSG_ID_SUPPORT
+        && bc.meta.msg_id != MSG_ID_GET_ZOOM_FOCUS
     {
         return None;
     }
@@ -209,6 +221,17 @@ fn pushed_update(bc: &Bc) -> Option<DeviceUpdate> {
         return None;
     };
     let xml = BcXml::from_bytes(payload).ok()?;
+    if let Some(zf) = xml.ptz_zoom_focus {
+        // (min, max, current)
+        let range = |r: Option<crate::protocol::bc::xml::PositionRange>| {
+            r.map(|r| (r.min_pos.unwrap_or(0), r.max_pos.unwrap_or(0), r.cur_pos.unwrap_or(0)))
+        };
+        return Some(DeviceUpdate::ZoomFocus {
+            channel_id: zf.channel_id.unwrap_or(bc.meta.channel_id),
+            zoom: range(zf.zoom),
+            focus: range(zf.focus),
+        });
+    }
     if let Some(support) = xml.support {
         let abilities = support.into_abilities();
         if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
@@ -599,6 +622,17 @@ impl ReolinkClient {
             body: BcBody::Modern(ModernMsg { extension_xml: Some(extension.to_bytes()), payload: None }),
         };
         self.connection.lock().await.send_bc(&request, &self.encryption).await
+    }
+
+    /// Asks where the camera's zoom and focus are and how far they go; the
+    /// answer arrives as `DeviceUpdate::ZoomFocus`.
+    pub async fn query_zoom_focus(&mut self, channel_id: u8) {
+        self.request_for_channel(MSG_ID_GET_ZOOM_FOCUS, channel_id).await;
+    }
+
+    /// Moves the zoom to a position (within what `query_zoom_focus` reported).
+    pub async fn set_zoom(&mut self, channel_id: u8, position: u32) -> crate::Result<()> {
+        self.send_control(MSG_ID_SET_ZOOM_FOCUS, channel_id, zoom_xml(channel_id, position)).await
     }
 
     /// Switches the camera's spotlight on or off.
@@ -1361,6 +1395,12 @@ mod control_tests {
     #[test]
     fn siren_command_has_the_length_of_the_official_one() {
         assert_eq!(siren_xml(0).len(), 223);
+    }
+
+    #[test]
+    fn zoom_commands_have_the_lengths_of_the_official_ones() {
+        assert_eq!(zoom_xml(0, 0).len(), 177);
+        assert_eq!(zoom_xml(0, 100).len(), 179);
     }
 
     #[test]
