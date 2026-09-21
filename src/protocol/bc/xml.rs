@@ -23,6 +23,27 @@ pub struct BcXml {
     pub osd_channel_name: Option<OsdChannelName>,
     #[serde(rename = "Support", skip_serializing_if = "Option::is_none")]
     pub support: Option<Support>,
+    #[serde(rename = "PtzZoomFocus", skip_serializing_if = "Option::is_none")]
+    pub ptz_zoom_focus: Option<PtzZoomFocus>,
+}
+
+/// A camera's zoom and focus: the range of positions and where they are.
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct PtzZoomFocus {
+    #[serde(rename = "channelId")]
+    pub channel_id: Option<u8>,
+    pub zoom: Option<PositionRange>,
+    pub focus: Option<PositionRange>,
+}
+
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct PositionRange {
+    #[serde(rename = "maxPos")]
+    pub max_pos: Option<u32>,
+    #[serde(rename = "minPos")]
+    pub min_pos: Option<u32>,
+    #[serde(rename = "curPos")]
+    pub cur_pos: Option<u32>,
 }
 
 /// What the device supports; the per-channel part is what we read.
@@ -342,6 +363,19 @@ mod channel_info_tests {
         assert!(of(0).siren && of(0).talk && of(0).pan && of(0).tilt && of(0).zoom && of(0).spotlight);
         assert!(of(2).siren && of(2).talk && of(2).spotlight && !of(2).pan);
         assert!(!of(3).siren && !of(3).talk && !of(3).spotlight);
+    }
+
+    #[test]
+    fn zoom_focus_reply_gives_ranges_and_positions() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" ?><body><PtzZoomFocus version="1.1">
+            <channelId>0</channelId>
+            <zoom><maxPos>3200</maxPos><minPos>1</minPos><curPos>120</curPos></zoom>
+            <focus><maxPos>3000</maxPos><minPos>0</minPos><curPos>800</curPos></focus>
+            </PtzZoomFocus></body>"#;
+        let zf = BcXml::from_bytes(xml).unwrap().ptz_zoom_focus.unwrap();
+        let zoom = zf.zoom.unwrap();
+        assert_eq!((zoom.min_pos, zoom.max_pos, zoom.cur_pos), (Some(1), Some(3200), Some(120)));
+        assert_eq!(zf.focus.unwrap().cur_pos, Some(800));
     }
 
     #[test]

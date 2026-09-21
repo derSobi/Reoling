@@ -17,6 +17,29 @@ pub enum Theme {
     Dark,
 }
 
+/// How long the picture is held back to ride out network jitter: shorter
+/// reacts faster (camera movement), longer smooths over a bad connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Latency {
+    /// 300 ms
+    Low,
+    /// 1 s
+    #[default]
+    Balanced,
+    /// 3 s
+    Smooth,
+}
+
+impl Latency {
+    pub fn millis(self) -> u64 {
+        match self {
+            Latency::Low => 300,
+            Latency::Balanced => 1000,
+            Latency::Smooth => 3000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Decoding {
     /// GStreamer's own choice (what `decodebin` ranks highest).
@@ -30,6 +53,7 @@ pub enum Decoding {
 pub struct Settings {
     pub theme: Theme,
     pub decoding: Decoding,
+    pub latency: Latency,
     /// With `Decoding::Hardware`: the decoder group to use (see
     /// `hardware_decoders`); `None` leaves the pick among them to GStreamer.
     pub hardware_decoder: Option<String>,
@@ -46,6 +70,7 @@ impl Default for Settings {
         Self {
             theme: Theme::default(),
             decoding: Decoding::default(),
+            latency: Latency::default(),
             hardware_decoder: None,
             volume: 0.5,
         }
@@ -69,6 +94,11 @@ impl Settings {
                 Some("hardware") => Decoding::Hardware,
                 Some("software") => Decoding::Software,
                 _ => Decoding::Auto,
+            },
+            latency: match get("latency").as_deref() {
+                Some("low") => Latency::Low,
+                Some("smooth") => Latency::Smooth,
+                _ => Latency::Balanced,
             },
             hardware_decoder: get("hardware_decoder").filter(|s| !s.is_empty()),
             volume: get("volume").and_then(|v| v.parse().ok()).map_or(0.5, |v: f64| v.clamp(0.0, 1.0)),
@@ -95,6 +125,15 @@ impl Settings {
                 Decoding::Software => "software",
             },
         );
+        file.set_string(
+            "settings",
+            "latency",
+            match self.latency {
+                Latency::Low => "low",
+                Latency::Balanced => "balanced",
+                Latency::Smooth => "smooth",
+            },
+        );
         file.set_string("settings", "volume", &self.volume.to_string());
         file.set_string("settings", "hardware_decoder", self.hardware_decoder.as_deref().unwrap_or(""));
         let path = path();
@@ -111,6 +150,7 @@ impl Settings {
     pub fn apply(&self) {
         apply_theme(self.theme);
         apply_decoding(self);
+        LATENCY_MS.store(self.latency.millis(), Ordering::Relaxed);
     }
 }
 
@@ -162,6 +202,12 @@ fn apply_theme(theme: Theme) {
 // --- decoding --------------------------------------------------------------
 
 static FORCE_SOFTWARE: AtomicBool = AtomicBool::new(false);
+static LATENCY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1000);
+
+/// How long new pipelines hold the picture (and sound) back.
+pub fn latency() -> std::time::Duration {
+    std::time::Duration::from_millis(LATENCY_MS.load(Ordering::Relaxed))
+}
 
 /// Whether new pipelines must use software decoders only.
 pub fn force_software() -> bool {

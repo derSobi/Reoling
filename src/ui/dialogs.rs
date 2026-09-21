@@ -1,7 +1,7 @@
 //! Modal dialogs: add a device, log in to a device.
 
 use crate::ui::bridge::ConnectTarget;
-use crate::ui::settings::{self, Decoding, Settings, Theme};
+use crate::ui::settings::{self, Decoding, Latency, Settings, Theme};
 use gtk4::prelude::*;
 use gtk4::{
     Box as GtkBox, Button, CheckButton, DropDown, Entry, Grid, Label, Notebook, Orientation,
@@ -216,6 +216,20 @@ pub fn settings(parent: &Window, current: &Settings, on_change: impl Fn(Settings
     );
     let video_grid = Grid::builder().row_spacing(10).column_spacing(12).build();
     row(&video_grid, 0, "Decoding", &decoding);
+    let latency = DropDown::new(
+        Some(StringList::new(&["Low (0.3 s)", "Balanced (1 s)", "Smooth (3 s)"])),
+        None::<gtk4::Expression>,
+    );
+    latency.set_selected(match current.latency {
+        Latency::Low => 0,
+        Latency::Balanced => 1,
+        Latency::Smooth => 2,
+    });
+    let latency_label = Label::new(Some("Latency"));
+    latency_label.set_halign(gtk4::Align::End);
+    video_grid.attach(&latency_label, 0, 2, 1, 1);
+    latency.set_hexpand(true);
+    video_grid.attach(&latency, 1, 2, 1, 1);
     let device_label = Label::new(Some("Decoder"));
     device_label.set_halign(gtk4::Align::End);
     video_grid.attach(&device_label, 0, 1, 1, 1);
@@ -223,7 +237,7 @@ pub fn settings(parent: &Window, current: &Settings, on_change: impl Fn(Settings
     video_grid.attach(&device, 1, 1, 1, 1);
     content.append(&video_grid);
 
-    let note = Label::new(Some("Decoding applies to streams started afterwards."));
+    let note = Label::new(Some("Decoding and latency apply to streams started afterwards. A shorter latency shows camera movement sooner but rides out a poor connection less well."));
     note.add_css_class("dim-label");
     note.set_halign(gtk4::Align::Start);
     content.append(&note);
@@ -243,7 +257,7 @@ pub fn settings(parent: &Window, current: &Settings, on_change: impl Fn(Settings
     show_device();
 
     let emit = {
-        let (theme, decoding, device) = (theme.clone(), decoding.clone(), device.clone());
+        let (theme, decoding, device, latency) = (theme.clone(), decoding.clone(), device.clone(), latency.clone());
         let base = current.clone();
         move || {
             let mode = modes.get(decoding.selected() as usize).map(|(m, _)| *m).unwrap_or_default();
@@ -254,6 +268,11 @@ pub fn settings(parent: &Window, current: &Settings, on_change: impl Fn(Settings
                     _ => Theme::Auto,
                 },
                 decoding: mode,
+                latency: match latency.selected() {
+                    0 => Latency::Low,
+                    2 => Latency::Smooth,
+                    _ => Latency::Balanced,
+                },
                 hardware_decoder: (device.selected() > 0)
                     .then(|| hardware.get(device.selected() as usize - 1).map(|d| d.key.clone()))
                     .flatten(),
@@ -262,7 +281,7 @@ pub fn settings(parent: &Window, current: &Settings, on_change: impl Fn(Settings
         }
     };
     let emit = std::rc::Rc::new(emit);
-    for dd in [&theme, &decoding, &device] {
+    for dd in [&theme, &decoding, &device, &latency] {
         let emit = std::rc::Rc::clone(&emit);
         let show_device = show_device.clone();
         dd.connect_selected_notify(move |_| {
