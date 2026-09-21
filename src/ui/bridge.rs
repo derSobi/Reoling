@@ -16,8 +16,8 @@ pub enum DeviceEvent {
     ControlFailed(String),
     /// What each channel's camera can do.
     Abilities(Vec<(u8, reoling::ChannelAbilities)>),
-    /// A camera's zoom as (min, max, current).
-    ZoomFocus { channel_id: u8, zoom: Option<(u32, u32, u32)> },
+    /// A camera's zoom and focus as (min, max, current).
+    ZoomFocus { channel_id: u8, zoom: Option<(u32, u32, u32)>, focus: Option<(u32, u32, u32)> },
     /// A channel's name, asked for because the channel list had none.
     ChannelName { channel_id: u8, name: String },
     /// The requested stream's first frame reached GStreamer.
@@ -39,6 +39,7 @@ enum Command {
     Ptz { channel: u8, command: &'static str, speed: u8 },
     QueryZoomFocus { channel: u8 },
     Zoom { channel: u8, position: u32 },
+    Focus { channel: u8, position: u32 },
     TalkStart { channel: u8 },
     TalkBlock { channel: u8, block: Vec<u8> },
     TalkStop { channel: u8 },
@@ -77,6 +78,10 @@ impl DeviceLink {
     /// Asks where the zoom is and how far it goes (answered as `ZoomFocus`).
     pub fn query_zoom_focus(&self, channel: u8) {
         let _ = self.commands.send(Command::QueryZoomFocus { channel });
+    }
+
+    pub fn set_focus(&self, channel: u8, position: u32) {
+        let _ = self.commands.send(Command::Focus { channel, position });
     }
 
     pub fn set_zoom(&self, channel: u8, position: u32) {
@@ -254,6 +259,11 @@ pub fn spawn_device(
                                 let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
                             }
                         }
+                        Some(Command::Focus { channel, position }) => {
+                            if let Err(e) = client.set_focus(channel, position).await {
+                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                            }
+                        }
                         Some(Command::TalkStart { channel }) => {
                             if let Err(e) = client.talk_start(channel).await {
                                 let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
@@ -291,8 +301,8 @@ pub fn spawn_device(
                                 DeviceEvent::ChannelName { channel_id, name }
                             }
                             DeviceUpdate::Abilities(abilities) => DeviceEvent::Abilities(abilities),
-                            DeviceUpdate::ZoomFocus { channel_id, zoom, .. } => {
-                                DeviceEvent::ZoomFocus { channel_id, zoom }
+                            DeviceUpdate::ZoomFocus { channel_id, zoom, focus } => {
+                                DeviceEvent::ZoomFocus { channel_id, zoom, focus }
                             }
                             DeviceUpdate::ControlReply { msg_id, code } => {
                                 DeviceEvent::ControlReply { msg_id, code }

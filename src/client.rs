@@ -173,6 +173,12 @@ fn zoom_xml(channel_id: u8, position: u32) -> Vec<u8> {
     ))
 }
 
+fn focus_xml(channel_id: u8, position: u32) -> Vec<u8> {
+    control_xml(&format!(
+        "<StartZoomFocus version=\"1.1\">\n<channelId>{channel_id}</channelId>\n<command>focusPos</command>\n<movePos>{position}</movePos>\n</StartZoomFocus>\n"
+    ))
+}
+
 /// The spotlight command: on or off, with the 180 s duration both of the
 /// official app's messages carried (177 bytes each, as captured).
 fn spotlight_xml(channel_id: u8, on: bool) -> Vec<u8> {
@@ -633,6 +639,12 @@ impl ReolinkClient {
     /// Moves the zoom to a position (within what `query_zoom_focus` reported).
     pub async fn set_zoom(&mut self, channel_id: u8, position: u32) -> crate::Result<()> {
         self.send_control(MSG_ID_SET_ZOOM_FOCUS, channel_id, zoom_xml(channel_id, position)).await
+    }
+
+    /// Moves the focus to a position. The command name is `focusPos`, by
+    /// analogy with the captured `zoomPos`; not itself seen in a capture.
+    pub async fn set_focus(&mut self, channel_id: u8, position: u32) -> crate::Result<()> {
+        self.send_control(MSG_ID_SET_ZOOM_FOCUS, channel_id, focus_xml(channel_id, position)).await
     }
 
     /// Switches the camera's spotlight on or off.

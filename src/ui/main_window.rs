@@ -281,7 +281,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
                 m.open_remote();
             }
         });
-        let (w_move, w_stop, w_zoom) = (weak.clone(), weak.clone(), weak.clone());
+        let (w_move, w_stop, w_zoom, w_focus) = (weak.clone(), weak.clone(), weak.clone(), weak.clone());
         let remote = RemoteControl::new(remote::Handlers {
             on_move: Box::new(move |command| {
                 if let Some(m) = w_move.upgrade() {
@@ -296,6 +296,11 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             on_zoom: Box::new(move |position| {
                 if let Some(m) = w_zoom.upgrade() {
                     m.control(move |link, channel| link.set_zoom(channel, position));
+                }
+            }),
+            on_focus: Box::new(move |position| {
+                if let Some(m) = w_focus.upgrade() {
+                    m.control(move |link, channel| link.set_focus(channel, position));
                 }
             }),
         });
@@ -969,7 +974,7 @@ impl MainWindow {
         self.talk.set_tooltip_text(Some(if can_talk { "Talk" } else { "This camera has no two-way audio" }));
         self.ptz.set_sensitive(self.streaming.get() && has_ptz);
         let (move_ok, zoom_ok) = abilities.map_or((false, false), |a| (a.pan || a.tilt, a.zoom));
-        self.remote.set_enabled(self.streaming.get() && move_ok, self.streaming.get() && zoom_ok);
+        self.remote.set_enabled(self.streaming.get() && move_ok, self.streaming.get() && zoom_ok, self.streaming.get() && zoom_ok);
         if let Some(d) = playing.as_deref().and_then(|k| self.device(k)) {
             let camera = d.channels.iter().find(|c| c.channel_id == d.channel).map(|c| c.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("Channel {}", u16::from(d.channel) + 1));
             self.remote.set_target(&format!("{} — {camera}", d.name));
@@ -1171,10 +1176,15 @@ impl MainWindow {
                 }
                 self.update_controls();
             }
-            DeviceEvent::ZoomFocus { channel_id, zoom } => {
+            DeviceEvent::ZoomFocus { channel_id, zoom, focus } => {
                 let watching = self.playing_key().and_then(|k| self.device(&k)).is_some_and(|d| d.channel == channel_id);
-                if let (true, Some((min, max, current))) = (watching, zoom) {
-                    self.remote.set_zoom_range(min, max, current);
+                if watching {
+                    if let Some((min, max, current)) = zoom {
+                        self.remote.set_zoom_range(min, max, current);
+                    }
+                    if let Some((min, max, current)) = focus {
+                        self.remote.set_focus_range(min, max, current);
+                    }
                 }
             }
             DeviceEvent::ControlFailed(reason) => {
