@@ -1,11 +1,13 @@
 use crate::protocol::bc::header_codec::{read_header, write_header};
 use crate::protocol::bc::model::{
-    has_payload_offset, Bc, BcBody, BcHeader, BcMeta, LegacyMsg, ModernMsg, MSG_ID_LOGIN,
+    has_payload_offset, Bc, BcBody, BcHeader, BcMeta, LegacyMsg, ModernMsg, MSG_ID_LOGIN, MSG_ID_TALK_DATA,
 };
 use crate::protocol::bc::xml::Extension;
 use crate::protocol::crypto::EncryptionProtocol;
 use crate::protocol::Error;
 use std::collections::HashSet;
+
+const BINARY_MARK: &[u8] = b"<binaryData>1</binaryData>";
 
 pub fn write_bc(bc: &Bc, enc: &EncryptionProtocol) -> Vec<u8> {
     // Symmetric with `read_bc`'s override: the whole login exchange (both
@@ -28,8 +30,22 @@ pub fn write_bc(bc: &Bc, enc: &EncryptionProtocol) -> Vec<u8> {
                 body.extend_from_slice(&encrypted_ext);
             }
             if let Some(payload) = &modern.payload {
-                let encrypted_payload = enc.encrypt(offset, payload);
-                body.extend_from_slice(&encrypted_payload);
+                // Talk audio (which announces binary data in its extension)
+                // goes out unencrypted: the official app's messages, captured,
+                // start with a plain BcMedia magic while their extension is
+                // encrypted. Only these: the camera's own video messages
+                // encrypt their payload (partly, see `encryptLen`).
+                let is_binary = bc.meta.msg_id == MSG_ID_TALK_DATA
+                    && modern
+                        .extension_xml
+                        .as_deref()
+                        .is_some_and(|e| e.windows(BINARY_MARK.len()).any(|w| w == BINARY_MARK));
+                if is_binary {
+                    body.extend_from_slice(payload);
+                } else {
+                    let encrypted_payload = enc.encrypt(offset, payload);
+                    body.extend_from_slice(&encrypted_payload);
+                }
             }
             // Only classes that actually carry the payload_offset word
             // (0x6414, 0x0000) get `Some`; e.g. 0x6614 (the encrypted reply
@@ -441,5 +457,33 @@ mod tests {
         // The bug: AES-decrypting this already-clear payload would turn it
         // into garbage. It must come back untouched.
         assert_eq!(payload2, plain_payload2);
+    }
+}
+
+#[cfg(test)]
+mod talk_payload_tests {
+    use super::*;
+
+    #[test]
+    fn talk_audio_payload_goes_out_unencrypted_but_its_extension_does_not() {
+        let key = EncryptionProtocol::Aes { key: [7u8; 16] };
+        let payload = b"01wb-plain-audio-block".to_vec();
+        let ext = b"<Extension version=\"1.1\"><binaryData>1</binaryData><channelId>0</channelId></Extension>".to_vec();
+        let mk = |msg_id| Bc {
+            meta: BcMeta {
+                msg_id,
+                channel_id: 0,
+                stream_type: 0,
+                msg_num: 1,
+                response_code: 0,
+                class: 0x6414,
+            },
+            body: BcBody::Modern(ModernMsg { extension_xml: Some(ext.clone()), payload: Some(payload.clone()) }),
+        };
+        let talk = write_bc(&mk(MSG_ID_TALK_DATA), &key);
+        assert!(talk.windows(payload.len()).any(|w| w == payload), "talk payload is plain");
+        assert!(!talk.windows(ext.len()).any(|w| w == ext), "its extension is encrypted");
+        let other = write_bc(&mk(3), &key);
+        assert!(!other.windows(payload.len()).any(|w| w == payload), "other payloads stay encrypted");
     }
 }

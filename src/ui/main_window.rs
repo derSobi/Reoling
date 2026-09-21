@@ -5,7 +5,7 @@ use crate::ui::bridge::{spawn_device, DeviceEvent, DeviceLink, SinkRequest, UidT
 use crate::ui::device_store::{self, Device};
 use crate::ui::sidebar::{Handlers, Sidebar, Status};
 use crate::ui::video_view::VideoView;
-use crate::ui::audio::AudioOutput;
+use crate::ui::audio::{AudioOutput, Microphone};
 use crate::ui::settings::Settings;
 use crate::ui::{dialogs, secrets};
 use gtk4::prelude::*;
@@ -54,6 +54,12 @@ pub struct MainWindow {
     siren: Button,
     spotlight: ToggleButton,
     ptz: MenuButton,
+    talk: ToggleButton,
+    updating_talk: Cell<bool>,
+    /// A talk was asked for and the camera has not answered yet.
+    talk_pending: Cell<bool>,
+    talk_retried: Cell<bool>,
+    microphone: RefCell<Option<Microphone>>,
     updating_spotlight: Cell<bool>,
     record: ToggleButton,
     /// Set while the code, not the user, flips the record button.
@@ -244,9 +250,18 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         controls.append(&record);
         controls.append(&gtk4::Separator::new(Orientation::Vertical));
         // Camera controls, per channel. Talk is not built yet.
-        let talk = Button::from_icon_name("audio-input-microphone-symbolic");
+        let talk = ToggleButton::new();
+        talk.set_icon_name("audio-input-microphone-symbolic");
         talk.set_tooltip_text(Some("Talk"));
         talk.set_sensitive(false);
+        let w = weak.clone();
+        talk.connect_toggled(move |button| {
+            if let Some(m) = w.upgrade() {
+                if !m.updating_talk.get() {
+                    m.toggle_talk(button.is_active());
+                }
+            }
+        });
         let siren = Button::from_icon_name(icon_of(&["alarm-symbolic", "dialog-warning-symbolic"]));
         siren.set_tooltip_text(Some("Sound the siren"));
         siren.set_sensitive(false);
@@ -547,6 +562,11 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             siren,
             spotlight,
             ptz,
+            talk,
+            updating_talk: Cell::new(false),
+            talk_pending: Cell::new(false),
+            talk_retried: Cell::new(false),
+            microphone: RefCell::new(None),
             updating_spotlight: Cell::new(false),
             record,
             updating_record: Cell::new(false),
@@ -744,11 +764,77 @@ impl MainWindow {
     }
 
     /// Sends a control command to the channel being watched.
-    fn control(self: &Rc<Self>, send: impl FnOnce(&crate::ui::bridge::DeviceLink, u8)) {
+    fn control(&self, send: impl FnOnce(&crate::ui::bridge::DeviceLink, u8)) {
         let Some(key) = self.playing_key() else { return };
         let Some(device) = self.device(&key) else { return };
         if let Some(l) = self.links.borrow().get(&key) {
             send(&l.link, device.channel);
+        }
+    }
+
+    fn set_talk_button(&self, on: bool) {
+        self.updating_talk.set(true);
+        self.talk.set_active(on);
+        self.updating_talk.set(false);
+    }
+
+    /// The Talk button: opens a session with the camera and, once it accepts,
+    /// starts sending the microphone.
+    fn toggle_talk(self: &Rc<Self>, on: bool) {
+        if on {
+            self.talk_pending.set(true);
+            self.talk_retried.set(false);
+            self.control(|link, channel| link.talk_start(channel));
+        } else {
+            self.end_talk();
+        }
+    }
+
+    /// Ends any talk: the microphone stops, the camera is told, the button
+    /// pops out.
+    fn end_talk(&self) {
+        let was = self.talk_pending.replace(false) || self.microphone.borrow_mut().take().is_some();
+        self.set_talk_button(false);
+        if was {
+            self.control(|link, channel| link.talk_stop(channel));
+        }
+        self.update_controls();
+    }
+
+    /// The camera answered the talk configuration.
+    fn talk_answered(self: &Rc<Self>, code: u16) {
+        if !self.talk_pending.get() {
+            return;
+        }
+        if code == 422 && !self.talk_retried.get() {
+            // Another talk is still open on the camera (or one of ours died):
+            // close it and ask again, as the official app does.
+            self.talk_retried.set(true);
+            self.control(|link, channel| link.talk_stop(channel));
+            self.control(|link, channel| link.talk_start(channel));
+            return;
+        }
+        if code != 200 {
+            self.talk_pending.set(false);
+            self.set_talk_button(false);
+            self.notify(&format!("Talk: the camera refused (code {code})"));
+            return;
+        }
+        self.talk_pending.set(false);
+        let Some(key) = self.playing_key() else { return };
+        let Some(device) = self.device(&key) else { return };
+        let sink = self.links.borrow().get(&key).map(|l| l.link.talk_sink(device.channel));
+        let Some(sink) = sink else { return };
+        match Microphone::start(sink) {
+            Ok(mic) => {
+                *self.microphone.borrow_mut() = Some(mic);
+                self.notify("Talking… press the microphone again to stop");
+            }
+            Err(e) => {
+                self.set_talk_button(false);
+                self.control(|link, channel| link.talk_stop(channel));
+                self.notify(&format!("No microphone: {e}"));
+            }
         }
     }
 
@@ -882,6 +968,11 @@ impl MainWindow {
             .and_then(|d| d.abilities.get(&d.channel).copied());
         let (siren, spotlight) = abilities.map_or((true, true), |a| (a.siren, a.spotlight));
         let has_ptz = abilities.is_some_and(|a| a.ptz());
+        let can_talk = abilities.is_some_and(|a| a.talk);
+        if !self.talk.is_active() {
+            self.talk.set_sensitive(self.streaming.get() && can_talk);
+        }
+        self.talk.set_tooltip_text(Some(if can_talk { "Talk" } else { "This camera has no two-way audio" }));
         self.ptz.set_sensitive(self.streaming.get() && has_ptz);
         self.ptz.set_tooltip_text(Some(if has_ptz { "Move the camera" } else { "This camera cannot move" }));
         self.siren.set_sensitive(self.streaming.get() && siren);
@@ -1047,6 +1138,10 @@ impl MainWindow {
                 }
             }
             DeviceEvent::ControlReply { msg_id, code } => {
+                if msg_id == 201 {
+                    self.talk_answered(code);
+                    return;
+                }
                 if msg_id == 18 {
                     if code != 200 {
                         self.notify(&format!("Move: the camera refused (code {code})"));
@@ -1199,6 +1294,7 @@ impl MainWindow {
         }
         self.reset_video();
         self.set_spotlight_button(false);
+        self.end_talk();
         *self.stopped.borrow_mut() = None;
         *self.playing.borrow_mut() = Some(key.to_string());
         *self.last_played.borrow_mut() = Some(key.to_string());
@@ -1224,6 +1320,7 @@ impl MainWindow {
         if let Some(l) = self.links.borrow().get(&key) {
             l.link.stop();
         }
+        self.end_talk();
         self.video.freeze();
         if let Some(sink) = self.video.current_sink() {
             sink.stop_recording();
