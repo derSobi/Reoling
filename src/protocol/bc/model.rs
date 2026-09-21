@@ -10,6 +10,10 @@ pub const MSG_ID_VERSION: u32 = 80;
 pub const MSG_ID_ABILITY_SUPPORT: u32 = 58;
 /// On-screen-display settings of a channel; carries the channel's name.
 pub const MSG_ID_OSD: u32 = 44;
+/// Plays the siren once. Seen in a capture of the official app.
+pub const MSG_ID_PLAY_SIREN: u32 = 263;
+/// Switches the spotlight (floodlight) on or off.
+pub const MSG_ID_SPOTLIGHT: u32 = 288;
 /// Empty request the official app sends after login; the answer describes
 /// the encoder settings per stream.
 pub const MSG_ID_STREAM_INFO: u32 = 146;

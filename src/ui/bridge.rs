@@ -9,6 +9,11 @@ pub enum DeviceEvent {
     Connected(DeviceIdentity),
     /// The device (NVR / Home Hub) described its channels.
     Channels(Vec<ChannelInfo>),
+    /// The device's answer to a siren or spotlight command (`code` 200 is
+    /// success).
+    ControlReply { msg_id: u32, code: u16 },
+    /// A control command could not even be sent.
+    ControlFailed(String),
     /// A channel's name, asked for because the channel list had none.
     ChannelName { channel_id: u8, name: String },
     /// The requested stream's first frame reached GStreamer.
@@ -25,6 +30,8 @@ pub enum DeviceEvent {
 
 enum Command {
     Play { channel: u8, profile: StreamProfile },
+    Siren { channel: u8 },
+    Spotlight { channel: u8, on: bool },
     Stop,
     Shutdown,
 }
@@ -40,6 +47,16 @@ impl DeviceLink {
     /// Streams the channel (replacing whatever this device was streaming).
     pub fn play(&self, channel: u8, profile: StreamProfile) {
         let _ = self.commands.send(Command::Play { channel, profile });
+    }
+
+    /// Plays the camera's siren once.
+    pub fn siren(&self, channel: u8) {
+        let _ = self.commands.send(Command::Siren { channel });
+    }
+
+    /// Spotlight on or off.
+    pub fn spotlight(&self, channel: u8, on: bool) {
+        let _ = self.commands.send(Command::Spotlight { channel, on });
     }
 
     /// Stops the stream; the connection stays.
@@ -172,6 +189,16 @@ pub fn spawn_device(
                                 }
                             }
                         }
+                        Some(Command::Siren { channel }) => {
+                            if let Err(e) = client.play_siren(channel).await {
+                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                            }
+                        }
+                        Some(Command::Spotlight { channel, on }) => {
+                            if let Err(e) = client.set_spotlight(channel, on).await {
+                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                            }
+                        }
                         Some(Command::Stop) => {
                             if frames.take().is_some() {
                                 let _ = client.stop_video(channel).await;
@@ -196,6 +223,9 @@ pub fn spawn_device(
                             }
                             DeviceUpdate::ChannelName { channel_id, name } => {
                                 DeviceEvent::ChannelName { channel_id, name }
+                            }
+                            DeviceUpdate::ControlReply { msg_id, code } => {
+                                DeviceEvent::ControlReply { msg_id, code }
                             }
                         };
                         if tx.send(event).await.is_err() {

@@ -26,6 +26,8 @@ pub struct DeviceInfoSummary {
 pub enum DeviceUpdate {
     Channels(Vec<ChannelInfo>),
     ChannelName { channel_id: u8, name: String },
+    /// The device's answer to a control command (siren, spotlight).
+    ControlReply { msg_id: u32, code: u16 },
 }
 
 /// What the device says it is, as reported after login.
@@ -109,9 +111,36 @@ struct PlayingStream {
     bc_stream_type: u8,
 }
 
+fn control_xml(inner: &str) -> Vec<u8> {
+    format!("<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n{inner}</body>\n").into_bytes()
+}
+
+/// The siren command exactly as the official app sends it (same length, as
+/// captured: 223 bytes): one play, not a switch.
+fn siren_xml(channel_id: u8) -> Vec<u8> {
+    control_xml(&format!(
+        "<audioPlayInfo version=\"1.1\">\n<channelId>{channel_id}</channelId>\n<playMode>0</playMode>\n<playDuration>0</playDuration>\n<playTimes>1</playTimes>\n<onOff>0</onOff>\n</audioPlayInfo>\n"
+    ))
+}
+
+/// The spotlight command: on or off, with the 180 s duration both of the
+/// official app's messages carried (177 bytes each, as captured).
+fn spotlight_xml(channel_id: u8, on: bool) -> Vec<u8> {
+    control_xml(&format!(
+        "<FloodlightManual version=\"1.1\">\n<channelId>{channel_id}</channelId>\n<status>{}</status>\n<duration>180</duration>\n</FloodlightManual>\n",
+        u8::from(on)
+    ))
+}
+
 /// What `bc` tells us, if it is a pushed channel list or the answer to a
 /// channel-name request.
 fn pushed_update(bc: &Bc) -> Option<DeviceUpdate> {
+    if bc.meta.msg_id == MSG_ID_PLAY_SIREN || bc.meta.msg_id == MSG_ID_SPOTLIGHT {
+        return Some(DeviceUpdate::ControlReply {
+            msg_id: bc.meta.msg_id,
+            code: bc.meta.response_code,
+        });
+    }
     if bc.meta.msg_id != MSG_ID_CHANNEL_INFO && bc.meta.msg_id != MSG_ID_OSD {
         return None;
     }
@@ -421,6 +450,43 @@ impl ReolinkClient {
         })
     }
 
+    /// A command about one channel: the channel goes in the extension, the
+    /// command itself in the payload. The answer arrives as a
+    /// `DeviceUpdate::ControlReply`.
+    async fn send_control(&mut self, msg_id: u32, channel_id: u8, xml: Vec<u8>) -> crate::Result<()> {
+        let msg_num = self.next_msg_num();
+        let extension = Extension {
+            version: XML_VERSION.to_string(),
+            channel_id: Some(channel_id),
+            ..Default::default()
+        };
+        let request = Bc {
+            meta: BcMeta {
+                msg_id,
+                channel_id,
+                stream_type: 0,
+                msg_num,
+                response_code: 0,
+                class: 0x6414,
+            },
+            body: BcBody::Modern(ModernMsg {
+                extension_xml: Some(extension.to_bytes()),
+                payload: Some(xml),
+            }),
+        };
+        self.connection.lock().await.send_bc(&request, &self.encryption).await
+    }
+
+    /// Plays the camera's siren once.
+    pub async fn play_siren(&mut self, channel_id: u8) -> crate::Result<()> {
+        self.send_control(MSG_ID_PLAY_SIREN, channel_id, siren_xml(channel_id)).await
+    }
+
+    /// Switches the camera's spotlight on or off.
+    pub async fn set_spotlight(&mut self, channel_id: u8, on: bool) -> crate::Result<()> {
+        self.send_control(MSG_ID_SPOTLIGHT, channel_id, spotlight_xml(channel_id, on)).await
+    }
+
     async fn send_empty_request(&mut self, msg_id: u32) -> crate::Result<()> {
         let msg_num = self.next_msg_num();
         let request = Bc {
@@ -521,6 +587,12 @@ impl ReolinkClient {
         // camera controls to offer; shown here to see how the devices word it.
         for channel_id in 0..3u8 {
             self.request_for_channel(MSG_ID_ABILITY_SUPPORT, channel_id).await;
+            // The per-channel requests the official app makes at start (talk
+            // ability, channel type, and others): which of the answers says
+            // what each camera can do is what this looks for.
+            for msg_id in [10u32, 318, 299, 56, 199] {
+                self.request_for_channel(msg_id, channel_id).await;
+            }
         }
         for msg_id in [192u32, 146] {
             let msg_num = self.next_msg_num();
@@ -1156,5 +1228,23 @@ mod tests {
         assert_eq!(frame.microseconds, 999);
 
         fake_camera.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    // Lengths measured on the official app's messages (the payloads are
+    // encrypted, but encryption keeps the length).
+    #[test]
+    fn siren_command_has_the_length_of_the_official_one() {
+        assert_eq!(siren_xml(0).len(), 223);
+    }
+
+    #[test]
+    fn spotlight_commands_have_the_length_of_the_official_ones() {
+        assert_eq!(spotlight_xml(0, true).len(), 177);
+        assert_eq!(spotlight_xml(0, false).len(), 177);
     }
 }
