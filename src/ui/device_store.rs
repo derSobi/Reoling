@@ -18,6 +18,8 @@ pub struct Device {
     pub multi_channel: bool,
     /// What the device reported about its channels this run (not saved).
     pub channels: Vec<reoling::ChannelInfo>,
+    /// What each channel's camera can do, as the device reported it this run.
+    pub abilities: std::collections::HashMap<u8, reoling::ChannelAbilities>,
 }
 
 impl Device {
@@ -36,6 +38,7 @@ impl Device {
             channel: 0,
             multi_channel: false,
             channels: Vec::new(),
+            abilities: Default::default(),
         }
     }
 }
@@ -75,6 +78,7 @@ pub fn load() -> (Vec<Device>, Option<String>) {
             channel: get("channel").and_then(|s| s.parse().ok()).unwrap_or(0),
             multi_channel: get("multi_channel").as_deref() == Some("true"),
             channels: Vec::new(),
+            abilities: Default::default(),
         });
     }
     (devices, last)
