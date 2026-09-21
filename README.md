@@ -9,15 +9,42 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 
 ## Status
 
-Early development (0.1.0). The Baichuan protocol (binary framing, XML
-payloads, BCEncrypt/AES encryption, P2P discovery and NAT traversal),
-login and live video work end-to-end against real hardware, rendered in
-the desktop app itself (H.264 and H.265, auto-detected). Connections go
-over UDP/P2P: Reoling races the device's local, NAT-mapped and relay
-addresses at the same time and uses whichever answers first, exactly as
-the official client does.
+Version **0.1.1**, early development. Login and live video work end to end
+against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
+only: Reoling races the device's local, NAT-mapped and relay addresses at
+the same time and uses whichever answers first, as the official client does.
 
-There is no packaged release yet — see [Installation](#installation).
+**What the app does today**
+
+- Devices: add by UID or IP; every saved device connects at start and shows
+  *Connected* / *Not connected*; one password per device, kept in the desktop
+  keyring; the device's own name, channels (with their names) and the streams
+  each channel offers (main / extern / sub) are read from the device.
+- Live view: click a device or one of its channels; the lightest stream is
+  the default; Stop freezes the picture and becomes Play; the last stream
+  restarts on the next start; fullscreen with a control bar that slides in.
+- Sound: the stream's audio with a volume control; Talk (microphone to the
+  camera, ADPCM).
+- Camera controls, shown per channel from what the camera reports: siren,
+  spotlight, pan/tilt (hold a direction to move).
+- Snapshot (PNG in `~/Pictures/Reoling`) and recording (MKV in
+  `~/Videos/Reoling`).
+- Settings: theme (Auto / Light / Dark), decoding (Auto / Hardware — with the
+  decoder to use if there are several — / Software). Colours are the active
+  theme's.
+
+**Not done yet**
+
+- Playback (the tab is a placeholder), Split View, zoom on PTZ cameras.
+- Packaging (see [Installation](#installation)).
+- Talk has been built from the official app's captured messages but is the
+  least tested part.
+
+**Version history**
+
+- 0.1.1 — camera controls (siren, spotlight, pan/tilt, talk), snapshot,
+  recording, audio, settings, per-channel streams, stop/play, fullscreen bar.
+- 0.1.0 — protocol, P2P discovery, login, live video, first UI.
 
 ## How it works
 
@@ -41,7 +68,9 @@ src/
 ├── transport/   P2P/UDP: UID resolution, NAT traversal, relay fallback,
 │                and the reliable BCUDP connection.
 ├── client.rs    Client/session API: login and live video.
-├── ui/          GTK4 + GStreamer desktop app (connect dialog, video view).
+├── talk.rs      ADPCM encoding for Talk.
+├── ui/          GTK4 + GStreamer desktop app (main window, sidebar,
+│                dialogs, settings, video and audio).
 └── main.rs      The `reoling` binary.
 examples/        Small diagnostic tools (UID probe, media trace analysis).
 data/            Icons.
@@ -74,8 +103,8 @@ cargo build --release
 cargo run --release
 ```
 
-Connect with the device's UID, a username and a password, and pick the
-zero-based channel. `--prefer-tcp` is a diagnostic-only flag that tries a
+Add a device with the **+** in the device list (its UID, or IP and port),
+then log in with the device's username and password. `--prefer-tcp` is a diagnostic-only flag that tries a
 direct TCP connection when the device is reachable that way; the normal
 path is always UDP/P2P.
 

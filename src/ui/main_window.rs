@@ -276,43 +276,33 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         ptz.set_sensitive(false);
         let pad = gtk4::Grid::builder().row_spacing(4).column_spacing(4).margin_top(8).margin_bottom(8).margin_start(8).margin_end(8).build();
         for (row, col, label, command) in [
-            (0, 0, "↖", "leftUp"),
             (0, 1, "↑", "up"),
-            (0, 2, "↗", "rightUp"),
             (1, 0, "←", "left"),
-            (1, 1, "■", "stop"),
             (1, 2, "→", "right"),
-            (2, 0, "↙", "leftDown"),
             (2, 1, "↓", "down"),
-            (2, 2, "↘", "rightDown"),
         ] {
+            // Moves while held: the camera goes on until told to stop.
             let button = Button::with_label(label);
             let hold = GestureClick::new();
             hold.set_propagation_phase(gtk4::PropagationPhase::Capture);
             let w = weak.clone();
             hold.connect_pressed(move |_, _, _, _| {
                 if let Some(m) = w.upgrade() {
-                    if command == "stop" {
-                        m.control(|link, channel| link.ptz(channel, "stop", 0));
-                    } else {
-                        m.control(move |link, channel| link.ptz(channel, command, PTZ_SPEED));
-                    }
+                    m.control(move |link, channel| link.ptz(channel, command, PTZ_SPEED));
                 }
             });
-            if command != "stop" {
-                let w = weak.clone();
-                hold.connect_released(move |_, _, _, _| {
-                    if let Some(m) = w.upgrade() {
-                        m.control(|link, channel| link.ptz(channel, "stop", 0));
-                    }
-                });
-                let w = weak.clone();
-                hold.connect_stopped(move |_| {
-                    if let Some(m) = w.upgrade() {
-                        m.control(|link, channel| link.ptz(channel, "stop", 0));
-                    }
-                });
-            }
+            let w = weak.clone();
+            hold.connect_released(move |_, _, _, _| {
+                if let Some(m) = w.upgrade() {
+                    m.control(|link, channel| link.ptz(channel, "stop", 0));
+                }
+            });
+            let w = weak.clone();
+            hold.connect_stopped(move |_| {
+                if let Some(m) = w.upgrade() {
+                    m.control(|link, channel| link.ptz(channel, "stop", 0));
+                }
+            });
             button.add_controller(hold);
             pad.attach(&button, col, row, 1, 1);
         }
