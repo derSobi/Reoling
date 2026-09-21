@@ -27,7 +27,17 @@ pub struct ChannelAbilities {
     pub spotlight: bool,
     /// Two-way audio.
     pub talk: bool,
-    pub ptz: bool,
+    /// Motors: pan, tilt and zoom.
+    pub pan: bool,
+    pub tilt: bool,
+    pub zoom: bool,
+}
+
+impl ChannelAbilities {
+    /// Has any motor.
+    pub fn ptz(&self) -> bool {
+        self.pan || self.tilt || self.zoom
+    }
 }
 
 /// Something the device told us without being asked, or as the answer to a
@@ -135,6 +145,14 @@ fn siren_xml(channel_id: u8) -> Vec<u8> {
     ))
 }
 
+/// A pan/tilt command as the official app sends it (speed 32 to move, 0 to
+/// stop; lengths 163/164 and 162 as captured).
+fn ptz_xml(channel_id: u8, command: &str, speed: u8) -> Vec<u8> {
+    control_xml(&format!(
+        "<PtzControl version=\"1.1\">\n<channelId>{channel_id}</channelId>\n<speed>{speed}</speed>\n<command>{command}</command>\n</PtzControl>\n"
+    ))
+}
+
 /// The spotlight command: on or off, with the 180 s duration both of the
 /// official app's messages carried (177 bytes each, as captured).
 fn spotlight_xml(channel_id: u8, on: bool) -> Vec<u8> {
@@ -147,7 +165,10 @@ fn spotlight_xml(channel_id: u8, on: bool) -> Vec<u8> {
 /// What `bc` tells us, if it is a pushed channel list or the answer to a
 /// channel-name request.
 fn pushed_update(bc: &Bc) -> Option<DeviceUpdate> {
-    if bc.meta.msg_id == MSG_ID_PLAY_SIREN || bc.meta.msg_id == MSG_ID_SPOTLIGHT {
+    if bc.meta.msg_id == MSG_ID_PLAY_SIREN
+        || bc.meta.msg_id == MSG_ID_SPOTLIGHT
+        || bc.meta.msg_id == MSG_ID_PTZ
+    {
         return Some(DeviceUpdate::ControlReply {
             msg_id: bc.meta.msg_id,
             code: bc.meta.response_code,
@@ -502,6 +523,13 @@ impl ReolinkClient {
     /// Plays the camera's siren once.
     pub async fn play_siren(&mut self, channel_id: u8) -> crate::Result<()> {
         self.send_control(MSG_ID_PLAY_SIREN, channel_id, siren_xml(channel_id)).await
+    }
+
+    /// Starts moving the camera (`left`, `right`, `up`, `down`, `leftUp`,
+    /// `leftDown`, `rightUp`, `rightDown`) or, with `stop`, stops it. It
+    /// moves until told to stop.
+    pub async fn ptz(&mut self, channel_id: u8, command: &str, speed: u8) -> crate::Result<()> {
+        self.send_control(MSG_ID_PTZ, channel_id, ptz_xml(channel_id, command, speed)).await
     }
 
     /// Switches the camera's spotlight on or off.
@@ -1264,6 +1292,13 @@ mod control_tests {
     #[test]
     fn siren_command_has_the_length_of_the_official_one() {
         assert_eq!(siren_xml(0).len(), 223);
+    }
+
+    #[test]
+    fn ptz_commands_have_the_length_of_the_official_ones() {
+        assert_eq!(ptz_xml(0, "left", 32).len(), 163);
+        assert_eq!(ptz_xml(0, "right", 32).len(), 164);
+        assert_eq!(ptz_xml(0, "stop", 0).len(), 162);
     }
 
     #[test]

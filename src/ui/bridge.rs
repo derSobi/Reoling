@@ -34,6 +34,7 @@ enum Command {
     Play { channel: u8, profile: StreamProfile },
     Siren { channel: u8 },
     Spotlight { channel: u8, on: bool },
+    Ptz { channel: u8, command: &'static str, speed: u8 },
     Stop,
     Shutdown,
 }
@@ -59,6 +60,11 @@ impl DeviceLink {
     /// Spotlight on or off.
     pub fn spotlight(&self, channel: u8, on: bool) {
         let _ = self.commands.send(Command::Spotlight { channel, on });
+    }
+
+    /// Pan/tilt: moves until a `stop` (speed 0) follows.
+    pub fn ptz(&self, channel: u8, command: &'static str, speed: u8) {
+        let _ = self.commands.send(Command::Ptz { channel, command, speed });
     }
 
     /// Stops the stream; the connection stays.
@@ -198,6 +204,11 @@ pub fn spawn_device(
                         }
                         Some(Command::Spotlight { channel, on }) => {
                             if let Err(e) = client.set_spotlight(channel, on).await {
+                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                            }
+                        }
+                        Some(Command::Ptz { channel, command, speed }) => {
+                            if let Err(e) = client.ptz(channel, command, speed).await {
                                 let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
                             }
                         }
