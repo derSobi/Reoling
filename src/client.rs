@@ -20,12 +20,24 @@ pub struct DeviceInfoSummary {
     pub resolution_name: Option<String>,
 }
 
+/// What one channel's camera can do.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChannelAbilities {
+    pub siren: bool,
+    pub spotlight: bool,
+    /// Two-way audio.
+    pub talk: bool,
+    pub ptz: bool,
+}
+
 /// Something the device told us without being asked, or as the answer to a
 /// request whose reader was busy streaming.
 #[derive(Debug, Clone)]
 pub enum DeviceUpdate {
     Channels(Vec<ChannelInfo>),
     ChannelName { channel_id: u8, name: String },
+    /// What each channel's camera can do.
+    Abilities(Vec<(u8, ChannelAbilities)>),
     /// The device's answer to a control command (siren, spotlight).
     ControlReply { msg_id: u32, code: u16 },
 }
@@ -141,7 +153,10 @@ fn pushed_update(bc: &Bc) -> Option<DeviceUpdate> {
             code: bc.meta.response_code,
         });
     }
-    if bc.meta.msg_id != MSG_ID_CHANNEL_INFO && bc.meta.msg_id != MSG_ID_OSD {
+    if bc.meta.msg_id != MSG_ID_CHANNEL_INFO
+        && bc.meta.msg_id != MSG_ID_OSD
+        && bc.meta.msg_id != MSG_ID_SUPPORT
+    {
         return None;
     }
     if bc.meta.msg_id == MSG_ID_OSD && std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
@@ -162,6 +177,13 @@ fn pushed_update(bc: &Bc) -> Option<DeviceUpdate> {
         return None;
     };
     let xml = BcXml::from_bytes(payload).ok()?;
+    if let Some(support) = xml.support {
+        let abilities = support.into_abilities();
+        if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
+            eprintln!("DEBUG abilities: {abilities:?}");
+        }
+        return Some(DeviceUpdate::Abilities(abilities));
+    }
     if let Some(list) = xml.channel_info_list {
         let channels = list.into_channels();
         if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
@@ -512,6 +534,8 @@ impl ReolinkClient {
         // Answers are picked up as they come.
         let _ = self.send_empty_request(MSG_ID_STREAM_INFO).await;
         let _ = self.send_empty_request(MSG_ID_SUBSCRIBE).await;
+        // Which camera can do what: the support table, one row per channel.
+        self.request_for_channel(MSG_ID_SUPPORT, 0).await;
         let msg_num = self.next_msg_num();
         let request = Bc {
             meta: BcMeta {

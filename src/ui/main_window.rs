@@ -810,8 +810,18 @@ impl MainWindow {
         self.stop.set_tooltip_text(Some(tip));
         self.stop.set_sensitive(playing.is_some() || stopped);
         self.snapshot.set_sensitive(self.streaming.get());
-        self.siren.set_sensitive(self.streaming.get());
-        self.spotlight.set_sensitive(self.streaming.get());
+        // What this channel's camera can do; until the device has said, assume
+        // it can (a wrong guess is answered with a refusal).
+        let abilities = playing
+            .as_deref()
+            .and_then(|k| self.device(k))
+            .and_then(|d| d.abilities.get(&d.channel).copied());
+        let (siren, spotlight) = abilities.map_or((true, true), |a| (a.siren, a.spotlight));
+        self.siren.set_sensitive(self.streaming.get() && siren);
+        self.spotlight.set_sensitive(self.streaming.get() && spotlight);
+        self.siren.set_tooltip_text(Some(if siren { "Sound the siren" } else { "This camera has no siren" }));
+        self.spotlight
+            .set_tooltip_text(Some(if spotlight { "Spotlight" } else { "This camera has no spotlight" }));
         self.record.set_sensitive(self.streaming.get());
         self.stream.set_sensitive(self.streaming.get());
         self.previous.set_sensitive(multi);
@@ -984,6 +994,12 @@ impl MainWindow {
                         self.set_spotlight_button(!on);
                     }
                 }
+            }
+            DeviceEvent::Abilities(abilities) => {
+                if let Some(d) = self.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
+                    d.abilities.extend(abilities);
+                }
+                self.update_controls();
             }
             DeviceEvent::ControlFailed(reason) => {
                 self.notify(&format!("Command not sent: {reason}"));

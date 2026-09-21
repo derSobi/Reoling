@@ -21,6 +21,61 @@ pub struct BcXml {
     pub channel_info_list: Option<ChannelInfoList>,
     #[serde(rename = "OsdChannelName", skip_serializing_if = "Option::is_none")]
     pub osd_channel_name: Option<OsdChannelName>,
+    #[serde(rename = "Support", skip_serializing_if = "Option::is_none")]
+    pub support: Option<Support>,
+}
+
+/// What the device supports; the per-channel part is what we read.
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct Support {
+    #[serde(rename = "item", default)]
+    pub items: Vec<SupportItem>,
+}
+
+/// One channel's row of the support table (other `item`s, such as the smart
+/// home entries, have no `chnID` and are ignored).
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct SupportItem {
+    #[serde(rename = "chnID")]
+    pub channel_id: Option<u8>,
+    /// Non-zero when the camera has the siren.
+    #[serde(rename = "audioVersion")]
+    pub audio_version: Option<u32>,
+    /// Bit mask of the camera's LEDs: 1 status LED, 2 infrared, 4 white
+    /// (spotlight) — deduced from a Home Hub and NVR with cameras of known
+    /// models, not from documentation.
+    #[serde(rename = "ledCtrl")]
+    pub led_ctrl: Option<u32>,
+    #[serde(rename = "lightType")]
+    pub light_type: Option<u32>,
+    /// Non-zero when the camera can do two-way audio.
+    #[serde(rename = "ipcAudioTalk")]
+    pub ipc_audio_talk: Option<u32>,
+    /// Non-zero for cameras with pan/tilt (and zoom) motors.
+    #[serde(rename = "ptzType")]
+    pub ptz_type: Option<u32>,
+}
+
+impl Support {
+    /// The channels' abilities.
+    pub fn into_abilities(self) -> Vec<(u8, crate::client::ChannelAbilities)> {
+        self.items
+            .into_iter()
+            .filter_map(|i| {
+                let channel = i.channel_id?;
+                let on = |v: Option<u32>| v.unwrap_or(0) > 0;
+                Some((
+                    channel,
+                    crate::client::ChannelAbilities {
+                        siren: on(i.audio_version),
+                        spotlight: i.led_ctrl.unwrap_or(0) & 4 != 0 || i.light_type.unwrap_or(0) >= 2,
+                        talk: on(i.ipc_audio_talk),
+                        ptz: on(i.ptz_type),
+                    },
+                ))
+            })
+            .collect()
+    }
 }
 
 /// The channel's on-screen name, from the reply to `MSG_ID_OSD` (the reply
@@ -265,6 +320,23 @@ mod channel_info_tests {
             <enable>1</enable></OsdChannelName></body>"#;
         let name = BcXml::from_bytes(xml).unwrap().osd_channel_name.unwrap().name;
         assert_eq!(name.as_deref(), Some("Camera7"));
+    }
+
+    #[test]
+    fn support_table_gives_each_channels_abilities() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" ?><body><Support version="1.1">
+            <channelNum>24</channelNum>
+            <smartHome><version>1</version><item><name>googleHome</name><ver>1</ver></item></smartHome>
+            <item><chnID>0</chnID><audioVersion>31</audioVersion><ledCtrl>3</ledCtrl><ipcAudioTalk>1</ipcAudioTalk><ptzType>5</ptzType><lightType>0</lightType></item>
+            <item><chnID>2</chnID><audioVersion>31</audioVersion><ledCtrl>38</ledCtrl><ipcAudioTalk>1</ipcAudioTalk><ptzType>0</ptzType><lightType>1</lightType></item>
+            <item><chnID>3</chnID><audioVersion>0</audioVersion><ledCtrl>0</ledCtrl><ipcAudioTalk>0</ipcAudioTalk></item>
+            </Support></body>"#;
+        let abilities = BcXml::from_bytes(xml).unwrap().support.unwrap().into_abilities();
+        assert_eq!(abilities.len(), 3);
+        let of = |c: u8| abilities.iter().find(|(id, _)| *id == c).unwrap().1;
+        assert!(of(0).siren && of(0).talk && of(0).ptz && !of(0).spotlight);
+        assert!(of(2).siren && of(2).talk && of(2).spotlight && !of(2).ptz);
+        assert!(!of(3).siren && !of(3).talk && !of(3).spotlight);
     }
 
     #[test]

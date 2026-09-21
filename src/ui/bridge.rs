@@ -14,6 +14,8 @@ pub enum DeviceEvent {
     ControlReply { msg_id: u32, code: u16 },
     /// A control command could not even be sent.
     ControlFailed(String),
+    /// What each channel's camera can do.
+    Abilities(Vec<(u8, reoling::ChannelAbilities)>),
     /// A channel's name, asked for because the channel list had none.
     ChannelName { channel_id: u8, name: String },
     /// The requested stream's first frame reached GStreamer.
@@ -224,6 +226,7 @@ pub fn spawn_device(
                             DeviceUpdate::ChannelName { channel_id, name } => {
                                 DeviceEvent::ChannelName { channel_id, name }
                             }
+                            DeviceUpdate::Abilities(abilities) => DeviceEvent::Abilities(abilities),
                             DeviceUpdate::ControlReply { msg_id, code } => {
                                 DeviceEvent::ControlReply { msg_id, code }
                             }

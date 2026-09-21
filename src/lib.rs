@@ -16,4 +16,4 @@ pub mod media_trace;
 pub mod media_guard;
 
 pub use protocol::{Error, Result};
-pub use client::{looks_multi_channel, ChannelInfo, DeviceIdentity, DeviceUpdate, DeviceInfoSummary, ReolinkClient, StreamProfile, VideoFrame, VideoType};
+pub use client::{looks_multi_channel, ChannelAbilities, ChannelInfo, DeviceIdentity, DeviceUpdate, DeviceInfoSummary, ReolinkClient, StreamProfile, VideoFrame, VideoType};
