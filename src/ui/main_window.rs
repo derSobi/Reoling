@@ -296,11 +296,13 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             on_zoom: Box::new(move |position| {
                 if let Some(m) = w_zoom.upgrade() {
                     m.control(move |link, channel| link.set_zoom(channel, position));
+                    m.refresh_zoom_focus_soon();
                 }
             }),
             on_focus: Box::new(move |position| {
                 if let Some(m) = w_focus.upgrade() {
                     m.control(move |link, channel| link.set_focus(channel, position));
+                    m.refresh_zoom_focus_soon();
                 }
             }),
         });
@@ -759,7 +761,17 @@ impl MainWindow {
         }
     }
 
-    /// Asks the watched camera where its zoom stands, if it has one.
+    /// Zooming makes the camera focus by itself, and a focus change can be
+    /// clamped: read both back a moment after a command, and again once the
+    /// autofocus has had time to settle.
+    fn refresh_zoom_focus_soon(self: &Rc<Self>) {
+        for delay in [Duration::from_millis(800), Duration::from_millis(2500)] {
+            let this = Rc::clone(self);
+            glib::timeout_add_local_once(delay, move || this.query_zoom());
+        }
+    }
+
+    /// Asks the watched camera where its zoom and focus stand, if it has them.
     fn query_zoom(&self) {
         let has_zoom = self
             .playing_key()
