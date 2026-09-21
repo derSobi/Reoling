@@ -12,7 +12,7 @@ use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Button, DropDown, EventControllerKey,
     GestureClick, HeaderBar, IconTheme, Image, Label, Orientation, Overlay, Paned, ScaleButton,
-    Revealer, RevealerTransitionType, Stack, StackSwitcher, ToggleButton,
+    MenuButton, Popover, Revealer, RevealerTransitionType, Stack, StackSwitcher, ToggleButton,
 };
 use reoling::{looks_multi_channel, StreamProfile};
 use std::cell::{Cell, RefCell};
@@ -20,6 +20,9 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// The speed the official app moves a camera at.
+const PTZ_SPEED: u8 = 32;
 
 /// How long the window-close and signal handlers give the network threads to
 /// get the disconnect packets out before the process goes away.
@@ -50,6 +53,7 @@ pub struct MainWindow {
     snapshot: Button,
     siren: Button,
     spotlight: ToggleButton,
+    ptz: MenuButton,
     updating_spotlight: Cell<bool>,
     record: ToggleButton,
     /// Set while the code, not the user, flips the record button.
@@ -250,9 +254,68 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         spotlight.set_icon_name(icon_of(&["weather-clear-symbolic", "keyboard-brightness-symbolic"]));
         spotlight.set_tooltip_text(Some("Spotlight"));
         spotlight.set_sensitive(false);
+        // Pan/tilt: a pad that moves the camera while a direction is held.
+        let ptz = MenuButton::new();
+        ptz.set_icon_name(icon_of(&["input-dpad-symbolic", "object-move-symbolic", "find-location-symbolic"]));
+        ptz.set_tooltip_text(Some("Move the camera"));
+        ptz.set_sensitive(false);
+        let pad = gtk4::Grid::builder().row_spacing(4).column_spacing(4).margin_top(8).margin_bottom(8).margin_start(8).margin_end(8).build();
+        for (row, col, label, command) in [
+            (0, 0, "↖", "leftUp"),
+            (0, 1, "↑", "up"),
+            (0, 2, "↗", "rightUp"),
+            (1, 0, "←", "left"),
+            (1, 1, "■", "stop"),
+            (1, 2, "→", "right"),
+            (2, 0, "↙", "leftDown"),
+            (2, 1, "↓", "down"),
+            (2, 2, "↘", "rightDown"),
+        ] {
+            let button = Button::with_label(label);
+            let hold = GestureClick::new();
+            hold.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            let w = weak.clone();
+            hold.connect_pressed(move |_, _, _, _| {
+                if let Some(m) = w.upgrade() {
+                    if command == "stop" {
+                        m.control(|link, channel| link.ptz(channel, "stop", 0));
+                    } else {
+                        m.control(move |link, channel| link.ptz(channel, command, PTZ_SPEED));
+                    }
+                }
+            });
+            if command != "stop" {
+                let w = weak.clone();
+                hold.connect_released(move |_, _, _, _| {
+                    if let Some(m) = w.upgrade() {
+                        m.control(|link, channel| link.ptz(channel, "stop", 0));
+                    }
+                });
+                let w = weak.clone();
+                hold.connect_stopped(move |_| {
+                    if let Some(m) = w.upgrade() {
+                        m.control(|link, channel| link.ptz(channel, "stop", 0));
+                    }
+                });
+            }
+            button.add_controller(hold);
+            pad.attach(&button, col, row, 1, 1);
+        }
+        let ptz_popover = Popover::new();
+        ptz_popover.set_child(Some(&pad));
+        // Closing the pad while a direction is held must not leave the camera
+        // moving.
+        let w = weak.clone();
+        ptz_popover.connect_closed(move |_| {
+            if let Some(m) = w.upgrade() {
+                m.control(|link, channel| link.ptz(channel, "stop", 0));
+            }
+        });
+        ptz.set_popover(Some(&ptz_popover));
         controls.append(&talk);
         controls.append(&siren);
         controls.append(&spotlight);
+        controls.append(&ptz);
         let spacer = GtkBox::new(Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         controls.append(&spacer);
@@ -483,6 +546,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             snapshot,
             siren,
             spotlight,
+            ptz,
             updating_spotlight: Cell::new(false),
             record,
             updating_record: Cell::new(false),
@@ -817,6 +881,9 @@ impl MainWindow {
             .and_then(|k| self.device(k))
             .and_then(|d| d.abilities.get(&d.channel).copied());
         let (siren, spotlight) = abilities.map_or((true, true), |a| (a.siren, a.spotlight));
+        let has_ptz = abilities.is_some_and(|a| a.ptz());
+        self.ptz.set_sensitive(self.streaming.get() && has_ptz);
+        self.ptz.set_tooltip_text(Some(if has_ptz { "Move the camera" } else { "This camera cannot move" }));
         self.siren.set_sensitive(self.streaming.get() && siren);
         self.spotlight.set_sensitive(self.streaming.get() && spotlight);
         self.siren.set_tooltip_text(Some(if siren { "Sound the siren" } else { "This camera has no siren" }));
@@ -980,6 +1047,12 @@ impl MainWindow {
                 }
             }
             DeviceEvent::ControlReply { msg_id, code } => {
+                if msg_id == 18 {
+                    if code != 200 {
+                        self.notify(&format!("Move: the camera refused (code {code})"));
+                    }
+                    return;
+                }
                 let (name, ok) = match msg_id {
                     263 => ("Siren", code == 200),
                     _ => ("Spotlight", code == 200),

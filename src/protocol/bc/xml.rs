@@ -64,13 +64,18 @@ impl Support {
             .filter_map(|i| {
                 let channel = i.channel_id?;
                 let on = |v: Option<u32>| v.unwrap_or(0) > 0;
+                // Which motors a pan/tilt(/zoom) camera has, by `ptzType`
+                // (0 and 5 seen on our devices; the other values are unverified).
+                let ptz = i.ptz_type.unwrap_or(0);
                 Some((
                     channel,
                     crate::client::ChannelAbilities {
                         siren: on(i.audio_version),
-                        spotlight: i.led_ctrl.unwrap_or(0) > 1 || i.light_type.unwrap_or(0) >= 2,
+                        spotlight: i.light_type.unwrap_or(0) >= 2 || i.led_ctrl.unwrap_or(0) & 0b110 != 0,
                         talk: on(i.ipc_audio_talk),
-                        ptz: on(i.ptz_type),
+                        pan: matches!(ptz, 2 | 3 | 5 | 6 | 7),
+                        tilt: matches!(ptz, 2 | 3 | 5 | 6),
+                        zoom: matches!(ptz, 1 | 2 | 5),
                     },
                 ))
             })
@@ -334,8 +339,8 @@ mod channel_info_tests {
         let abilities = BcXml::from_bytes(xml).unwrap().support.unwrap().into_abilities();
         assert_eq!(abilities.len(), 3);
         let of = |c: u8| abilities.iter().find(|(id, _)| *id == c).unwrap().1;
-        assert!(of(0).siren && of(0).talk && of(0).ptz && of(0).spotlight);
-        assert!(of(2).siren && of(2).talk && of(2).spotlight && !of(2).ptz);
+        assert!(of(0).siren && of(0).talk && of(0).pan && of(0).tilt && of(0).zoom && of(0).spotlight);
+        assert!(of(2).siren && of(2).talk && of(2).spotlight && !of(2).pan);
         assert!(!of(3).siren && !of(3).talk && !of(3).spotlight);
     }
 

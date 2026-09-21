@@ -10,6 +10,8 @@ pub const MSG_ID_VERSION: u32 = 80;
 pub const MSG_ID_ABILITY_SUPPORT: u32 = 58;
 /// On-screen-display settings of a channel; carries the channel's name.
 pub const MSG_ID_OSD: u32 = 44;
+/// Pan/tilt movement of a camera.
+pub const MSG_ID_PTZ: u32 = 18;
 /// Per-channel support table (which camera has a siren, spotlight, ...).
 pub const MSG_ID_SUPPORT: u32 = 199;
 /// Plays the siren once. Seen in a capture of the official app.
