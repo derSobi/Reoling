@@ -35,6 +35,9 @@ enum Command {
     Siren { channel: u8 },
     Spotlight { channel: u8, on: bool },
     Ptz { channel: u8, command: &'static str, speed: u8 },
+    TalkStart { channel: u8 },
+    TalkBlock { channel: u8, block: Vec<u8> },
+    TalkStop { channel: u8 },
     Stop,
     Shutdown,
 }
@@ -65,6 +68,24 @@ impl DeviceLink {
     /// Pan/tilt: moves until a `stop` (speed 0) follows.
     pub fn ptz(&self, channel: u8, command: &'static str, speed: u8) {
         let _ = self.commands.send(Command::Ptz { channel, command, speed });
+    }
+
+    /// Opens a talk session; the camera's answer comes as a `ControlReply`
+    /// for message 201.
+    pub fn talk_start(&self, channel: u8) {
+        let _ = self.commands.send(Command::TalkStart { channel });
+    }
+
+    pub fn talk_stop(&self, channel: u8) {
+        let _ = self.commands.send(Command::TalkStop { channel });
+    }
+
+    /// Where the microphone's blocks go: usable from any thread.
+    pub fn talk_sink(&self, channel: u8) -> Box<dyn Fn(Vec<u8>) + Send> {
+        let commands = self.commands.clone();
+        Box::new(move |block| {
+            let _ = commands.send(Command::TalkBlock { channel, block });
+        })
     }
 
     /// Stops the stream; the connection stays.
@@ -211,6 +232,17 @@ pub fn spawn_device(
                             if let Err(e) = client.ptz(channel, command, speed).await {
                                 let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
                             }
+                        }
+                        Some(Command::TalkStart { channel }) => {
+                            if let Err(e) = client.talk_start(channel).await {
+                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                            }
+                        }
+                        Some(Command::TalkBlock { channel, block }) => {
+                            let _ = client.talk_block(channel, &block).await;
+                        }
+                        Some(Command::TalkStop { channel }) => {
+                            let _ = client.talk_stop(channel).await;
                         }
                         Some(Command::Stop) => {
                             if frames.take().is_some() {

@@ -10,6 +10,11 @@ pub const MSG_ID_VERSION: u32 = 80;
 pub const MSG_ID_ABILITY_SUPPORT: u32 = 58;
 /// On-screen-display settings of a channel; carries the channel's name.
 pub const MSG_ID_OSD: u32 = 44;
+/// Two-way audio: ask what the camera accepts, stop, configure, send audio.
+pub const MSG_ID_TALK_ABILITY: u32 = 10;
+pub const MSG_ID_TALK_STOP: u32 = 11;
+pub const MSG_ID_TALK_CONFIG: u32 = 201;
+pub const MSG_ID_TALK_DATA: u32 = 202;
 /// Pan/tilt movement of a camera.
 pub const MSG_ID_PTZ: u32 = 18;
 /// Per-channel support table (which camera has a siren, spotlight, ...).

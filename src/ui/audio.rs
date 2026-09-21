@@ -107,3 +107,65 @@ impl AudioOutput {
         }
     }
 }
+
+/// The microphone, as ADPCM blocks for the camera (see `reoling::talk`).
+pub struct Microphone {
+    pipeline: gstreamer::Pipeline,
+}
+
+impl Microphone {
+    /// Starts capturing; `on_block` gets each finished block (516 bytes) on a
+    /// GStreamer thread.
+    pub fn start(on_block: impl Fn(Vec<u8>) + Send + 'static) -> Result<Self, String> {
+        use reoling::talk::{AdpcmEncoder, SAMPLES_PER_BLOCK, SAMPLE_RATE};
+        let make = |name: &str| {
+            gstreamer::ElementFactory::make(name)
+                .build()
+                .map_err(|e| format!("{name} is missing: {e}"))
+        };
+        let source = make("autoaudiosrc")?;
+        let convert = make("audioconvert")?;
+        let resample = make("audioresample")?;
+        let caps = gstreamer::Caps::builder("audio/x-raw")
+            .field("format", "S16LE")
+            .field("rate", SAMPLE_RATE as i32)
+            .field("channels", 1i32)
+            .build();
+        let sink = gstreamer_app::AppSink::builder().caps(&caps).sync(false).build();
+
+        let mut pending: Vec<i16> = Vec::new();
+        let mut encoder = AdpcmEncoder::default();
+        sink.set_callbacks(
+            gstreamer_app::AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let sample = sink.pull_sample().map_err(|_| gstreamer::FlowError::Eos)?;
+                    let buffer = sample.buffer().ok_or(gstreamer::FlowError::Error)?;
+                    let map = buffer.map_readable().map_err(|_| gstreamer::FlowError::Error)?;
+                    pending.extend(map.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
+                    while pending.len() >= SAMPLES_PER_BLOCK {
+                        let block: Vec<i16> = pending.drain(..SAMPLES_PER_BLOCK).collect();
+                        on_block(encoder.encode_block(&block));
+                    }
+                    Ok(gstreamer::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+
+        let pipeline = gstreamer::Pipeline::new();
+        let elements = [&source, &convert, &resample, sink.upcast_ref()];
+        pipeline.add_many(elements).map_err(|e| e.to_string())?;
+        gstreamer::Element::link_many(elements).map_err(|e| e.to_string())?;
+        pipeline.set_state(gstreamer::State::Playing).map_err(|e| e.to_string())?;
+        Ok(Self { pipeline })
+    }
+}
+
+impl Drop for Microphone {
+    fn drop(&mut self) {
+        let pipeline = self.pipeline.clone();
+        // Off the caller's thread: taking a pipeline down can block.
+        std::thread::spawn(move || {
+            let _ = pipeline.set_state(gstreamer::State::Null);
+        });
+    }
+}

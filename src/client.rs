@@ -107,6 +107,8 @@ pub struct ReolinkClient {
     encryption: EncryptionProtocol,
     next_msg_num: u16,
     video_task: Option<tokio::task::JoinHandle<()>>,
+    /// The message number all audio blocks of the current talk share.
+    talk_msg_num: u16,
     /// The stream `start_video` opened, so `stop_video` can name it.
     playing: Option<PlayingStream>,
     /// Keeps a direct (non-relay) connection alive — see
@@ -153,6 +155,14 @@ fn ptz_xml(channel_id: u8, command: &str, speed: u8) -> Vec<u8> {
     ))
 }
 
+/// The talk configuration as the official app sends it (394 bytes, as
+/// captured): follow the video stream's audio mode, ADPCM 16 kHz mono.
+fn talk_config_xml(channel_id: u8) -> Vec<u8> {
+    control_xml(&format!(
+        "<TalkConfig version=\"1.1\">\n<channelId>{channel_id}</channelId>\n<duplex>FDX</duplex>\n<audioStreamMode>followVideoStream</audioStreamMode>\n<audioConfig>\n<audioType>adpcm</audioType>\n<sampleRate>16000</sampleRate>\n<samplePrecision>16</samplePrecision>\n<lengthPerEncoder>1024</lengthPerEncoder>\n<soundTrack>mono</soundTrack>\n</audioConfig>\n</TalkConfig>\n"
+    ))
+}
+
 /// The spotlight command: on or off, with the 180 s duration both of the
 /// official app's messages carried (177 bytes each, as captured).
 fn spotlight_xml(channel_id: u8, on: bool) -> Vec<u8> {
@@ -168,6 +178,7 @@ fn pushed_update(bc: &Bc) -> Option<DeviceUpdate> {
     if bc.meta.msg_id == MSG_ID_PLAY_SIREN
         || bc.meta.msg_id == MSG_ID_SPOTLIGHT
         || bc.meta.msg_id == MSG_ID_PTZ
+        || bc.meta.msg_id == MSG_ID_TALK_CONFIG
     {
         return Some(DeviceUpdate::ControlReply {
             msg_id: bc.meta.msg_id,
@@ -330,6 +341,7 @@ impl ReolinkClient {
             next_msg_num: 1,
             video_task: None,
             playing: None,
+            talk_msg_num: 0,
             direct_keepalive_task: None,
             channel_updates_tx,
             channel_updates_rx: Some(channel_updates_rx),
@@ -530,6 +542,63 @@ impl ReolinkClient {
     /// moves until told to stop.
     pub async fn ptz(&mut self, channel_id: u8, command: &str, speed: u8) -> crate::Result<()> {
         self.send_control(MSG_ID_PTZ, channel_id, ptz_xml(channel_id, command, speed)).await
+    }
+
+    /// Opens a talk session with the camera: the audio format it should
+    /// expect (the one every camera here announced: ADPCM, 16 kHz, mono).
+    /// The answer arrives as a `ControlReply` for message 201 (422 means
+    /// another talk is still open: send `talk_stop` and try again).
+    pub async fn talk_start(&mut self, channel_id: u8) -> crate::Result<()> {
+        self.talk_msg_num = self.next_msg_num();
+        self.send_control(MSG_ID_TALK_CONFIG, channel_id, talk_config_xml(channel_id)).await
+    }
+
+    /// One block of audio (see `talk`), sent unencrypted under the number the
+    /// talk started with.
+    pub async fn talk_block(&mut self, channel_id: u8, block: &[u8]) -> crate::Result<()> {
+        let extension = Extension {
+            version: XML_VERSION.to_string(),
+            binary_data: Some(1),
+            channel_id: Some(channel_id),
+            ..Default::default()
+        };
+        let request = Bc {
+            meta: BcMeta {
+                msg_id: MSG_ID_TALK_DATA,
+                channel_id,
+                stream_type: 0,
+                msg_num: self.talk_msg_num,
+                response_code: 0,
+                class: 0x6414,
+            },
+            body: BcBody::Modern(ModernMsg {
+                extension_xml: Some(extension.to_bytes()),
+                payload: Some(crate::talk::adpcm_unit(block)),
+            }),
+        };
+        self.connection.lock().await.send_bc(&request, &self.encryption).await
+    }
+
+    /// Ends the talk session.
+    pub async fn talk_stop(&mut self, channel_id: u8) -> crate::Result<()> {
+        let msg_num = self.next_msg_num();
+        let extension = Extension {
+            version: XML_VERSION.to_string(),
+            channel_id: Some(channel_id),
+            ..Default::default()
+        };
+        let request = Bc {
+            meta: BcMeta {
+                msg_id: MSG_ID_TALK_STOP,
+                channel_id,
+                stream_type: 0,
+                msg_num,
+                response_code: 0,
+                class: 0x6414,
+            },
+            body: BcBody::Modern(ModernMsg { extension_xml: Some(extension.to_bytes()), payload: None }),
+        };
+        self.connection.lock().await.send_bc(&request, &self.encryption).await
     }
 
     /// Switches the camera's spotlight on or off.
@@ -1292,6 +1361,11 @@ mod control_tests {
     #[test]
     fn siren_command_has_the_length_of_the_official_one() {
         assert_eq!(siren_xml(0).len(), 223);
+    }
+
+    #[test]
+    fn talk_config_has_the_length_of_the_official_one() {
+        assert_eq!(talk_config_xml(0).len(), 394);
     }
 
     #[test]
