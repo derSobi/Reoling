@@ -24,6 +24,7 @@ this script touches the login password — it only rearranges bytes that
 were already in the capture.
 """
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -101,6 +102,16 @@ def main():
         sys.exit(1)
     pcap, device_ip, out_dir = sys.argv[1], sys.argv[2], Path(sys.argv[3])
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # `tshark` refuses to open a capture file it doesn't own — even a
+    # world-readable one (e.g. one `tcpdump` wrote as a different system
+    # user, as `sudo tcpdump -w` typically does) — with a permission error
+    # that has nothing to do with the actual Unix file permissions. A plain
+    # copy sidesteps it: this process only needs read access to make one,
+    # which the file's own permissions already grant.
+    own_copy = out_dir / "_capture.pcap"
+    shutil.copyfile(pcap, own_copy)
+    pcap = str(own_copy)
 
     result = try_tcp(pcap, device_ip)
     kind = "TCP:9000"
