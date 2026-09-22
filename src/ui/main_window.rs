@@ -283,6 +283,8 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         });
         let (w_move, w_stop, w_zoom, w_focus) = (weak.clone(), weak.clone(), weak.clone(), weak.clone());
         let (w_add, w_goto, w_delete) = (weak.clone(), weak.clone(), weak.clone());
+        let (w_calibrate, w_mp_config, w_mp_reset, w_mp_goto) =
+            (weak.clone(), weak.clone(), weak.clone(), weak.clone());
         let remote = RemoteControl::new(remote::Handlers {
             on_move: Box::new(move |command| {
                 if let Some(m) = w_move.upgrade() {
@@ -321,6 +323,28 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
                     m.control(move |link, channel| link.delete_preset(channel, id));
                     // The list only changes on the device; ask again shortly.
                     m.query_presets_soon();
+                }
+            }),
+            on_calibrate: Box::new(move || {
+                if let Some(m) = w_calibrate.upgrade() {
+                    m.control(|link, channel| link.calibrate(channel));
+                    m.notify("Calibrating… this can take a few seconds");
+                }
+            }),
+            on_monitor_point_config: Box::new(move |enabled, timeout| {
+                if let Some(m) = w_mp_config.upgrade() {
+                    m.control(move |link, channel| link.set_monitor_point_config(channel, enabled, timeout));
+                }
+            }),
+            on_reset_monitor_point: Box::new(move |enabled, timeout| {
+                if let Some(m) = w_mp_reset.upgrade() {
+                    m.control(move |link, channel| link.set_monitor_point_here(channel, enabled, timeout));
+                    m.query_monitor_point_soon();
+                }
+            }),
+            on_go_to_monitor_point: Box::new(move |timeout| {
+                if let Some(m) = w_mp_goto.upgrade() {
+                    m.control(move |link, channel| link.go_to_monitor_point(channel, timeout));
                 }
             }),
         });
@@ -777,6 +801,7 @@ impl MainWindow {
             self.remote.present();
             self.query_zoom();
             self.query_presets();
+            self.query_monitor_point();
         }
     }
 
@@ -814,6 +839,25 @@ impl MainWindow {
         for delay in [Duration::from_millis(500), Duration::from_millis(1500)] {
             let this = Rc::clone(self);
             glib::timeout_add_local_once(delay, move || this.query_presets());
+        }
+    }
+
+    /// Asks the watched camera for Monitor Point's state, if it has one.
+    fn query_monitor_point(&self) {
+        let has_monitor_point = self
+            .playing_key()
+            .and_then(|k| self.device(&k))
+            .and_then(|d| d.abilities.get(&d.channel).copied())
+            .is_some_and(|a| a.monitor_point);
+        if has_monitor_point {
+            self.control(|link, channel| link.query_monitor_point(channel));
+        }
+    }
+
+    fn query_monitor_point_soon(self: &Rc<Self>) {
+        for delay in [Duration::from_millis(500), Duration::from_millis(1500)] {
+            let this = Rc::clone(self);
+            glib::timeout_add_local_once(delay, move || this.query_monitor_point());
         }
     }
 
@@ -1032,7 +1076,15 @@ impl MainWindow {
         self.talk.set_tooltip_text(Some(if can_talk { "Talk" } else { "This camera has no two-way audio" }));
         self.ptz.set_sensitive(self.streaming.get() && has_ptz);
         let (move_ok, zoom_ok) = abilities.map_or((false, false), |a| (a.pan || a.tilt, a.zoom));
-        self.remote.set_enabled(self.streaming.get() && move_ok, self.streaming.get() && zoom_ok, self.streaming.get() && zoom_ok);
+        let (calibration_ok, monitor_point_ok) = abilities.map_or((false, false), |a| (a.calibration, a.monitor_point));
+        let streaming = self.streaming.get();
+        self.remote.set_enabled(
+            streaming && move_ok,
+            streaming && zoom_ok,
+            streaming && zoom_ok,
+            streaming && calibration_ok,
+            streaming && monitor_point_ok,
+        );
         if let Some(d) = playing.as_deref().and_then(|k| self.device(k)) {
             let camera = d.channels.iter().find(|c| c.channel_id == d.channel).map(|c| c.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("Channel {}", u16::from(d.channel) + 1));
             self.remote.set_target(&format!("{} — {camera}", d.name));
@@ -1256,6 +1308,12 @@ impl MainWindow {
                     self.remote.set_presets(&presets);
                 }
             }
+            DeviceEvent::MonitorPoint { channel_id, state } => {
+                let watching = self.playing_key().and_then(|k| self.device(&k)).is_some_and(|d| d.channel == channel_id);
+                if watching {
+                    self.remote.set_monitor_point(state);
+                }
+            }
             DeviceEvent::ControlFailed(reason) => {
                 self.notify(&format!("Command not sent: {reason}"));
             }
@@ -1265,6 +1323,7 @@ impl MainWindow {
                     self.streaming.set(true);
                     self.update_controls();
                     self.query_zoom();
+                    self.query_monitor_point();
                 }
             }
             DeviceEvent::PlayFailed(reason) => {
