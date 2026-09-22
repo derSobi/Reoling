@@ -1,11 +1,17 @@
 //! The camera's remote control: a small window of its own (independent of the
-//! main window) with the direction pad, zoom and focus. It acts on whatever
-//! channel the main window is showing.
+//! main window) with the direction pad, zoom and focus, plus three pages —
+//! Calibration (a direct action), Monitor Point and Preset Points — reached
+//! through their own buttons and left with "back", the same drill-down
+//! structure the official app uses (`.plans/official_app_screenshots/PTZ-1`)
+//! instead of showing everything inlined at once, which made this window far
+//! taller than it needed to be. It acts on whatever channel the main window
+//! is showing.
 
 use gtk4::prelude::*;
 use gtk4::{
-    Box as GtkBox, Button, Entry, GestureClick, Grid, Label, ListBox, ListBoxRow, Orientation,
-    Image as ImageWidget, PropagationPhase, Scale, Separator, Switch, Window,
+    Box as GtkBox, Button, Entry, GestureClick, Grid, Image as ImageWidget, Label, ListBox,
+    ListBoxRow, Orientation, PropagationPhase, Scale, Spinner, Stack, StackTransitionType,
+    Switch, Window,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -33,6 +39,10 @@ pub struct Handlers {
     /// whatever Auto Return on/off and timeout are showing.
     pub on_reset_monitor_point: Box<dyn Fn(bool, u32)>,
     pub on_go_to_monitor_point: Box<dyn Fn(u32)>,
+    /// The saved thumbnail was asked for again (opening the page, or a click
+    /// on it — the official app treats its thumbnail as its own refresh
+    /// button, and a preset saved without one only gets it after a refresh).
+    pub on_refresh_monitor_point_image: Box<dyn Fn()>,
 }
 
 /// A slider with its name, its value, and − / + around it.
@@ -143,14 +153,44 @@ impl Adjuster {
     }
 }
 
+/// A sub-page's header: "← Title", matching the official app's own
+/// drill-down panels.
+fn page_header(stack: &Stack, title: &str) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 6);
+    let back = Button::from_icon_name("go-previous-symbolic");
+    back.add_css_class("flat");
+    back.set_tooltip_text(Some("Back"));
+    let stack = stack.clone();
+    back.connect_clicked(move |_| stack.set_visible_child_name("main"));
+    let heading = Label::new(Some(title));
+    heading.add_css_class("heading");
+    heading.set_hexpand(true);
+    heading.set_halign(gtk4::Align::Start);
+    row.append(&back);
+    row.append(&heading);
+    row
+}
+
 pub struct RemoteControl {
     window: Window,
-    target: Label,
+    stack: Stack,
     pad: Grid,
     zoom: Rc<Adjuster>,
     focus: Rc<Adjuster>,
     calibrate: Button,
-    monitor_point: GtkBox,
+    calibrating: Cell<bool>,
+    calibration_generation: Cell<u64>,
+    /// What `set_enabled` last said, kept apart from `calibrating` so
+    /// clearing the calibration-busy state can restore exactly that rather
+    /// than guessing from the buttons' current (already-overwritten)
+    /// sensitivity.
+    calibration_capable: Cell<bool>,
+    monitor_point_capable: Cell<bool>,
+    presets_capable: Cell<bool>,
+    calibration_spinner: Spinner,
+    calibration_status: Label,
+    open_monitor_point: Button,
+    open_presets: Button,
     monitor_image: ImageWidget,
     monitor_enabled: Switch,
     monitor_timeout: Rc<Adjuster>,
@@ -176,14 +216,22 @@ impl RemoteControl {
             glib::Propagation::Stop
         });
 
-        let content = GtkBox::new(Orientation::Vertical, 12);
-        content.set_margin_top(12);
-        content.set_margin_bottom(12);
-        content.set_margin_start(12);
-        content.set_margin_end(12);
-        let target = Label::new(Some("No camera"));
-        target.add_css_class("heading");
-        content.append(&target);
+        let stack = Stack::new();
+        // Each page keeps its own natural size instead of the window sizing
+        // to whichever page is largest — the same page-to-page size change
+        // the official app's own panel has.
+        stack.set_hhomogeneous(false);
+        stack.set_vhomogeneous(false);
+        stack.set_transition_type(StackTransitionType::SlideLeftRight);
+        window.set_child(Some(&stack));
+
+        // --- Main page: target camera, pad, zoom, focus, and the three
+        // buttons that open the pages below. ---
+        let main_page = GtkBox::new(Orientation::Vertical, 12);
+        main_page.set_margin_top(12);
+        main_page.set_margin_bottom(12);
+        main_page.set_margin_start(12);
+        main_page.set_margin_end(12);
 
         let pad = Grid::builder().row_spacing(6).column_spacing(6).halign(gtk4::Align::Center).build();
         for (row, col, label, command) in [
@@ -206,67 +254,112 @@ impl RemoteControl {
             button.add_controller(hold);
             pad.attach(&button, col, row, 1, 1);
         }
-        content.append(&pad);
+        main_page.append(&pad);
 
         let h = Rc::clone(&handlers);
         let zoom = Adjuster::new("Zoom", move |p| (h.on_zoom)(p));
         let h = Rc::clone(&handlers);
         let focus = Adjuster::new("Focus", move |p| (h.on_focus)(p));
-        content.append(&zoom.row);
-        content.append(&focus.row);
-        content.append(&Separator::new(Orientation::Horizontal));
+        main_page.append(&zoom.row);
+        main_page.append(&focus.row);
 
-        let h = Rc::clone(&handlers);
+        // Calibration: a direct action (not a page) — while it runs, the
+        // official app disables the whole panel and shows a spinner with an
+        // explanatory message, since the camera gives no separate "finished"
+        // signal (only that the request was accepted); `set_calibrating`
+        // reproduces that, cleared once `main_window` sees the reply.
         let calibrate = Button::with_label("Calibration");
-        calibrate.connect_clicked(move |_| (h.on_calibrate)());
-        content.append(&calibrate);
+        let calibration_spinner = Spinner::new();
+        calibration_spinner.set_visible(false);
+        let calibration_status = Label::new(None);
+        calibration_status.set_wrap(true);
+        calibration_status.set_max_width_chars(28);
+        calibration_status.set_justify(gtk4::Justification::Center);
+        calibration_status.set_visible(false);
+        calibration_status.add_css_class("dim-label");
+        let calibration_row = GtkBox::new(Orientation::Horizontal, 6);
+        calibration_row.set_halign(gtk4::Align::Center);
+        calibration_row.append(&calibration_spinner);
+        calibration_row.append(&calibration_status);
+        main_page.append(&calibration_row);
+        main_page.append(&calibrate);
 
-        // Monitor Point ("PTZ Guard" on the wire): a saved home position,
-        // with an optional automatic return after a timeout.
-        let monitor_heading = Label::new(Some("Monitor Point"));
-        monitor_heading.add_css_class("heading");
-        monitor_heading.set_halign(gtk4::Align::Start);
-        content.append(&monitor_heading);
-        let monitor_point = GtkBox::new(Orientation::Vertical, 8);
+        let open_monitor_point = Button::with_label("Monitor Point");
+        let open_presets = Button::with_label("Preset");
+        for button in [&open_monitor_point, &open_presets] {
+            button.set_halign(gtk4::Align::Fill);
+        }
+        main_page.append(&open_monitor_point);
+        main_page.append(&open_presets);
+
+        stack.add_named(&main_page, Some("main"));
+
+        // --- Monitor Point page. ---
+        let monitor_page = GtkBox::new(Orientation::Vertical, 10);
+        monitor_page.set_margin_top(12);
+        monitor_page.set_margin_bottom(12);
+        monitor_page.set_margin_start(12);
+        monitor_page.set_margin_end(12);
+        monitor_page.append(&page_header(&stack, "Monitor Point"));
+        let hint = Label::new(Some(
+            "The device will auto return to the initial monitoring position after deviating.",
+        ));
+        hint.add_css_class("dim-label");
+        hint.set_wrap(true);
+        hint.set_max_width_chars(28);
+        hint.set_halign(gtk4::Align::Start);
+        monitor_page.append(&hint);
 
         // `Image`, not `Picture`: it sizes itself to the pixbuf's own pixel
         // dimensions instead of stretching to fill the available width, so
         // the thumbnail this project pre-scales in `set_monitor_point_image`
-        // actually stays small.
+        // actually stays small. Wrapped in a flat button: clicking it, like
+        // the official app's own thumbnail, asks the camera for it again —
+        // a preset or point saved without a picture only gets one this way.
         let monitor_image = ImageWidget::new();
         monitor_image.set_halign(gtk4::Align::Start);
         monitor_image.set_visible(false);
-        monitor_point.append(&monitor_image);
+        let refresh_image = Button::new();
+        refresh_image.add_css_class("flat");
+        refresh_image.set_halign(gtk4::Align::Start);
+        refresh_image.set_tooltip_text(Some("Refresh the picture"));
+        refresh_image.set_child(Some(&monitor_image));
+        let h = Rc::clone(&handlers);
+        refresh_image.connect_clicked(move |_| (h.on_refresh_monitor_point_image)());
+        monitor_page.append(&refresh_image);
 
         let monitor_status = Label::new(Some("Not read yet"));
         monitor_status.add_css_class("dim-label");
         monitor_status.set_halign(gtk4::Align::Start);
-        monitor_point.append(&monitor_status);
+        monitor_page.append(&monitor_status);
+
+        let go_to_monitor = Button::with_label("Return to Monitor Point");
+        monitor_page.append(&go_to_monitor);
 
         let enable_row = GtkBox::new(Orientation::Horizontal, 6);
-        let enable_label = Label::new(Some("Auto Return"));
+        let enable_label = Label::new(Some("Auto"));
         enable_label.set_hexpand(true);
         enable_label.set_halign(gtk4::Align::Start);
         let monitor_enabled = Switch::new();
         monitor_enabled.set_valign(gtk4::Align::Center);
         enable_row.append(&enable_label);
         enable_row.append(&monitor_enabled);
-        monitor_point.append(&enable_row);
+        monitor_page.append(&enable_row);
 
         // Shared with the switch, the timeout slider, and the two buttons
-        // below: the last-known Monitor Point state, so any one of them can
-        // send the OTHER's current value along with its own change (see
-        // `Handlers::on_monitor_point_config`'s doc comment).
+        // above/below: the last-known Monitor Point state, so any one of
+        // them can send the OTHER's current value along with its own change
+        // (see `Handlers::on_monitor_point_config`'s doc comment).
         let monitor_state: Rc<Cell<reoling::MonitorPoint>> = Rc::default();
         let updating_monitor_enabled: Rc<Cell<bool>> = Rc::default();
 
         let (h, state) = (Rc::clone(&handlers), Rc::clone(&monitor_state));
-        let monitor_timeout = Adjuster::with_fixed_step("Return after (seconds)", 1.0, move |timeout| {
+        let monitor_timeout = Adjuster::with_fixed_step("Interval (seconds)", 1.0, move |timeout| {
             state.set(reoling::MonitorPoint { timeout_seconds: timeout, ..state.get() });
             (h.on_monitor_point_config)(state.get().enabled, timeout);
         });
         monitor_timeout.set_range(10, 300, 60);
-        monitor_point.append(&monitor_timeout.row);
+        monitor_page.append(&monitor_timeout.row);
 
         let (h, state, updating) = (Rc::clone(&handlers), Rc::clone(&monitor_state), Rc::clone(&updating_monitor_enabled));
         monitor_enabled.connect_state_set(move |_, enabled| {
@@ -277,46 +370,58 @@ impl RemoteControl {
             glib::Propagation::Proceed
         });
 
-        let go_to_monitor = Button::with_label("Return to Monitor Point");
         let (h, state) = (Rc::clone(&handlers), Rc::clone(&monitor_state));
         go_to_monitor.connect_clicked(move |_| (h.on_go_to_monitor_point)(state.get().timeout_seconds));
-        monitor_point.append(&go_to_monitor);
 
+        // Separated from the settings above, like the official app's own
+        // page, since it is a destructive-ish action (moves the saved
+        // point), not a settings change.
         let reset_monitor = Button::with_label("Reset Monitor Point");
+        reset_monitor.set_margin_top(12);
         reset_monitor.set_tooltip_text(Some("Save the camera's current position as Monitor Point"));
         let (h, state) = (Rc::clone(&handlers), Rc::clone(&monitor_state));
         reset_monitor.connect_clicked(move |_| (h.on_reset_monitor_point)(state.get().enabled, state.get().timeout_seconds));
-        monitor_point.append(&reset_monitor);
+        monitor_page.append(&reset_monitor);
 
-        content.append(&monitor_point);
-        content.append(&Separator::new(Orientation::Horizontal));
+        stack.add_named(&monitor_page, Some("monitor_point"));
 
-        // Presets: a scrollable list, each with Go / Delete, and an entry to
-        // save the current position as a new one.
-        let preset_heading = Label::new(Some("Presets"));
-        preset_heading.add_css_class("heading");
-        preset_heading.set_halign(gtk4::Align::Start);
-        content.append(&preset_heading);
+        // --- Preset Points page. ---
+        let preset_page = GtkBox::new(Orientation::Vertical, 10);
+        preset_page.set_margin_top(12);
+        preset_page.set_margin_bottom(12);
+        preset_page.set_margin_start(12);
+        preset_page.set_margin_end(12);
+        preset_page.append(&page_header(&stack, "Preset Points"));
         let presets = ListBox::new();
         presets.add_css_class("boxed-list");
-        content.append(&presets);
+        preset_page.append(&presets);
         let add_row = GtkBox::new(Orientation::Horizontal, 4);
         let preset_name = Entry::builder().placeholder_text("New preset name").hexpand(true).build();
         let add = Button::from_icon_name("list-add-symbolic");
         add.set_tooltip_text(Some("Save the current position as a preset"));
         add_row.append(&preset_name);
         add_row.append(&add);
-        content.append(&add_row);
-        window.set_child(Some(&content));
+        preset_page.append(&add_row);
+        stack.add_named(&preset_page, Some("presets"));
+
+        stack.set_visible_child_name("main");
 
         let this = Rc::new(Self {
             window,
-            target,
+            stack,
             pad,
             zoom,
             focus,
             calibrate,
-            monitor_point,
+            calibrating: Cell::new(false),
+            calibration_generation: Cell::new(0),
+            calibration_capable: Cell::new(false),
+            monitor_point_capable: Cell::new(false),
+            presets_capable: Cell::new(false),
+            calibration_spinner,
+            calibration_status,
+            open_monitor_point,
+            open_presets,
             monitor_image,
             monitor_enabled,
             monitor_timeout,
@@ -326,6 +431,38 @@ impl RemoteControl {
             presets,
             preset_name,
             handlers,
+        });
+
+        let weak = Rc::downgrade(&this);
+        this.open_monitor_point.connect_clicked(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.stack.set_visible_child_name("monitor_point");
+                (r.handlers.on_refresh_monitor_point_image)();
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        this.open_presets.connect_clicked(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.stack.set_visible_child_name("presets");
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        this.calibrate.connect_clicked(move |_| {
+            let Some(r) = weak.upgrade() else { return };
+            (r.handlers.on_calibrate)();
+            r.set_calibrating(true);
+            // Safety net: if the reply never arrives, the panel would
+            // otherwise stay disabled forever.
+            let generation = r.calibration_generation.get() + 1;
+            r.calibration_generation.set(generation);
+            let weak = Rc::downgrade(&r);
+            glib::timeout_add_local_once(Duration::from_secs(20), move || {
+                if let Some(r) = weak.upgrade() {
+                    if r.calibration_generation.get() == generation {
+                        r.set_calibrating(false);
+                    }
+                }
+            });
         });
 
         let weak = Rc::downgrade(&this);
@@ -344,8 +481,10 @@ impl RemoteControl {
         this
     }
 
-    /// Shows the window (or brings it forward).
+    /// Shows the window (or brings it forward), always starting from the
+    /// main page.
     pub fn present(&self) {
+        self.stack.set_visible_child_name("main");
         self.window.present();
     }
 
@@ -357,9 +496,10 @@ impl RemoteControl {
         self.window.set_visible(false);
     }
 
-    /// Names the camera being controlled.
+    /// Names the camera being controlled — the window's own title, so it is
+    /// still visible whichever page is showing.
     pub fn set_target(&self, name: &str) {
-        self.target.set_text(name);
+        self.window.set_title(Some(name));
     }
 
     /// What the camera can do right now (nothing while there is no stream).
@@ -375,13 +515,41 @@ impl RemoteControl {
         self.pad.set_sensitive(move_pad);
         self.zoom.row.set_sensitive(zoom);
         self.focus.row.set_sensitive(focus);
-        self.calibrate.set_sensitive(calibration);
-        self.monitor_point.set_sensitive(monitor_point);
+        self.calibration_capable.set(calibration);
+        self.monitor_point_capable.set(monitor_point);
+        // Presets, like the pad, move the camera — the same requirement.
+        self.presets_capable.set(move_pad);
+        if !self.calibrating.get() {
+            self.calibrate.set_sensitive(calibration);
+            self.open_monitor_point.set_sensitive(monitor_point);
+            self.open_presets.set_sensitive(move_pad);
+        }
         if !monitor_point {
             self.monitor_status.set_text("This camera has no Monitor Point");
             self.clear_monitor_point_image();
         } else if self.monitor_status.text() == "This camera has no Monitor Point" {
             self.monitor_status.set_text("Not read yet");
+        }
+    }
+
+    /// Disables the whole panel with a spinner while calibration runs, or
+    /// clears that back to normal — see the comment on the Calibration
+    /// button's construction for why there is no real "finished" signal to
+    /// wait for instead.
+    pub fn set_calibrating(&self, busy: bool) {
+        self.calibrating.set(busy);
+        self.pad.set_sensitive(!busy);
+        self.zoom.row.set_sensitive(!busy);
+        self.focus.row.set_sensitive(!busy);
+        self.calibrate.set_sensitive(!busy && self.calibration_capable.get());
+        self.open_monitor_point.set_sensitive(!busy && self.monitor_point_capable.get());
+        self.open_presets.set_sensitive(!busy && self.presets_capable.get());
+        self.calibration_spinner.set_visible(busy);
+        self.calibration_spinner.set_spinning(busy);
+        self.calibration_status.set_visible(busy);
+        if busy {
+            self.calibration_status
+                .set_text("Calibrating… PTZ is unavailable until this finishes.");
         }
     }
 

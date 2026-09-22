@@ -283,8 +283,8 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         });
         let (w_move, w_stop, w_zoom, w_focus) = (weak.clone(), weak.clone(), weak.clone(), weak.clone());
         let (w_add, w_goto, w_delete) = (weak.clone(), weak.clone(), weak.clone());
-        let (w_calibrate, w_mp_config, w_mp_reset, w_mp_goto) =
-            (weak.clone(), weak.clone(), weak.clone(), weak.clone());
+        let (w_calibrate, w_mp_config, w_mp_reset, w_mp_goto, w_mp_image) =
+            (weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone());
         let remote = RemoteControl::new(remote::Handlers {
             on_move: Box::new(move |command| {
                 if let Some(m) = w_move.upgrade() {
@@ -345,6 +345,11 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             on_go_to_monitor_point: Box::new(move |timeout| {
                 if let Some(m) = w_mp_goto.upgrade() {
                     m.control(move |link, channel| link.go_to_monitor_point(channel, timeout));
+                }
+            }),
+            on_refresh_monitor_point_image: Box::new(move || {
+                if let Some(m) = w_mp_image.upgrade() {
+                    m.control(|link, channel| link.query_monitor_point_image(channel));
                 }
             }),
         });
@@ -1283,11 +1288,16 @@ impl MainWindow {
                         }
                     }
                     341 => {
-                        self.notify(&if ok {
-                            "Calibrating… this can take a few seconds".to_string()
+                        // This reply is the only signal the wire protocol
+                        // gives at all — whether it means "request queued"
+                        // or "physically finished" is not confirmed either
+                        // way, so the busy state clears on it regardless.
+                        self.remote.set_calibrating(false);
+                        if ok {
+                            self.notify("Calibration finished");
                         } else {
-                            format!("Calibration: the camera refused (code {code})")
-                        });
+                            self.notify(&format!("Calibration: the camera refused (code {code})"));
+                        }
                     }
                     // Sent for three different actions (a plain config
                     // change, "Reset", "Return") — only a failure is worth a

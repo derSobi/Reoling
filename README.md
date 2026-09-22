@@ -9,7 +9,7 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 
 ## Status
 
-Version **0.1.4**, early development. Login and live video work end to end
+Version **0.1.5**, early development. Login and live video work end to end
 against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
 only: Reoling races the device's local, NAT-mapped and relay addresses at
 the same time and uses whichever answers first, as the official client does.
@@ -29,13 +29,17 @@ the same time and uses whichever answers first, as the official client does.
   camera, ADPCM).
 - Camera controls, shown per channel from what the camera reports: siren,
   spotlight, and — in a separate "Camera control" window, independent of the
-  main window — pan/tilt (hold a direction to move), zoom and focus (read
-  back from the camera after every change, since zooming makes it
-  autofocus), PTZ presets (save, go to, delete), Monitor Point (a saved home
-  position, shown with its own saved thumbnail: Auto Return on/off and its
-  timeout in 1-second steps, "Return to Monitor Point", "Reset Monitor
-  Point" to save the current position), and calibration — all confirmed
-  working against real hardware.
+  main window — pan/tilt (hold a direction to move) and zoom/focus on its
+  main page (read back from the camera after every change, since zooming
+  makes it autofocus); Monitor Point and Preset Points are their own pages,
+  reached from there and left with "back", the same drill-down the official
+  app uses. Monitor Point: a saved home position with its own thumbnail
+  (click it to refresh — a point saved from Reoling has none until this is
+  pressed once), Auto Return on/off and its timeout in 1-second steps,
+  "Return to Monitor Point", "Reset Monitor Point" to save the current
+  position. Presets: save / go to / delete. Calibration disables the panel
+  with a spinner while it runs — all confirmed working against real
+  hardware.
 - Snapshot (PNG in `~/Pictures/Reoling`) and recording (MKV in
   `~/Videos/Reoling`).
 - Settings: theme (Auto / Light / Dark), decoding (Auto / Hardware — with the
@@ -46,6 +50,11 @@ the same time and uses whichever answers first, as the official client does.
 
 - Playback (the tab is a placeholder), Split View, zoom on cameras behind an
   NVR's sub-channel numbering.
+- Preset Points don't show a thumbnail per preset yet (Monitor Point's does)
+  — under investigation from a capture of the official app's own preset
+  list; a preset the official app itself saved does show one there, one
+  Reoling saved doesn't until refreshed once in the official app, so the
+  camera does hold one per preset, Reoling just doesn't know its name yet.
 - PTZ calibration has no separate "finished" signal from the camera — the
   app only knows the request was accepted, matching what's documented for
   Baichuan generally, not a limitation specific to this capture.
@@ -58,6 +67,12 @@ the same time and uses whichever answers first, as the official client does.
 
 **Version history**
 
+- 0.1.5 — the remote is now paged (Calibration/Monitor Point/Preset Points
+  reached from the main page and left with "back"), matching the official
+  app's own panel instead of showing everything at once — much shorter;
+  Monitor Point's thumbnail is now click-to-refresh; calibration disables
+  the panel with a spinner while it runs, with a 20 s safety fallback in
+  case the camera's reply never arrives.
 - 0.1.4 — Monitor Point's saved thumbnail, shown in the remote; its timeout
   now steps by exactly 1 second; calibration and Monitor Point confirmed
   working on real hardware; control-reply messages (e.g. Monitor Point
