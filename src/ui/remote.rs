@@ -69,10 +69,12 @@ pub struct Handlers {
     /// on it — the official app treats its thumbnail as its own refresh
     /// button, and a preset saved without one only gets it after a refresh).
     pub on_refresh_monitor_point_image: Box<dyn Fn()>,
-    /// The Preset Points page opened — the moment to (re-)fetch every known
-    /// preset's thumbnail (the official app does the same on opening its
-    /// own list).
-    pub on_open_presets: Box<dyn Fn()>,
+    /// A preset's thumbnail was asked for again (a click on it, same as
+    /// Monitor Point's own thumbnail) — never fetched automatically for
+    /// every preset at once: the camera's own image-file transfer only
+    /// tolerates one at a time, and a burst of concurrent requests (once
+    /// tried here) got the camera to drop the connection.
+    pub on_refresh_preset_image: Box<dyn Fn(u8)>,
 }
 
 /// A slider with its name, its value, and − / + around it.
@@ -479,7 +481,6 @@ impl RemoteControl {
         this.open_presets.connect_clicked(move |_| {
             if let Some(r) = weak.upgrade() {
                 r.stack.set_visible_child_name("presets");
-                (r.handlers.on_open_presets)();
             }
         });
         let weak = Rc::downgrade(&this);
@@ -680,8 +681,15 @@ impl RemoteControl {
             line.set_margin_bottom(4);
             line.set_margin_start(8);
             line.set_margin_end(8);
+            // Wrapped in a flat button, like Monitor Point's own thumbnail:
+            // clicking it asks the camera for it again. Never fetched for
+            // every preset at once — see `on_refresh_preset_image`'s doc.
             let thumbnail = ImageWidget::new();
             thumbnail.set_visible(false);
+            let refresh_thumbnail = Button::new();
+            refresh_thumbnail.add_css_class("flat");
+            refresh_thumbnail.set_tooltip_text(Some("Refresh the picture"));
+            refresh_thumbnail.set_child(Some(&thumbnail));
             let name = Label::new(Some(&preset.name));
             name.set_hexpand(true);
             name.set_halign(gtk4::Align::Start);
@@ -692,7 +700,7 @@ impl RemoteControl {
             let remove = Button::from_icon_name("user-trash-symbolic");
             remove.set_tooltip_text(Some("Delete"));
             remove.add_css_class("flat");
-            line.append(&thumbnail);
+            line.append(&refresh_thumbnail);
             line.append(&name);
             line.append(&go);
             line.append(&remove);
@@ -700,6 +708,12 @@ impl RemoteControl {
             self.presets.append(&row);
             self.preset_images.borrow_mut().insert(preset.id, thumbnail);
 
+            let (id, weak) = (preset.id, Rc::downgrade(self));
+            refresh_thumbnail.connect_clicked(move |_| {
+                if let Some(r) = weak.upgrade() {
+                    (r.handlers.on_refresh_preset_image)(id);
+                }
+            });
             let (id, weak) = (preset.id, Rc::downgrade(self));
             go.connect_clicked(move |_| {
                 if let Some(r) = weak.upgrade() {

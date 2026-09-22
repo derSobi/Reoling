@@ -283,7 +283,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         });
         let (w_move, w_stop, w_zoom, w_focus) = (weak.clone(), weak.clone(), weak.clone(), weak.clone());
         let (w_add, w_goto, w_delete) = (weak.clone(), weak.clone(), weak.clone());
-        let (w_calibrate, w_mp_config, w_mp_reset, w_mp_goto, w_mp_image, w_presets_open) =
+        let (w_calibrate, w_mp_config, w_mp_reset, w_mp_goto, w_mp_image, w_preset_image) =
             (weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone());
         let remote = RemoteControl::new(remote::Handlers {
             on_move: Box::new(move |command| {
@@ -352,9 +352,9 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
                     m.control(|link, channel| link.query_monitor_point_image(channel));
                 }
             }),
-            on_open_presets: Box::new(move || {
-                if let Some(m) = w_presets_open.upgrade() {
-                    m.query_preset_images();
+            on_refresh_preset_image: Box::new(move |id| {
+                if let Some(m) = w_preset_image.upgrade() {
+                    m.control(move |link, channel| link.query_preset_image(channel, id));
                 }
             }),
         });
@@ -843,18 +843,6 @@ impl MainWindow {
 
     fn query_presets(&self) {
         self.control(|link, channel| link.query_presets(channel));
-    }
-
-    /// Asks for every currently listed preset's thumbnail — the official
-    /// app does the same each time its own Preset Points page opens.
-    fn query_preset_images(&self) {
-        let Some(key) = self.playing_key() else { return };
-        let Some(device) = self.device(&key) else { return };
-        if let Some(l) = self.links.borrow().get(&key) {
-            for preset in &device.presets {
-                l.link.query_preset_image(device.channel, preset.id);
-            }
-        }
     }
 
     fn query_presets_soon(self: &Rc<Self>) {

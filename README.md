@@ -9,7 +9,7 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 
 ## Status
 
-Version **0.1.6**, early development. Login and live video work end to end
+Version **0.1.7**, early development. Login and live video work end to end
 against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
 only: Reoling races the device's local, NAT-mapped and relay addresses at
 the same time and uses whichever answers first, as the official client does.
@@ -38,9 +38,12 @@ the same time and uses whichever answers first, as the official client does.
   pressed once), Auto Return on/off and its timeout in 1-second steps,
   "Return to Monitor Point", "Reset Monitor Point" to save the current
   position. Presets: save / go to / delete, each with its own thumbnail,
-  (re-)fetched when the Preset Points page opens. Calibration disables the
-  panel with a spinner while it runs — all confirmed working against real
-  hardware.
+  click-to-refresh like Monitor Point's — never fetched automatically for
+  every preset at once, since the camera only tolerates one image-file
+  transfer at a time and disconnected when this project first tried
+  fetching all of them together on opening the page. Calibration disables
+  the panel with a spinner while it runs — all confirmed working against
+  real hardware.
 - Snapshot (PNG in `~/Pictures/Reoling`) and recording (MKV in
   `~/Videos/Reoling`).
 - Settings: theme (Auto / Light / Dark), decoding (Auto / Hardware — with the
@@ -63,6 +66,13 @@ the same time and uses whichever answers first, as the official client does.
 
 **Version history**
 
+- 0.1.7 — fixed a real-hardware bug where opening Preset Points
+  disconnected the camera (`bad magic header`): it was fetching every
+  preset's thumbnail at once, which the camera's image-file transfer
+  can't handle concurrently; each preset's thumbnail is now click-to-
+  refresh instead, matching Monitor Point's own thumbnail and the
+  official app's own preset list (confirmed this only shows a picture
+  after a manual refresh).
 - 0.1.6 — Preset Points now show a thumbnail per preset, same as Monitor
   Point, fetched from the camera under each preset's own name
   (`preset_{id}`, confirmed from a capture of the official app's own
