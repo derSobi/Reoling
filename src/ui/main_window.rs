@@ -1255,29 +1255,48 @@ impl MainWindow {
                 }
             }
             DeviceEvent::ControlReply { msg_id, code } => {
-                if msg_id == 201 {
-                    self.talk_answered(code);
-                    return;
-                }
-                if msg_id == 18 || msg_id == 295 {
-                    if code != 200 {
-                        self.notify(&format!("Move: the camera refused (code {code})"));
+                let ok = code == 200;
+                match msg_id {
+                    201 => {
+                        self.talk_answered(code);
                     }
-                    return;
-                }
-                let (name, ok) = match msg_id {
-                    263 => ("Siren", code == 200),
-                    _ => ("Spotlight", code == 200),
-                };
-                if ok {
-                    self.notify(&if msg_id == 263 { "Siren sounding".to_string() } else { "Spotlight command sent".to_string() });
-                } else {
-                    self.notify(&format!("{name}: the camera refused (code {code})"));
-                    if msg_id != 263 {
-                        // It did not switch; show the truth.
-                        let on = self.spotlight.is_active();
-                        self.set_spotlight_button(!on);
+                    18 | 295 => {
+                        if !ok {
+                            self.notify(&format!("Move: the camera refused (code {code})"));
+                        }
                     }
+                    263 => {
+                        if ok {
+                            self.notify("Siren sounding");
+                        } else {
+                            self.notify(&format!("Siren: the camera refused (code {code})"));
+                        }
+                    }
+                    288 => {
+                        if ok {
+                            self.notify("Spotlight command sent");
+                        } else {
+                            self.notify(&format!("Spotlight: the camera refused (code {code})"));
+                            // It did not switch; show the truth.
+                            let on = self.spotlight.is_active();
+                            self.set_spotlight_button(!on);
+                        }
+                    }
+                    341 => {
+                        self.notify(&if ok {
+                            "Calibrating… this can take a few seconds".to_string()
+                        } else {
+                            format!("Calibration: the camera refused (code {code})")
+                        });
+                    }
+                    // Sent for three different actions (a plain config
+                    // change, "Reset", "Return") — only a failure is worth a
+                    // message; a config change alone would spam one on every
+                    // settled slider drag otherwise.
+                    331 if !ok => {
+                        self.notify(&format!("Monitor Point: the camera refused (code {code})"));
+                    }
+                    _ => {}
                 }
             }
             DeviceEvent::Abilities(abilities) => {
@@ -1312,6 +1331,17 @@ impl MainWindow {
                 let watching = self.playing_key().and_then(|k| self.device(&k)).is_some_and(|d| d.channel == channel_id);
                 if watching {
                     self.remote.set_monitor_point(state);
+                    if state.valid {
+                        self.control(|link, channel| link.query_monitor_point_image(channel));
+                    } else {
+                        self.remote.clear_monitor_point_image();
+                    }
+                }
+            }
+            DeviceEvent::MonitorPointImage { channel_id, jpeg } => {
+                let watching = self.playing_key().and_then(|k| self.device(&k)).is_some_and(|d| d.channel == channel_id);
+                if watching {
+                    self.remote.set_monitor_point_image(&jpeg);
                 }
             }
             DeviceEvent::ControlFailed(reason) => {

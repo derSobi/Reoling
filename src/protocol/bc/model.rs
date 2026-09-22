@@ -31,6 +31,11 @@ pub const MSG_ID_PTZ_GUARD: u32 = 331;
 pub const MSG_ID_GET_PTZ_GUARD: u32 = 332;
 /// Re-calibrates the pan/tilt mechanism.
 pub const MSG_ID_PTZ_CALIBRATE: u32 = 341;
+/// Reads a named image file the device keeps (Monitor Point's own
+/// thumbnail, named "guard"). The reply is a small metadata message
+/// followed by one or more `binaryData=1` chunks, ended by a response code
+/// other than 200 (201, empty body) rather than a size field.
+pub const MSG_ID_IMAGE_FILE: u32 = 421;
 /// Per-channel support table (which camera has a siren, spotlight, ...).
 pub const MSG_ID_SUPPORT: u32 = 199;
 /// Plays the siren once. Seen in a capture of the official app.

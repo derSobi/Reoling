@@ -7,6 +7,7 @@ use crate::transport::connection::BcConnection;
 use crate::transport::discovery::{connect_by_uid, PeerHandle};
 use crate::Error;
 use md5::{Digest, Md5};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::channel;
@@ -77,6 +78,8 @@ pub enum DeviceUpdate {
     Presets { channel_id: u8, presets: Vec<PtzPreset> },
     /// The camera's Monitor Point (PTZ Guard) state.
     MonitorPoint { channel_id: u8, state: MonitorPoint },
+    /// Monitor Point's saved thumbnail (JPEG bytes), fully reassembled.
+    MonitorPointImage { channel_id: u8, jpeg: Vec<u8> },
     /// The device's answer to a control command (siren, spotlight).
     ControlReply { msg_id: u32, code: u16 },
 }
@@ -227,6 +230,14 @@ fn monitor_point_read_extension(channel_id: u8) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Requests the named image file, exactly as captured for Monitor Point's
+/// own thumbnail (`name = "guard"`).
+fn image_file_read_xml(channel_id: u8, name: &str) -> Vec<u8> {
+    control_xml(&format!(
+        "<imageFileInfo version=\"1.1\">\n<channelId>{channel_id}</channelId>\n<imageName>{name}</imageName>\n</imageFileInfo>\n"
+    ))
+}
+
 /// A Monitor Point (`PtzGuard`) write: `setGrd` (configure — add
 /// `needSetPos` to also save the camera's current position as the point)
 /// or `toGrd` (move to it now). `xpos`/`ypos`/`height`/`width` are written
@@ -250,8 +261,36 @@ fn spotlight_xml(channel_id: u8, on: bool) -> Vec<u8> {
 }
 
 /// What `bc` tells us, if it is a pushed channel list or the answer to a
-/// channel-name request.
-fn pushed_update(bc: &Bc) -> Option<DeviceUpdate> {
+/// channel-name request. `image_chunks` reassembles a multi-message image
+/// download (see `MSG_ID_IMAGE_FILE`'s doc comment) — callers keep one map
+/// alive for as long as they keep reading from the same connection, the
+/// same way `read_bc`'s own `bin_mode` is kept alive across calls.
+fn pushed_update(bc: &Bc, image_chunks: &mut HashMap<u16, Vec<u8>>) -> Option<DeviceUpdate> {
+    if bc.meta.msg_id == MSG_ID_IMAGE_FILE {
+        let BcBody::Modern(ModernMsg { extension_xml, payload }) = &bc.body else {
+            return None;
+        };
+        let is_chunk = extension_xml
+            .as_deref()
+            .and_then(|e| Extension::from_bytes(e).ok())
+            .and_then(|e| e.binary_data)
+            == Some(1);
+        if !is_chunk {
+            // The small metadata reply that precedes the chunks; nothing
+            // this project reads from it yet.
+            return None;
+        }
+        if bc.meta.response_code == 200 {
+            if let Some(payload) = payload {
+                image_chunks.entry(bc.meta.msg_num).or_default().extend_from_slice(payload);
+            }
+            return None; // more to come
+        }
+        // Any other code (201, seen in a capture) ends the transfer.
+        let jpeg = image_chunks.remove(&bc.meta.msg_num).unwrap_or_default();
+        return (!jpeg.is_empty())
+            .then_some(DeviceUpdate::MonitorPointImage { channel_id: bc.meta.channel_id, jpeg });
+    }
     if bc.meta.msg_id == MSG_ID_PLAY_SIREN
         || bc.meta.msg_id == MSG_ID_SPOTLIGHT
         || bc.meta.msg_id == MSG_ID_PTZ
@@ -700,6 +739,33 @@ impl ReolinkClient {
         let _ = self.connection.lock().await.send_bc(&request, &self.encryption).await;
     }
 
+    /// Asks for Monitor Point's saved thumbnail. The device answers with
+    /// several messages; the reassembled JPEG arrives as one
+    /// `DeviceUpdate::MonitorPointImage` once the transfer ends.
+    pub async fn query_monitor_point_image(&mut self, channel_id: u8) {
+        let msg_num = self.next_msg_num();
+        let extension = Extension {
+            version: XML_VERSION.to_string(),
+            channel_id: Some(channel_id),
+            ..Default::default()
+        };
+        let request = Bc {
+            meta: BcMeta {
+                msg_id: MSG_ID_IMAGE_FILE,
+                channel_id,
+                stream_type: 0,
+                msg_num,
+                response_code: 0,
+                class: 0x6414,
+            },
+            body: BcBody::Modern(ModernMsg {
+                extension_xml: Some(extension.to_bytes()),
+                payload: Some(image_file_read_xml(channel_id, "guard")),
+            }),
+        };
+        let _ = self.connection.lock().await.send_bc(&request, &self.encryption).await;
+    }
+
     /// Configures Monitor Point (Auto Return on/off, its timeout) without
     /// moving it — moving it would need `set_current_position_as_monitor_point`
     /// instead, so a plain settings change never relocates it by accident.
@@ -885,12 +951,13 @@ impl ReolinkClient {
             if self.connection.lock().await.send_bc(&request, &self.encryption).await.is_err() {
                 return;
             }
+            let mut image_chunks = HashMap::new();
             for _ in 0..16 {
                 let Ok(reply) = self.connection.lock().await.recv_bc(&self.encryption).await
                 else {
                     return;
                 };
-                if let Some(update) = pushed_update(&reply) {
+                if let Some(update) = pushed_update(&reply, &mut image_chunks) {
                     let _ = self.channel_updates_tx.send(update);
                     continue;
                 }
@@ -967,6 +1034,7 @@ impl ReolinkClient {
             eprintln!("PROBE sent {msg_id}: {sent:?}");
         }
         let listen = async {
+            let mut image_chunks = HashMap::new();
             loop {
                 let Ok(bc) = self.connection.lock().await.recv_bc(&self.encryption).await else {
                     return;
@@ -984,7 +1052,7 @@ impl ReolinkClient {
                 );
                 // Keep the app working while probing: the channel list is
                 // among what arrives here.
-                if let Some(update) = pushed_update(&bc) {
+                if let Some(update) = pushed_update(&bc, &mut image_chunks) {
                     let _ = self.channel_updates_tx.send(update);
                 }
             }
@@ -1135,9 +1203,10 @@ impl ReolinkClient {
         self.connection.lock().await.send_bc(&request, &self.encryption).await?;
         // Pushes (channel lists, alarm events, ...) can come between our
         // request and the answer; they are not the answer.
+        let mut image_chunks = HashMap::new();
         let ack = loop {
             let bc = self.connection.lock().await.recv_bc(&self.encryption).await?;
-            if let Some(update) = pushed_update(&bc) {
+            if let Some(update) = pushed_update(&bc, &mut image_chunks) {
                 let _ = self.channel_updates_tx.send(update);
             } else if bc.meta.msg_id == MSG_ID_VIDEO && bc.meta.msg_num == msg_num {
                 // Same message number as our request: an earlier stream's
@@ -1166,6 +1235,7 @@ impl ReolinkClient {
         self.video_task = Some(tokio::spawn(async move {
             let mut buffer: Vec<u8> = Vec::new();
             let mut guard = MediaGuard::default();
+            let mut image_chunks = HashMap::new();
             loop {
                 let bc = {
                     let mut conn = connection.lock().await;
@@ -1177,7 +1247,7 @@ impl ReolinkClient {
                         }
                     }
                 };
-                if let Some(update) = pushed_update(&bc) {
+                if let Some(update) = pushed_update(&bc, &mut image_chunks) {
                     let _ = channel_updates.send(update);
                     continue;
                 }
@@ -1307,11 +1377,12 @@ impl ReolinkClient {
     /// `take_channel_updates`. Returns only when the connection fails.
     /// Cancel-safe: partial messages are kept by the connection.
     pub async fn wait_for_pushes(&mut self) -> crate::Error {
+        let mut image_chunks = HashMap::new();
         loop {
             let received = self.connection.lock().await.recv_bc(&self.encryption).await;
             match received {
                 Ok(bc) => {
-                    if let Some(update) = pushed_update(&bc) {
+                    if let Some(update) = pushed_update(&bc, &mut image_chunks) {
                         let _ = self.channel_updates_tx.send(update);
                     }
                 }
