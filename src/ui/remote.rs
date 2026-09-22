@@ -21,6 +21,32 @@ use std::time::Duration;
 /// not flood the camera.
 const SETTLE: Duration = Duration::from_millis(120);
 
+/// Decodes a JPEG/PNG and scales it down to fit within `max_width` ×
+/// `max_height`, preserving aspect ratio and never upscaling. Returns the
+/// scaled pixbuf and its actual pixel size, or `None` if the bytes don't
+/// decode.
+fn decode_and_scale(bytes: &[u8], max_width: i32, max_height: i32) -> Option<(gtk4::gdk_pixbuf::Pixbuf, i32, i32)> {
+    use gtk4::gdk_pixbuf::{prelude::*, InterpType, PixbufLoader};
+
+    let loader = PixbufLoader::new();
+    let pixbuf = loader
+        .write(bytes)
+        .and_then(|()| loader.close())
+        .ok()
+        .and_then(|()| loader.pixbuf())?;
+
+    let (width, height) = (pixbuf.width(), pixbuf.height());
+    let scale = (f64::from(max_width) / f64::from(width.max(1)))
+        .min(f64::from(max_height) / f64::from(height.max(1)))
+        .min(1.0);
+    let target_width = ((f64::from(width) * scale) as i32).max(1);
+    let target_height = ((f64::from(height) * scale) as i32).max(1);
+    let thumbnail = pixbuf
+        .scale_simple(target_width, target_height, InterpType::Bilinear)
+        .unwrap_or(pixbuf);
+    Some((thumbnail, target_width, target_height))
+}
+
 pub struct Handlers {
     /// A direction is held down: `left`, `right`, `up` or `down`.
     pub on_move: Box<dyn Fn(&'static str)>,
@@ -43,6 +69,10 @@ pub struct Handlers {
     /// on it — the official app treats its thumbnail as its own refresh
     /// button, and a preset saved without one only gets it after a refresh).
     pub on_refresh_monitor_point_image: Box<dyn Fn()>,
+    /// The Preset Points page opened — the moment to (re-)fetch every known
+    /// preset's thumbnail (the official app does the same on opening its
+    /// own list).
+    pub on_open_presets: Box<dyn Fn()>,
 }
 
 /// A slider with its name, its value, and − / + around it.
@@ -202,6 +232,10 @@ pub struct RemoteControl {
     /// Set while the code (not the user) moves the switch.
     updating_monitor_enabled: Rc<Cell<bool>>,
     presets: ListBox,
+    /// Each listed preset's thumbnail widget, by preset id, so a later
+    /// `set_preset_image` can update one in place without rebuilding the
+    /// whole list.
+    preset_images: std::cell::RefCell<std::collections::HashMap<u8, ImageWidget>>,
     preset_name: Entry,
     handlers: Rc<Handlers>,
 }
@@ -429,6 +463,7 @@ impl RemoteControl {
             monitor_state,
             updating_monitor_enabled,
             presets,
+            preset_images: std::cell::RefCell::new(std::collections::HashMap::new()),
             preset_name,
             handlers,
         });
@@ -444,6 +479,7 @@ impl RemoteControl {
         this.open_presets.connect_clicked(move |_| {
             if let Some(r) = weak.upgrade() {
                 r.stack.set_visible_child_name("presets");
+                (r.handlers.on_open_presets)();
             }
         });
         let weak = Rc::downgrade(&this);
@@ -578,31 +614,13 @@ impl RemoteControl {
     /// `Picture` left to its own natural size would show the source image
     /// at full resolution in this narrow window.
     pub fn set_monitor_point_image(&self, jpeg: &[u8]) {
-        use gtk4::gdk_pixbuf::{prelude::*, InterpType, PixbufLoader};
-
         const MAX_WIDTH: i32 = 220;
         const MAX_HEIGHT: i32 = 130;
 
-        let loader = PixbufLoader::new();
-        let pixbuf = loader
-            .write(jpeg)
-            .and_then(|()| loader.close())
-            .ok()
-            .and_then(|()| loader.pixbuf());
-        let Some(pixbuf) = pixbuf else {
+        let Some((thumbnail, target_width, target_height)) = decode_and_scale(jpeg, MAX_WIDTH, MAX_HEIGHT) else {
             eprintln!("could not decode Monitor Point's thumbnail");
             return;
         };
-
-        let (width, height) = (pixbuf.width(), pixbuf.height());
-        let scale = (f64::from(MAX_WIDTH) / f64::from(width.max(1)))
-            .min(f64::from(MAX_HEIGHT) / f64::from(height.max(1)))
-            .min(1.0);
-        let target_width = ((f64::from(width) * scale) as i32).max(1);
-        let target_height = ((f64::from(height) * scale) as i32).max(1);
-        let thumbnail = pixbuf
-            .scale_simple(target_width, target_height, InterpType::Bilinear)
-            .unwrap_or(pixbuf);
 
         // `Image` renders every pixbuf through its icon-size pipeline in
         // GTK4 — without this, it shrinks the (already pre-scaled)
@@ -616,6 +634,25 @@ impl RemoteControl {
     pub fn clear_monitor_point_image(&self) {
         self.monitor_image.set_from_pixbuf(None);
         self.monitor_image.set_visible(false);
+    }
+
+    /// A single preset's saved thumbnail, once its download has finished.
+    /// No-op if the preset is no longer listed (e.g. a refresh reply arrived
+    /// after the preset was deleted or the list was replaced).
+    pub fn set_preset_image(&self, preset_id: u8, jpeg: &[u8]) {
+        const MAX_WIDTH: i32 = 48;
+        const MAX_HEIGHT: i32 = 48;
+
+        let Some(image) = self.preset_images.borrow().get(&preset_id).cloned() else {
+            return;
+        };
+        let Some((thumbnail, target_width, target_height)) = decode_and_scale(jpeg, MAX_WIDTH, MAX_HEIGHT) else {
+            eprintln!("could not decode preset {preset_id}'s thumbnail");
+            return;
+        };
+        image.set_pixel_size(target_width.max(target_height));
+        image.set_from_pixbuf(Some(&thumbnail));
+        image.set_visible(true);
     }
 
     /// Zoom range and position, from the camera.
@@ -633,6 +670,7 @@ impl RemoteControl {
         while let Some(child) = self.presets.first_child() {
             self.presets.remove(&child);
         }
+        self.preset_images.borrow_mut().clear();
         for preset in presets {
             let row = ListBoxRow::new();
             row.set_selectable(false);
@@ -642,6 +680,8 @@ impl RemoteControl {
             line.set_margin_bottom(4);
             line.set_margin_start(8);
             line.set_margin_end(8);
+            let thumbnail = ImageWidget::new();
+            thumbnail.set_visible(false);
             let name = Label::new(Some(&preset.name));
             name.set_hexpand(true);
             name.set_halign(gtk4::Align::Start);
@@ -652,11 +692,13 @@ impl RemoteControl {
             let remove = Button::from_icon_name("user-trash-symbolic");
             remove.set_tooltip_text(Some("Delete"));
             remove.add_css_class("flat");
+            line.append(&thumbnail);
             line.append(&name);
             line.append(&go);
             line.append(&remove);
             row.set_child(Some(&line));
             self.presets.append(&row);
+            self.preset_images.borrow_mut().insert(preset.id, thumbnail);
 
             let (id, weak) = (preset.id, Rc::downgrade(self));
             go.connect_clicked(move |_| {

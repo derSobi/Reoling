@@ -80,6 +80,8 @@ pub enum DeviceUpdate {
     MonitorPoint { channel_id: u8, state: MonitorPoint },
     /// Monitor Point's saved thumbnail (JPEG bytes), fully reassembled.
     MonitorPointImage { channel_id: u8, jpeg: Vec<u8> },
+    /// A preset's saved thumbnail (JPEG bytes), fully reassembled.
+    PresetImage { channel_id: u8, preset_id: u8, jpeg: Vec<u8> },
     /// The device's answer to a control command (siren, spotlight).
     ControlReply { msg_id: u32, code: u16 },
 }
@@ -157,6 +159,21 @@ pub struct ReolinkClient {
     /// AAC (ADTS) frames of the running stream's audio.
     audio_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     audio_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+    /// What each in-flight `MSG_ID_IMAGE_FILE` request (keyed by its
+    /// `msg_num`) is for, so its reply — read by whichever task happens to
+    /// be reading the connection when it arrives, not necessarily the one
+    /// that sent the request — knows which `DeviceUpdate` to emit. `Arc` so
+    /// the video task's own read loop (a `'static` spawned task with no
+    /// `&mut self`) can share it too.
+    pending_images: Arc<std::sync::Mutex<HashMap<u16, ImageKind>>>,
+}
+
+/// What a `MSG_ID_IMAGE_FILE` request (see its own doc comment) was asking
+/// for.
+#[derive(Debug, Clone, Copy)]
+enum ImageKind {
+    MonitorPoint,
+    Preset(u8),
 }
 
 #[derive(Debug, Clone)]
@@ -265,7 +282,15 @@ fn spotlight_xml(channel_id: u8, on: bool) -> Vec<u8> {
 /// download (see `MSG_ID_IMAGE_FILE`'s doc comment) — callers keep one map
 /// alive for as long as they keep reading from the same connection, the
 /// same way `read_bc`'s own `bin_mode` is kept alive across calls.
-fn pushed_update(bc: &Bc, image_chunks: &mut HashMap<u16, Vec<u8>>) -> Option<DeviceUpdate> {
+/// `pending_images` says which request (Monitor Point, or which preset)
+/// each in-flight download answers — shared (not loop-local, unlike
+/// `image_chunks`) because the request that populates it can be sent from a
+/// completely different task than the one that ends up reading the reply.
+fn pushed_update(
+    bc: &Bc,
+    image_chunks: &mut HashMap<u16, Vec<u8>>,
+    pending_images: &std::sync::Mutex<HashMap<u16, ImageKind>>,
+) -> Option<DeviceUpdate> {
     if bc.meta.msg_id == MSG_ID_IMAGE_FILE {
         let BcBody::Modern(ModernMsg { extension_xml, payload }) = &bc.body else {
             return None;
@@ -288,8 +313,20 @@ fn pushed_update(bc: &Bc, image_chunks: &mut HashMap<u16, Vec<u8>>) -> Option<De
         }
         // Any other code (201, seen in a capture) ends the transfer.
         let jpeg = image_chunks.remove(&bc.meta.msg_num).unwrap_or_default();
-        return (!jpeg.is_empty())
-            .then_some(DeviceUpdate::MonitorPointImage { channel_id: bc.meta.channel_id, jpeg });
+        if jpeg.is_empty() {
+            return None;
+        }
+        let kind = pending_images.lock().expect("pending_images mutex poisoned").remove(&bc.meta.msg_num);
+        return match kind {
+            Some(ImageKind::Preset(preset_id)) => {
+                Some(DeviceUpdate::PresetImage { channel_id: bc.meta.channel_id, preset_id, jpeg })
+            }
+            // Monitor Point either by request, or as a fallback for a
+            // reply whose own request this client did not see (unexpected,
+            // but showing Monitor Point's picture is a safer default than
+            // silently dropping a downloaded image).
+            _ => Some(DeviceUpdate::MonitorPointImage { channel_id: bc.meta.channel_id, jpeg }),
+        };
     }
     if bc.meta.msg_id == MSG_ID_PLAY_SIREN
         || bc.meta.msg_id == MSG_ID_SPOTLIGHT
@@ -489,6 +526,7 @@ impl ReolinkClient {
             channel_updates_rx: Some(channel_updates_rx),
             audio_tx,
             audio_rx: Some(audio_rx),
+            pending_images: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -743,7 +781,21 @@ impl ReolinkClient {
     /// several messages; the reassembled JPEG arrives as one
     /// `DeviceUpdate::MonitorPointImage` once the transfer ends.
     pub async fn query_monitor_point_image(&mut self, channel_id: u8) {
+        self.query_image(channel_id, "guard".to_string(), ImageKind::MonitorPoint).await;
+    }
+
+    /// Asks for a preset's saved thumbnail. `preset_{id:02}` is the name
+    /// the official app itself uploads a freshly-taken snapshot under
+    /// (confirmed against a capture of it doing exactly that for a preset
+    /// Reoling had saved without one) — the same read-and-reassemble
+    /// mechanism as Monitor Point's, distinguished by `ImageKind`.
+    pub async fn query_preset_image(&mut self, channel_id: u8, preset_id: u8) {
+        self.query_image(channel_id, format!("preset_{preset_id:02}"), ImageKind::Preset(preset_id)).await;
+    }
+
+    async fn query_image(&mut self, channel_id: u8, image_name: String, kind: ImageKind) {
         let msg_num = self.next_msg_num();
+        self.pending_images.lock().expect("pending_images mutex poisoned").insert(msg_num, kind);
         let extension = Extension {
             version: XML_VERSION.to_string(),
             channel_id: Some(channel_id),
@@ -760,10 +812,12 @@ impl ReolinkClient {
             },
             body: BcBody::Modern(ModernMsg {
                 extension_xml: Some(extension.to_bytes()),
-                payload: Some(image_file_read_xml(channel_id, "guard")),
+                payload: Some(image_file_read_xml(channel_id, &image_name)),
             }),
         };
-        let _ = self.connection.lock().await.send_bc(&request, &self.encryption).await;
+        if self.connection.lock().await.send_bc(&request, &self.encryption).await.is_err() {
+            self.pending_images.lock().expect("pending_images mutex poisoned").remove(&msg_num);
+        }
     }
 
     /// Configures Monitor Point (Auto Return on/off, its timeout) without
@@ -957,7 +1011,7 @@ impl ReolinkClient {
                 else {
                     return;
                 };
-                if let Some(update) = pushed_update(&reply, &mut image_chunks) {
+                if let Some(update) = pushed_update(&reply, &mut image_chunks, &self.pending_images) {
                     let _ = self.channel_updates_tx.send(update);
                     continue;
                 }
@@ -1052,7 +1106,7 @@ impl ReolinkClient {
                 );
                 // Keep the app working while probing: the channel list is
                 // among what arrives here.
-                if let Some(update) = pushed_update(&bc, &mut image_chunks) {
+                if let Some(update) = pushed_update(&bc, &mut image_chunks, &self.pending_images) {
                     let _ = self.channel_updates_tx.send(update);
                 }
             }
@@ -1206,7 +1260,7 @@ impl ReolinkClient {
         let mut image_chunks = HashMap::new();
         let ack = loop {
             let bc = self.connection.lock().await.recv_bc(&self.encryption).await?;
-            if let Some(update) = pushed_update(&bc, &mut image_chunks) {
+            if let Some(update) = pushed_update(&bc, &mut image_chunks, &self.pending_images) {
                 let _ = self.channel_updates_tx.send(update);
             } else if bc.meta.msg_id == MSG_ID_VIDEO && bc.meta.msg_num == msg_num {
                 // Same message number as our request: an earlier stream's
@@ -1232,6 +1286,7 @@ impl ReolinkClient {
         let encryption = self.encryption.clone();
         let channel_updates = self.channel_updates_tx.clone();
         let audio = self.audio_tx.clone();
+        let pending_images = Arc::clone(&self.pending_images);
         self.video_task = Some(tokio::spawn(async move {
             let mut buffer: Vec<u8> = Vec::new();
             let mut guard = MediaGuard::default();
@@ -1247,7 +1302,7 @@ impl ReolinkClient {
                         }
                     }
                 };
-                if let Some(update) = pushed_update(&bc, &mut image_chunks) {
+                if let Some(update) = pushed_update(&bc, &mut image_chunks, &pending_images) {
                     let _ = channel_updates.send(update);
                     continue;
                 }
@@ -1382,7 +1437,7 @@ impl ReolinkClient {
             let received = self.connection.lock().await.recv_bc(&self.encryption).await;
             match received {
                 Ok(bc) => {
-                    if let Some(update) = pushed_update(&bc, &mut image_chunks) {
+                    if let Some(update) = pushed_update(&bc, &mut image_chunks, &self.pending_images) {
                         let _ = self.channel_updates_tx.send(update);
                     }
                 }

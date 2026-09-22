@@ -283,8 +283,8 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         });
         let (w_move, w_stop, w_zoom, w_focus) = (weak.clone(), weak.clone(), weak.clone(), weak.clone());
         let (w_add, w_goto, w_delete) = (weak.clone(), weak.clone(), weak.clone());
-        let (w_calibrate, w_mp_config, w_mp_reset, w_mp_goto, w_mp_image) =
-            (weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone());
+        let (w_calibrate, w_mp_config, w_mp_reset, w_mp_goto, w_mp_image, w_presets_open) =
+            (weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone());
         let remote = RemoteControl::new(remote::Handlers {
             on_move: Box::new(move |command| {
                 if let Some(m) = w_move.upgrade() {
@@ -350,6 +350,11 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             on_refresh_monitor_point_image: Box::new(move || {
                 if let Some(m) = w_mp_image.upgrade() {
                     m.control(|link, channel| link.query_monitor_point_image(channel));
+                }
+            }),
+            on_open_presets: Box::new(move || {
+                if let Some(m) = w_presets_open.upgrade() {
+                    m.query_preset_images();
                 }
             }),
         });
@@ -838,6 +843,18 @@ impl MainWindow {
 
     fn query_presets(&self) {
         self.control(|link, channel| link.query_presets(channel));
+    }
+
+    /// Asks for every currently listed preset's thumbnail — the official
+    /// app does the same each time its own Preset Points page opens.
+    fn query_preset_images(&self) {
+        let Some(key) = self.playing_key() else { return };
+        let Some(device) = self.device(&key) else { return };
+        if let Some(l) = self.links.borrow().get(&key) {
+            for preset in &device.presets {
+                l.link.query_preset_image(device.channel, preset.id);
+            }
+        }
     }
 
     fn query_presets_soon(self: &Rc<Self>) {
@@ -1352,6 +1369,12 @@ impl MainWindow {
                 let watching = self.playing_key().and_then(|k| self.device(&k)).is_some_and(|d| d.channel == channel_id);
                 if watching {
                     self.remote.set_monitor_point_image(&jpeg);
+                }
+            }
+            DeviceEvent::PresetImage { channel_id, preset_id, jpeg } => {
+                let watching = self.playing_key().and_then(|k| self.device(&k)).is_some_and(|d| d.channel == channel_id);
+                if watching {
+                    self.remote.set_preset_image(preset_id, &jpeg);
                 }
             }
             DeviceEvent::ControlFailed(reason) => {

@@ -24,6 +24,8 @@ pub enum DeviceEvent {
     MonitorPoint { channel_id: u8, state: reoling::MonitorPoint },
     /// Monitor Point's saved thumbnail (JPEG bytes), fully reassembled.
     MonitorPointImage { channel_id: u8, jpeg: Vec<u8> },
+    /// A preset's saved thumbnail (JPEG bytes), fully reassembled.
+    PresetImage { channel_id: u8, preset_id: u8, jpeg: Vec<u8> },
     /// A channel's name, asked for because the channel list had none.
     ChannelName { channel_id: u8, name: String },
     /// The requested stream's first frame reached GStreamer.
@@ -56,6 +58,7 @@ enum Command {
     Calibrate { channel: u8 },
     QueryMonitorPoint { channel: u8 },
     QueryMonitorPointImage { channel: u8 },
+    QueryPresetImage { channel: u8, preset_id: u8 },
     SetMonitorPointConfig { channel: u8, enabled: bool, timeout_seconds: u32 },
     SetMonitorPointHere { channel: u8, enabled: bool, timeout_seconds: u32 },
     GoToMonitorPoint { channel: u8, timeout_seconds: u32 },
@@ -134,6 +137,11 @@ impl DeviceLink {
     /// `MonitorPointImage`).
     pub fn query_monitor_point_image(&self, channel: u8) {
         let _ = self.commands.send(Command::QueryMonitorPointImage { channel });
+    }
+
+    /// Asks for a preset's saved thumbnail (answered as `PresetImage`).
+    pub fn query_preset_image(&self, channel: u8, preset_id: u8) {
+        let _ = self.commands.send(Command::QueryPresetImage { channel, preset_id });
     }
 
     /// Auto Return on/off and its timeout, without moving the point.
@@ -351,6 +359,9 @@ pub fn spawn_device(
                         Some(Command::QueryMonitorPointImage { channel }) => {
                             client.query_monitor_point_image(channel).await;
                         }
+                        Some(Command::QueryPresetImage { channel, preset_id }) => {
+                            client.query_preset_image(channel, preset_id).await;
+                        }
                         Some(Command::SetMonitorPointConfig { channel, enabled, timeout_seconds }) => {
                             if let Err(e) = client.set_monitor_point_config(channel, enabled, timeout_seconds).await {
                                 let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
@@ -421,6 +432,9 @@ pub fn spawn_device(
                             }
                             DeviceUpdate::MonitorPointImage { channel_id, jpeg } => {
                                 DeviceEvent::MonitorPointImage { channel_id, jpeg }
+                            }
+                            DeviceUpdate::PresetImage { channel_id, preset_id, jpeg } => {
+                                DeviceEvent::PresetImage { channel_id, preset_id, jpeg }
                             }
                             DeviceUpdate::ControlReply { msg_id, code } => {
                                 DeviceEvent::ControlReply { msg_id, code }

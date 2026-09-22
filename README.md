@@ -9,7 +9,7 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 
 ## Status
 
-Version **0.1.5**, early development. Login and live video work end to end
+Version **0.1.6**, early development. Login and live video work end to end
 against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
 only: Reoling races the device's local, NAT-mapped and relay addresses at
 the same time and uses whichever answers first, as the official client does.
@@ -37,8 +37,9 @@ the same time and uses whichever answers first, as the official client does.
   (click it to refresh — a point saved from Reoling has none until this is
   pressed once), Auto Return on/off and its timeout in 1-second steps,
   "Return to Monitor Point", "Reset Monitor Point" to save the current
-  position. Presets: save / go to / delete. Calibration disables the panel
-  with a spinner while it runs — all confirmed working against real
+  position. Presets: save / go to / delete, each with its own thumbnail,
+  (re-)fetched when the Preset Points page opens. Calibration disables the
+  panel with a spinner while it runs — all confirmed working against real
   hardware.
 - Snapshot (PNG in `~/Pictures/Reoling`) and recording (MKV in
   `~/Videos/Reoling`).
@@ -50,11 +51,6 @@ the same time and uses whichever answers first, as the official client does.
 
 - Playback (the tab is a placeholder), Split View, zoom on cameras behind an
   NVR's sub-channel numbering.
-- Preset Points don't show a thumbnail per preset yet (Monitor Point's does)
-  — under investigation from a capture of the official app's own preset
-  list; a preset the official app itself saved does show one there, one
-  Reoling saved doesn't until refreshed once in the official app, so the
-  camera does hold one per preset, Reoling just doesn't know its name yet.
 - PTZ calibration has no separate "finished" signal from the camera — the
   app only knows the request was accepted, matching what's documented for
   Baichuan generally, not a limitation specific to this capture.
@@ -67,6 +63,10 @@ the same time and uses whichever answers first, as the official client does.
 
 **Version history**
 
+- 0.1.6 — Preset Points now show a thumbnail per preset, same as Monitor
+  Point, fetched from the camera under each preset's own name
+  (`preset_{id}`, confirmed from a capture of the official app's own
+  preset list) each time the Preset Points page opens.
 - 0.1.5 — the remote is now paged (Calibration/Monitor Point/Preset Points
   reached from the main page and left with "back"), matching the official
   app's own panel instead of showing everything at once — much shorter;
