@@ -5,7 +5,7 @@
 use gtk4::prelude::*;
 use gtk4::{
     Box as GtkBox, Button, Entry, GestureClick, Grid, Label, ListBox, ListBoxRow, Orientation,
-    PropagationPhase, Scale, Separator, Switch, Window,
+    Image as ImageWidget, PropagationPhase, Scale, Separator, Switch, Window,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -43,10 +43,24 @@ struct Adjuster {
     /// Set while the code (not the user) moves the slider.
     updating: Cell<bool>,
     generation: Cell<u64>,
+    /// The −/+ buttons' step. `None` means one proportional to the current
+    /// range (for zoom/focus, whose range can be in the thousands); `Some`
+    /// pins it regardless of range (Monitor Point's timeout wants exactly
+    /// 1 second, not a fraction of 10..300).
+    fixed_step: Option<f64>,
 }
 
 impl Adjuster {
     fn new(name: &str, send: impl Fn(u32) + 'static) -> Rc<Self> {
+        Self::with_step(name, None, send)
+    }
+
+    /// Like `new`, but the −/+ buttons always move by exactly `step`.
+    fn with_fixed_step(name: &str, step: f64, send: impl Fn(u32) + 'static) -> Rc<Self> {
+        Self::with_step(name, Some(step), send)
+    }
+
+    fn with_step(name: &str, fixed_step: Option<f64>, send: impl Fn(u32) + 'static) -> Rc<Self> {
         let scale = Scale::with_range(Orientation::Horizontal, 0.0, 1.0, 1.0);
         scale.set_draw_value(false);
         scale.set_hexpand(true);
@@ -76,6 +90,7 @@ impl Adjuster {
             value,
             updating: Cell::new(false),
             generation: Cell::new(0),
+            fixed_step,
         });
 
         for (button, sign) in [(less, -1.0), (more, 1.0)] {
@@ -83,7 +98,9 @@ impl Adjuster {
             button.connect_clicked(move |_| {
                 if let Some(a) = weak.upgrade() {
                     let adjustment = a.scale.adjustment();
-                    let step = ((adjustment.upper() - adjustment.lower()) / 50.0).max(1.0);
+                    let step = a
+                        .fixed_step
+                        .unwrap_or_else(|| ((adjustment.upper() - adjustment.lower()) / 50.0).max(1.0));
                     a.scale.set_value(a.scale.value() + sign * step);
                 }
             });
@@ -134,6 +151,7 @@ pub struct RemoteControl {
     focus: Rc<Adjuster>,
     calibrate: Button,
     monitor_point: GtkBox,
+    monitor_image: ImageWidget,
     monitor_enabled: Switch,
     monitor_timeout: Rc<Adjuster>,
     monitor_status: Label,
@@ -211,6 +229,15 @@ impl RemoteControl {
         content.append(&monitor_heading);
         let monitor_point = GtkBox::new(Orientation::Vertical, 8);
 
+        // `Image`, not `Picture`: it sizes itself to the pixbuf's own pixel
+        // dimensions instead of stretching to fill the available width, so
+        // the thumbnail this project pre-scales in `set_monitor_point_image`
+        // actually stays small.
+        let monitor_image = ImageWidget::new();
+        monitor_image.set_halign(gtk4::Align::Start);
+        monitor_image.set_visible(false);
+        monitor_point.append(&monitor_image);
+
         let monitor_status = Label::new(Some("Not read yet"));
         monitor_status.add_css_class("dim-label");
         monitor_status.set_halign(gtk4::Align::Start);
@@ -234,7 +261,7 @@ impl RemoteControl {
         let updating_monitor_enabled: Rc<Cell<bool>> = Rc::default();
 
         let (h, state) = (Rc::clone(&handlers), Rc::clone(&monitor_state));
-        let monitor_timeout = Adjuster::new("Return after (seconds)", move |timeout| {
+        let monitor_timeout = Adjuster::with_fixed_step("Return after (seconds)", 1.0, move |timeout| {
             state.set(reoling::MonitorPoint { timeout_seconds: timeout, ..state.get() });
             (h.on_monitor_point_config)(state.get().enabled, timeout);
         });
@@ -290,6 +317,7 @@ impl RemoteControl {
             focus,
             calibrate,
             monitor_point,
+            monitor_image,
             monitor_enabled,
             monitor_timeout,
             monitor_status,
@@ -351,6 +379,7 @@ impl RemoteControl {
         self.monitor_point.set_sensitive(monitor_point);
         if !monitor_point {
             self.monitor_status.set_text("This camera has no Monitor Point");
+            self.clear_monitor_point_image();
         } else if self.monitor_status.text() == "This camera has no Monitor Point" {
             self.monitor_status.set_text("Not read yet");
         }
@@ -371,6 +400,54 @@ impl RemoteControl {
         } else {
             "No Monitor Point saved yet — move the camera and press Reset Monitor Point"
         });
+        if !state.valid {
+            self.clear_monitor_point_image();
+        }
+    }
+
+    /// Monitor Point's saved thumbnail, once its download has finished.
+    /// Scaled down to a small, fixed-bound thumbnail before display — a
+    /// `Picture` left to its own natural size would show the source image
+    /// at full resolution in this narrow window.
+    pub fn set_monitor_point_image(&self, jpeg: &[u8]) {
+        use gtk4::gdk_pixbuf::{prelude::*, InterpType, PixbufLoader};
+
+        const MAX_WIDTH: i32 = 220;
+        const MAX_HEIGHT: i32 = 130;
+
+        let loader = PixbufLoader::new();
+        let pixbuf = loader
+            .write(jpeg)
+            .and_then(|()| loader.close())
+            .ok()
+            .and_then(|()| loader.pixbuf());
+        let Some(pixbuf) = pixbuf else {
+            eprintln!("could not decode Monitor Point's thumbnail");
+            return;
+        };
+
+        let (width, height) = (pixbuf.width(), pixbuf.height());
+        let scale = (f64::from(MAX_WIDTH) / f64::from(width.max(1)))
+            .min(f64::from(MAX_HEIGHT) / f64::from(height.max(1)))
+            .min(1.0);
+        let target_width = ((f64::from(width) * scale) as i32).max(1);
+        let target_height = ((f64::from(height) * scale) as i32).max(1);
+        let thumbnail = pixbuf
+            .scale_simple(target_width, target_height, InterpType::Bilinear)
+            .unwrap_or(pixbuf);
+
+        // `Image` renders every pixbuf through its icon-size pipeline in
+        // GTK4 — without this, it shrinks the (already pre-scaled)
+        // thumbnail down to the theme's normal icon size regardless of its
+        // real pixel dimensions.
+        self.monitor_image.set_pixel_size(target_width.max(target_height));
+        self.monitor_image.set_from_pixbuf(Some(&thumbnail));
+        self.monitor_image.set_visible(true);
+    }
+
+    pub fn clear_monitor_point_image(&self) {
+        self.monitor_image.set_from_pixbuf(None);
+        self.monitor_image.set_visible(false);
     }
 
     /// Zoom range and position, from the camera.
