@@ -18,6 +18,7 @@
 # Codul proiectului
 !/src/**
 !/examples/**
+!/scripts/**
 !/data/**
 
 # Dar nu artefactele de build
