@@ -46,8 +46,8 @@ the same time and uses whichever answers first, as the official client does.
   of the official app needs its session decrypted, which needs its
   password.
 - Deleting a PTZ preset sends `delPos` (this project's best guess, matched
-  against message counts in a capture, not against decrypted bytes); some
-  firmwares are known to accept it without actually clearing the slot.
+  against message counts in a capture, not against decrypted bytes — but
+  confirmed working, deletion included, against a real camera).
 - Packaging (see [Installation](#installation)).
 - Talk has been built from the official app's captured messages but is the
   least tested part.
