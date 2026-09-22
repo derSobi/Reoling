@@ -27,6 +27,40 @@ pub struct BcXml {
     pub ptz_zoom_focus: Option<PtzZoomFocus>,
     #[serde(rename = "PtzPreset", skip_serializing_if = "Option::is_none")]
     pub ptz_preset: Option<PtzPresetXml>,
+    #[serde(rename = "PtzGuard", skip_serializing_if = "Option::is_none")]
+    pub ptz_guard: Option<PtzGuardXml>,
+}
+
+/// "Monitor Point" in the app's UI — PTZ Guard / Guard Point on the wire: a
+/// saved home position the camera can be sent to, with an optional
+/// automatic-return timer. Read via `MSG_ID_GET_PTZ_GUARD` (332). See
+/// `.plans/reolink-baichuan-calibration-monitor-point.md`.
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct PtzGuardXml {
+    #[serde(rename = "channelId")]
+    pub channel_id: Option<u8>,
+    /// Automatic return enabled.
+    pub benable: Option<u8>,
+    /// Whether a point is actually saved. Different firmwares use different
+    /// field names for this — both are read.
+    pub bvalid: Option<u8>,
+    #[serde(rename = "bexistPos")]
+    pub bexist_pos: Option<u8>,
+    /// Seconds before automatic return (10..=300 in the official app).
+    pub timeout: Option<u32>,
+    pub mode: Option<String>,
+    #[serde(rename = "imageName")]
+    pub image_name: Option<String>,
+}
+
+impl PtzGuardXml {
+    pub fn into_monitor_point(self) -> crate::client::MonitorPoint {
+        crate::client::MonitorPoint {
+            enabled: self.benable.unwrap_or(0) != 0,
+            valid: self.bvalid.or(self.bexist_pos).unwrap_or(0) != 0,
+            timeout_seconds: self.timeout.unwrap_or(0),
+        }
+    }
 }
 
 /// A camera's saved PTZ presets, and the write form of one preset command
@@ -126,6 +160,11 @@ pub struct SupportItem {
     /// Non-zero for cameras with pan/tilt (and zoom) motors.
     #[serde(rename = "ptzType")]
     pub ptz_type: Option<u32>,
+    /// Bit mask of PTZ features (bit 2 Monitor Point / Guard, bit 3
+    /// calibration, bit 4 digital zoom, bit 6 speed control — reolink_aio;
+    /// see `.plans/reolink-baichuan-calibration-monitor-point.md`).
+    #[serde(rename = "ptzControl")]
+    pub ptz_control: Option<u32>,
 }
 
 impl Support {
@@ -139,6 +178,8 @@ impl Support {
                 // Which motors a pan/tilt(/zoom) camera has, by `ptzType`
                 // (values as reolink_aio decodes them).
                 let ptz = i.ptz_type.unwrap_or(0);
+                let physical_ptz = ptz != 0;
+                let ptz_control = i.ptz_control.unwrap_or(0);
                 Some((
                     channel,
                     crate::client::ChannelAbilities {
@@ -148,6 +189,8 @@ impl Support {
                         pan: matches!(ptz, 2 | 3 | 5 | 6 | 7),
                         tilt: matches!(ptz, 2 | 3 | 5 | 6),
                         zoom: matches!(ptz, 1 | 2 | 5),
+                        monitor_point: physical_ptz && ptz_control & (1 << 2) != 0,
+                        calibration: physical_ptz && ptz_control & (1 << 3) != 0,
                     },
                 ))
             })
@@ -419,16 +462,46 @@ mod channel_info_tests {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" ?><body><Support version="1.1">
             <channelNum>24</channelNum>
             <smartHome><version>1</version><item><name>googleHome</name><ver>1</ver></item></smartHome>
-            <item><chnID>0</chnID><audioVersion>31</audioVersion><ledCtrl>3</ledCtrl><ipcAudioTalk>1</ipcAudioTalk><ptzType>5</ptzType><lightType>0</lightType></item>
-            <item><chnID>2</chnID><audioVersion>31</audioVersion><ledCtrl>38</ledCtrl><ipcAudioTalk>1</ipcAudioTalk><ptzType>0</ptzType><lightType>1</lightType></item>
+            <item><chnID>0</chnID><audioVersion>31</audioVersion><ledCtrl>3</ledCtrl><ipcAudioTalk>1</ipcAudioTalk><ptzType>5</ptzType><ptzControl>47</ptzControl><lightType>0</lightType></item>
+            <item><chnID>2</chnID><audioVersion>31</audioVersion><ledCtrl>38</ledCtrl><ipcAudioTalk>1</ipcAudioTalk><ptzType>0</ptzType><ptzControl>64</ptzControl><lightType>1</lightType></item>
             <item><chnID>3</chnID><audioVersion>0</audioVersion><ledCtrl>0</ledCtrl><ipcAudioTalk>0</ipcAudioTalk></item>
             </Support></body>"#;
         let abilities = BcXml::from_bytes(xml).unwrap().support.unwrap().into_abilities();
         assert_eq!(abilities.len(), 3);
         let of = |c: u8| abilities.iter().find(|(id, _)| *id == c).unwrap().1;
         assert!(of(0).siren && of(0).talk && of(0).pan && of(0).tilt && of(0).zoom && of(0).spotlight);
+        assert!(of(0).monitor_point && of(0).calibration);
         assert!(of(2).siren && of(2).talk && of(2).spotlight && !of(2).pan);
+        // ptzControl=64 has bits 2/3 clear, and no physical PTZ either.
+        assert!(!of(2).monitor_point && !of(2).calibration);
         assert!(!of(3).siren && !of(3).talk && !of(3).spotlight);
+    }
+
+    #[test]
+    fn monitor_point_reply_gives_state() {
+        // Shape captured from the official app (see
+        // .plans/reolink-baichuan-calibration-monitor-point.md section 7).
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" ?><body><PtzGuard version="1.1">
+            <channelId>0</channelId>
+            <timeout>68</timeout>
+            <benable>1</benable>
+            <bvalid>1</bvalid>
+            <imageName>guard</imageName>
+            <mode>global</mode>
+            <xpos>0</xpos><ypos>0</ypos><height>0</height><width>0</width>
+            </PtzGuard></body>"#;
+        let state = BcXml::from_bytes(xml).unwrap().ptz_guard.unwrap().into_monitor_point();
+        assert!(state.enabled && state.valid);
+        assert_eq!(state.timeout_seconds, 68);
+    }
+
+    #[test]
+    fn monitor_point_reply_accepts_bexistpos_instead_of_bvalid() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" ?><body><PtzGuard version="1.1">
+            <channelId>0</channelId><timeout>60</timeout><benable>0</benable><bexistPos>1</bexistPos>
+            </PtzGuard></body>"#;
+        let state = BcXml::from_bytes(xml).unwrap().ptz_guard.unwrap().into_monitor_point();
+        assert!(!state.enabled && state.valid);
     }
 
     #[test]

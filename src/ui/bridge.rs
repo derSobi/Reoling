@@ -20,6 +20,8 @@ pub enum DeviceEvent {
     ZoomFocus { channel_id: u8, zoom: Option<(u32, u32, u32)>, focus: Option<(u32, u32, u32)> },
     /// The camera's saved presets.
     Presets { channel_id: u8, presets: Vec<reoling::PtzPreset> },
+    /// The camera's Monitor Point (PTZ Guard) state.
+    MonitorPoint { channel_id: u8, state: reoling::MonitorPoint },
     /// A channel's name, asked for because the channel list had none.
     ChannelName { channel_id: u8, name: String },
     /// The requested stream's first frame reached GStreamer.
@@ -49,6 +51,11 @@ enum Command {
     TalkStart { channel: u8 },
     TalkBlock { channel: u8, block: Vec<u8> },
     TalkStop { channel: u8 },
+    Calibrate { channel: u8 },
+    QueryMonitorPoint { channel: u8 },
+    SetMonitorPointConfig { channel: u8, enabled: bool, timeout_seconds: u32 },
+    SetMonitorPointHere { channel: u8, enabled: bool, timeout_seconds: u32 },
+    GoToMonitorPoint { channel: u8, timeout_seconds: u32 },
     Stop,
     Shutdown,
 }
@@ -108,6 +115,31 @@ impl DeviceLink {
 
     pub fn delete_preset(&self, channel: u8, id: u8) {
         let _ = self.commands.send(Command::DeletePreset { channel, id });
+    }
+
+    /// Re-calibrates the pan/tilt mechanism.
+    pub fn calibrate(&self, channel: u8) {
+        let _ = self.commands.send(Command::Calibrate { channel });
+    }
+
+    /// Asks for Monitor Point's current state (answered as `MonitorPoint`).
+    pub fn query_monitor_point(&self, channel: u8) {
+        let _ = self.commands.send(Command::QueryMonitorPoint { channel });
+    }
+
+    /// Auto Return on/off and its timeout, without moving the point.
+    pub fn set_monitor_point_config(&self, channel: u8, enabled: bool, timeout_seconds: u32) {
+        let _ = self.commands.send(Command::SetMonitorPointConfig { channel, enabled, timeout_seconds });
+    }
+
+    /// Saves the camera's current position as Monitor Point.
+    pub fn set_monitor_point_here(&self, channel: u8, enabled: bool, timeout_seconds: u32) {
+        let _ = self.commands.send(Command::SetMonitorPointHere { channel, enabled, timeout_seconds });
+    }
+
+    /// Moves the camera to Monitor Point now.
+    pub fn go_to_monitor_point(&self, channel: u8, timeout_seconds: u32) {
+        let _ = self.commands.send(Command::GoToMonitorPoint { channel, timeout_seconds });
     }
 
     /// Opens a talk session; the camera's answer comes as a `ControlReply`
@@ -299,6 +331,31 @@ pub fn spawn_device(
                                 let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
                             }
                         }
+                        Some(Command::Calibrate { channel }) => {
+                            if let Err(e) = client.calibrate_ptz(channel).await {
+                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                            }
+                        }
+                        Some(Command::QueryMonitorPoint { channel }) => {
+                            client.query_monitor_point(channel).await;
+                        }
+                        Some(Command::SetMonitorPointConfig { channel, enabled, timeout_seconds }) => {
+                            if let Err(e) = client.set_monitor_point_config(channel, enabled, timeout_seconds).await {
+                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                            }
+                        }
+                        Some(Command::SetMonitorPointHere { channel, enabled, timeout_seconds }) => {
+                            if let Err(e) =
+                                client.set_current_position_as_monitor_point(channel, enabled, timeout_seconds).await
+                            {
+                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                            }
+                        }
+                        Some(Command::GoToMonitorPoint { channel, timeout_seconds }) => {
+                            if let Err(e) = client.go_to_monitor_point(channel, timeout_seconds).await {
+                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                            }
+                        }
                         Some(Command::Focus { channel, position }) => {
                             if let Err(e) = client.set_focus(channel, position).await {
                                 let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
@@ -346,6 +403,9 @@ pub fn spawn_device(
                             }
                             DeviceUpdate::Presets { channel_id, presets } => {
                                 DeviceEvent::Presets { channel_id, presets }
+                            }
+                            DeviceUpdate::MonitorPoint { channel_id, state } => {
+                                DeviceEvent::MonitorPoint { channel_id, state }
                             }
                             DeviceUpdate::ControlReply { msg_id, code } => {
                                 DeviceEvent::ControlReply { msg_id, code }

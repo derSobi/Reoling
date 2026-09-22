@@ -27,6 +27,17 @@ pub struct PtzPreset {
     pub name: String,
 }
 
+/// "Monitor Point" — a saved home position a PTZ camera can automatically
+/// (or on demand) return to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MonitorPoint {
+    /// Automatic return after `timeout_seconds`.
+    pub enabled: bool,
+    /// Whether a point is actually saved.
+    pub valid: bool,
+    pub timeout_seconds: u32,
+}
+
 /// What one channel's camera can do.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChannelAbilities {
@@ -38,6 +49,11 @@ pub struct ChannelAbilities {
     pub pan: bool,
     pub tilt: bool,
     pub zoom: bool,
+    /// PTZ Guard / "Monitor Point" — a saved home position the camera can
+    /// return to, on demand or automatically after a timeout.
+    pub monitor_point: bool,
+    /// Re-calibrates the pan/tilt mechanism.
+    pub calibration: bool,
 }
 
 impl ChannelAbilities {
@@ -59,6 +75,8 @@ pub enum DeviceUpdate {
     ZoomFocus { channel_id: u8, zoom: Option<(u32, u32, u32)>, focus: Option<(u32, u32, u32)> },
     /// The camera's saved presets.
     Presets { channel_id: u8, presets: Vec<PtzPreset> },
+    /// The camera's Monitor Point (PTZ Guard) state.
+    MonitorPoint { channel_id: u8, state: MonitorPoint },
     /// The device's answer to a control command (siren, spotlight).
     ControlReply { msg_id: u32, code: u16 },
 }
@@ -197,6 +215,31 @@ fn preset_xml(channel_id: u8, id: u8, name: Option<&str>, command: &str) -> Vec<
     ))
 }
 
+/// Extension for reading Monitor Point (332): unlike every other control
+/// message here, the READ extension carries `chnType` — the WRITE one
+/// (331) doesn't. Confirmed against a real capture (see
+/// `.plans/reolink-baichuan-calibration-monitor-point.md` section 7); this
+/// asymmetry is why this isn't built from the shared `Extension` struct.
+fn monitor_point_read_extension(channel_id: u8) -> Vec<u8> {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<Extension version=\"1.1\">\n<channelId>{channel_id}</channelId>\n<chnType>0</chnType>\n</Extension>\n"
+    )
+    .into_bytes()
+}
+
+/// A Monitor Point (`PtzGuard`) write: `setGrd` (configure — add
+/// `needSetPos` to also save the camera's current position as the point)
+/// or `toGrd` (move to it now). `xpos`/`ypos`/`height`/`width` are written
+/// as `0.000000e+00`, not `0` — some firmware's parser is strict about it
+/// (same source as above, section 13).
+fn monitor_point_xml(channel_id: u8, enabled: bool, timeout: u32, command: &str, set_position: bool) -> Vec<u8> {
+    let need_set_pos = if set_position { "<needSetPos>1</needSetPos>\n" } else { "" };
+    control_xml(&format!(
+        "<PtzGuard version=\"1.1\">\n<channelId>{channel_id}</channelId>\n<benable>{}</benable>\n<timeout>{timeout}</timeout>\n{need_set_pos}<command>{command}</command>\n<imageName></imageName>\n<xpos>0.000000e+00</xpos>\n<ypos>0.000000e+00</ypos>\n<height>0.000000e+00</height>\n<width>0.000000e+00</width>\n<mode>global</mode>\n</PtzGuard>\n",
+        u8::from(enabled)
+    ))
+}
+
 /// The spotlight command: on or off, with the 180 s duration both of the
 /// official app's messages carried (177 bytes each, as captured).
 fn spotlight_xml(channel_id: u8, on: bool) -> Vec<u8> {
@@ -215,6 +258,8 @@ fn pushed_update(bc: &Bc) -> Option<DeviceUpdate> {
         || bc.meta.msg_id == MSG_ID_PTZ_PRESET
         || bc.meta.msg_id == MSG_ID_SET_ZOOM_FOCUS
         || bc.meta.msg_id == MSG_ID_TALK_CONFIG
+        || bc.meta.msg_id == MSG_ID_PTZ_GUARD
+        || bc.meta.msg_id == MSG_ID_PTZ_CALIBRATE
     {
         return Some(DeviceUpdate::ControlReply {
             msg_id: bc.meta.msg_id,
@@ -226,6 +271,7 @@ fn pushed_update(bc: &Bc) -> Option<DeviceUpdate> {
         && bc.meta.msg_id != MSG_ID_SUPPORT
         && bc.meta.msg_id != MSG_ID_GET_ZOOM_FOCUS
         && bc.meta.msg_id != MSG_ID_GET_PTZ_PRESET
+        && bc.meta.msg_id != MSG_ID_GET_PTZ_GUARD
     {
         return None;
     }
@@ -250,6 +296,10 @@ fn pushed_update(bc: &Bc) -> Option<DeviceUpdate> {
     if let Some(preset) = xml.ptz_preset {
         let channel_id = preset.channel_id.unwrap_or(bc.meta.channel_id);
         return Some(DeviceUpdate::Presets { channel_id, presets: preset.into_presets() });
+    }
+    if let Some(guard) = xml.ptz_guard {
+        let channel_id = guard.channel_id.unwrap_or(bc.meta.channel_id);
+        return Some(DeviceUpdate::MonitorPoint { channel_id, state: guard.into_monitor_point() });
     }
     if let Some(zf) = xml.ptz_zoom_focus {
         // (min, max, current)
@@ -585,6 +635,29 @@ impl ReolinkClient {
         self.connection.lock().await.send_bc(&request, &self.encryption).await
     }
 
+    /// Like `send_control`, but with no payload at all (e.g. calibration,
+    /// which the official app sends with only the channel extension).
+    async fn send_control_no_payload(&mut self, msg_id: u32, channel_id: u8) -> crate::Result<()> {
+        let msg_num = self.next_msg_num();
+        let extension = Extension {
+            version: XML_VERSION.to_string(),
+            channel_id: Some(channel_id),
+            ..Default::default()
+        };
+        let request = Bc {
+            meta: BcMeta {
+                msg_id,
+                channel_id,
+                stream_type: 0,
+                msg_num,
+                response_code: 0,
+                class: 0x6414,
+            },
+            body: BcBody::Modern(ModernMsg { extension_xml: Some(extension.to_bytes()), payload: None }),
+        };
+        self.connection.lock().await.send_bc(&request, &self.encryption).await
+    }
+
     /// Plays the camera's siren once.
     pub async fn play_siren(&mut self, channel_id: u8) -> crate::Result<()> {
         self.send_control(MSG_ID_PLAY_SIREN, channel_id, siren_xml(channel_id)).await
@@ -595,6 +668,71 @@ impl ReolinkClient {
     /// moves until told to stop.
     pub async fn ptz(&mut self, channel_id: u8, command: &str, speed: u8) -> crate::Result<()> {
         self.send_control(MSG_ID_PTZ, channel_id, ptz_xml(channel_id, command, speed)).await
+    }
+
+    /// Re-calibrates the pan/tilt mechanism. A successful reply means the
+    /// camera accepted the request, not that the (mechanical, several-second)
+    /// calibration has finished — there is no separate "done" message.
+    pub async fn calibrate_ptz(&mut self, channel_id: u8) -> crate::Result<()> {
+        self.send_control_no_payload(MSG_ID_PTZ_CALIBRATE, channel_id).await
+    }
+
+    /// Asks for the camera's Monitor Point (the answer arrives as
+    /// `DeviceUpdate::MonitorPoint`). The read extension differs from every
+    /// other control message's (see `monitor_point_read_extension`), so
+    /// this bypasses `request_for_channel`.
+    pub async fn query_monitor_point(&mut self, channel_id: u8) {
+        let msg_num = self.next_msg_num();
+        let request = Bc {
+            meta: BcMeta {
+                msg_id: MSG_ID_GET_PTZ_GUARD,
+                channel_id,
+                stream_type: 0,
+                msg_num,
+                response_code: 0,
+                class: 0x6414,
+            },
+            body: BcBody::Modern(ModernMsg {
+                extension_xml: Some(monitor_point_read_extension(channel_id)),
+                payload: None,
+            }),
+        };
+        let _ = self.connection.lock().await.send_bc(&request, &self.encryption).await;
+    }
+
+    /// Configures Monitor Point (Auto Return on/off, its timeout) without
+    /// moving it — moving it would need `set_current_position_as_monitor_point`
+    /// instead, so a plain settings change never relocates it by accident.
+    pub async fn set_monitor_point_config(
+        &mut self,
+        channel_id: u8,
+        enabled: bool,
+        timeout_seconds: u32,
+    ) -> crate::Result<()> {
+        let timeout = timeout_seconds.clamp(10, 300);
+        let xml = monitor_point_xml(channel_id, enabled, timeout, "setGrd", false);
+        self.send_control(MSG_ID_PTZ_GUARD, channel_id, xml).await
+    }
+
+    /// Saves the camera's current position as Monitor Point (`needSetPos`)
+    /// — "Reset Monitor Point" in the official app. Point the camera where
+    /// you want it (e.g. via `ptz`) before calling this.
+    pub async fn set_current_position_as_monitor_point(
+        &mut self,
+        channel_id: u8,
+        enabled: bool,
+        timeout_seconds: u32,
+    ) -> crate::Result<()> {
+        let timeout = timeout_seconds.clamp(10, 300);
+        let xml = monitor_point_xml(channel_id, enabled, timeout, "setGrd", true);
+        self.send_control(MSG_ID_PTZ_GUARD, channel_id, xml).await
+    }
+
+    /// Moves the camera to Monitor Point now ("Return to Monitor Point").
+    pub async fn go_to_monitor_point(&mut self, channel_id: u8, timeout_seconds: u32) -> crate::Result<()> {
+        let timeout = timeout_seconds.clamp(10, 300);
+        let xml = monitor_point_xml(channel_id, false, timeout, "toGrd", false);
+        self.send_control(MSG_ID_PTZ_GUARD, channel_id, xml).await
     }
 
     /// Opens a talk session with the camera: the audio format it should

@@ -24,6 +24,13 @@ pub const MSG_ID_GET_ZOOM_FOCUS: u32 = 294;
 pub const MSG_ID_SET_ZOOM_FOCUS: u32 = 295;
 /// Pan/tilt movement of a camera.
 pub const MSG_ID_PTZ: u32 = 18;
+/// PTZ Guard / "Monitor Point": sets, saves or moves to the saved home
+/// position (write) and reads its current state (read). See
+/// `.plans/reolink-baichuan-calibration-monitor-point.md`.
+pub const MSG_ID_PTZ_GUARD: u32 = 331;
+pub const MSG_ID_GET_PTZ_GUARD: u32 = 332;
+/// Re-calibrates the pan/tilt mechanism.
+pub const MSG_ID_PTZ_CALIBRATE: u32 = 341;
 /// Per-channel support table (which camera has a siren, spotlight, ...).
 pub const MSG_ID_SUPPORT: u32 = 199;
 /// Plays the siren once. Seen in a capture of the official app.

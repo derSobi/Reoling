@@ -9,7 +9,7 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 
 ## Status
 
-Version **0.1.2**, early development. Login and live video work end to end
+Version **0.1.3**, early development. Login and live video work end to end
 against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
 only: Reoling races the device's local, NAT-mapped and relay addresses at
 the same time and uses whichever answers first, as the official client does.
@@ -31,7 +31,9 @@ the same time and uses whichever answers first, as the official client does.
   spotlight, and — in a separate "Camera control" window, independent of the
   main window — pan/tilt (hold a direction to move), zoom and focus (read
   back from the camera after every change, since zooming makes it
-  autofocus), and PTZ presets (save, go to, delete).
+  autofocus), PTZ presets (save, go to, delete), Monitor Point (a saved home
+  position: Auto Return on/off and its timeout, "Return to Monitor Point",
+  "Reset Monitor Point" to save the current position), and calibration.
 - Snapshot (PNG in `~/Pictures/Reoling`) and recording (MKV in
   `~/Videos/Reoling`).
 - Settings: theme (Auto / Light / Dark), decoding (Auto / Hardware — with the
@@ -40,20 +42,25 @@ the same time and uses whichever answers first, as the official client does.
 
 **Not done yet**
 
-- Playback (the tab is a placeholder), Split View.
-- PTZ calibration and Monitor Point: not implemented — no reference
-  implementation documents their messages, and reading them from a capture
-  of the official app needs its session decrypted, which needs its
-  password.
-- Deleting a PTZ preset sends `delPos` (this project's best guess, matched
-  against message counts in a capture, not against decrypted bytes — but
-  confirmed working, deletion included, against a real camera).
+- Playback (the tab is a placeholder), Split View, zoom on cameras behind an
+  NVR's sub-channel numbering.
+- PTZ calibration has no separate "finished" signal from the camera — the
+  app only knows the request was accepted, matching what's documented for
+  Baichuan generally, not a limitation specific to this capture.
+- Deleting a PTZ preset sends `delPos` (this project's best guess when it
+  was first written, matched only against message counts in a capture — now
+  also confirmed against a real camera; still not confirmed against the
+  capture's own decrypted bytes).
 - Packaging (see [Installation](#installation)).
 - Talk has been built from the official app's captured messages but is the
   least tested part.
 
 **Version history**
 
+- 0.1.3 — PTZ Monitor Point (Auto Return, timeout, return, reset) and
+  calibration, read from a capture decrypted with a local, standalone tool
+  (see `examples/decrypt_bc_stream.rs`) against
+  `.plans/reolink-baichuan-calibration-monitor-point.md`'s research.
 - 0.1.2 — camera remote in its own window: zoom, focus (both read back after
   a change), PTZ presets (save / go to / delete); a latency setting.
 - 0.1.1 — camera controls (siren, spotlight, pan/tilt, talk), snapshot,

@@ -5,7 +5,7 @@
 use gtk4::prelude::*;
 use gtk4::{
     Box as GtkBox, Button, Entry, GestureClick, Grid, Label, ListBox, ListBoxRow, Orientation,
-    PropagationPhase, Scale, Window,
+    PropagationPhase, Scale, Separator, Switch, Window,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -25,6 +25,14 @@ pub struct Handlers {
     pub on_add_preset: Box<dyn Fn(String)>,
     pub on_goto_preset: Box<dyn Fn(u8)>,
     pub on_delete_preset: Box<dyn Fn(u8)>,
+    /// Re-calibrates the pan/tilt mechanism.
+    pub on_calibrate: Box<dyn Fn()>,
+    /// Auto Return's on/off and timeout changed — never the saved position.
+    pub on_monitor_point_config: Box<dyn Fn(bool, u32)>,
+    /// Saves the camera's current position as Monitor Point, keeping
+    /// whatever Auto Return on/off and timeout are showing.
+    pub on_reset_monitor_point: Box<dyn Fn(bool, u32)>,
+    pub on_go_to_monitor_point: Box<dyn Fn(u32)>,
 }
 
 /// A slider with its name, its value, and − / + around it.
@@ -124,6 +132,17 @@ pub struct RemoteControl {
     pad: Grid,
     zoom: Rc<Adjuster>,
     focus: Rc<Adjuster>,
+    calibrate: Button,
+    monitor_point: GtkBox,
+    monitor_enabled: Switch,
+    monitor_timeout: Rc<Adjuster>,
+    monitor_status: Label,
+    /// The state a read of Monitor Point last reported, so a plain toggle or
+    /// timeout change can be sent together with the other's current value —
+    /// see `Handlers::on_monitor_point_config`'s own doc comment.
+    monitor_state: Rc<Cell<reoling::MonitorPoint>>,
+    /// Set while the code (not the user) moves the switch.
+    updating_monitor_enabled: Rc<Cell<bool>>,
     presets: ListBox,
     preset_name: Entry,
     handlers: Rc<Handlers>,
@@ -177,6 +196,73 @@ impl RemoteControl {
         let focus = Adjuster::new("Focus", move |p| (h.on_focus)(p));
         content.append(&zoom.row);
         content.append(&focus.row);
+        content.append(&Separator::new(Orientation::Horizontal));
+
+        let h = Rc::clone(&handlers);
+        let calibrate = Button::with_label("Calibration");
+        calibrate.connect_clicked(move |_| (h.on_calibrate)());
+        content.append(&calibrate);
+
+        // Monitor Point ("PTZ Guard" on the wire): a saved home position,
+        // with an optional automatic return after a timeout.
+        let monitor_heading = Label::new(Some("Monitor Point"));
+        monitor_heading.add_css_class("heading");
+        monitor_heading.set_halign(gtk4::Align::Start);
+        content.append(&monitor_heading);
+        let monitor_point = GtkBox::new(Orientation::Vertical, 8);
+
+        let monitor_status = Label::new(Some("Not read yet"));
+        monitor_status.add_css_class("dim-label");
+        monitor_status.set_halign(gtk4::Align::Start);
+        monitor_point.append(&monitor_status);
+
+        let enable_row = GtkBox::new(Orientation::Horizontal, 6);
+        let enable_label = Label::new(Some("Auto Return"));
+        enable_label.set_hexpand(true);
+        enable_label.set_halign(gtk4::Align::Start);
+        let monitor_enabled = Switch::new();
+        monitor_enabled.set_valign(gtk4::Align::Center);
+        enable_row.append(&enable_label);
+        enable_row.append(&monitor_enabled);
+        monitor_point.append(&enable_row);
+
+        // Shared with the switch, the timeout slider, and the two buttons
+        // below: the last-known Monitor Point state, so any one of them can
+        // send the OTHER's current value along with its own change (see
+        // `Handlers::on_monitor_point_config`'s doc comment).
+        let monitor_state: Rc<Cell<reoling::MonitorPoint>> = Rc::default();
+        let updating_monitor_enabled: Rc<Cell<bool>> = Rc::default();
+
+        let (h, state) = (Rc::clone(&handlers), Rc::clone(&monitor_state));
+        let monitor_timeout = Adjuster::new("Return after (seconds)", move |timeout| {
+            state.set(reoling::MonitorPoint { timeout_seconds: timeout, ..state.get() });
+            (h.on_monitor_point_config)(state.get().enabled, timeout);
+        });
+        monitor_timeout.set_range(10, 300, 60);
+        monitor_point.append(&monitor_timeout.row);
+
+        let (h, state, updating) = (Rc::clone(&handlers), Rc::clone(&monitor_state), Rc::clone(&updating_monitor_enabled));
+        monitor_enabled.connect_state_set(move |_, enabled| {
+            if !updating.get() {
+                state.set(reoling::MonitorPoint { enabled, ..state.get() });
+                (h.on_monitor_point_config)(enabled, state.get().timeout_seconds);
+            }
+            glib::Propagation::Proceed
+        });
+
+        let go_to_monitor = Button::with_label("Return to Monitor Point");
+        let (h, state) = (Rc::clone(&handlers), Rc::clone(&monitor_state));
+        go_to_monitor.connect_clicked(move |_| (h.on_go_to_monitor_point)(state.get().timeout_seconds));
+        monitor_point.append(&go_to_monitor);
+
+        let reset_monitor = Button::with_label("Reset Monitor Point");
+        reset_monitor.set_tooltip_text(Some("Save the camera's current position as Monitor Point"));
+        let (h, state) = (Rc::clone(&handlers), Rc::clone(&monitor_state));
+        reset_monitor.connect_clicked(move |_| (h.on_reset_monitor_point)(state.get().enabled, state.get().timeout_seconds));
+        monitor_point.append(&reset_monitor);
+
+        content.append(&monitor_point);
+        content.append(&Separator::new(Orientation::Horizontal));
 
         // Presets: a scrollable list, each with Go / Delete, and an entry to
         // save the current position as a new one.
@@ -196,7 +282,23 @@ impl RemoteControl {
         content.append(&add_row);
         window.set_child(Some(&content));
 
-        let this = Rc::new(Self { window, target, pad, zoom, focus, presets, preset_name, handlers });
+        let this = Rc::new(Self {
+            window,
+            target,
+            pad,
+            zoom,
+            focus,
+            calibrate,
+            monitor_point,
+            monitor_enabled,
+            monitor_timeout,
+            monitor_status,
+            monitor_state,
+            updating_monitor_enabled,
+            presets,
+            preset_name,
+            handlers,
+        });
 
         let weak = Rc::downgrade(&this);
         let commit = move || {
@@ -233,10 +335,42 @@ impl RemoteControl {
     }
 
     /// What the camera can do right now (nothing while there is no stream).
-    pub fn set_enabled(&self, move_pad: bool, zoom: bool, focus: bool) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_enabled(
+        &self,
+        move_pad: bool,
+        zoom: bool,
+        focus: bool,
+        calibration: bool,
+        monitor_point: bool,
+    ) {
         self.pad.set_sensitive(move_pad);
         self.zoom.row.set_sensitive(zoom);
         self.focus.row.set_sensitive(focus);
+        self.calibrate.set_sensitive(calibration);
+        self.monitor_point.set_sensitive(monitor_point);
+        if !monitor_point {
+            self.monitor_status.set_text("This camera has no Monitor Point");
+        } else if self.monitor_status.text() == "This camera has no Monitor Point" {
+            self.monitor_status.set_text("Not read yet");
+        }
+    }
+
+    /// Monitor Point's state, from the camera.
+    pub fn set_monitor_point(&self, state: reoling::MonitorPoint) {
+        self.monitor_state.set(state);
+        self.updating_monitor_enabled.set(true);
+        self.monitor_enabled.set_state(state.enabled);
+        self.monitor_enabled.set_active(state.enabled);
+        self.updating_monitor_enabled.set(false);
+        if state.timeout_seconds > 0 {
+            self.monitor_timeout.set_range(10, 300, state.timeout_seconds);
+        }
+        self.monitor_status.set_text(if state.valid {
+            "Monitor Point is set"
+        } else {
+            "No Monitor Point saved yet — move the camera and press Reset Monitor Point"
+        });
     }
 
     /// Zoom range and position, from the camera.
