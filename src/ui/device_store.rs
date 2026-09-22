@@ -20,6 +20,8 @@ pub struct Device {
     pub channels: Vec<reoling::ChannelInfo>,
     /// What each channel's camera can do, as the device reported it this run.
     pub abilities: std::collections::HashMap<u8, reoling::ChannelAbilities>,
+    /// The watched channel's saved presets, as the device last reported them.
+    pub presets: Vec<reoling::PtzPreset>,
 }
 
 impl Device {
@@ -39,6 +41,7 @@ impl Device {
             multi_channel: false,
             channels: Vec::new(),
             abilities: Default::default(),
+            presets: Vec::new(),
         }
     }
 }
@@ -79,6 +82,7 @@ pub fn load() -> (Vec<Device>, Option<String>) {
             multi_channel: get("multi_channel").as_deref() == Some("true"),
             channels: Vec::new(),
             abilities: Default::default(),
+            presets: Vec::new(),
         });
     }
     (devices, last)

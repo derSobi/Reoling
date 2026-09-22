@@ -15,6 +15,10 @@ pub const MSG_ID_TALK_ABILITY: u32 = 10;
 pub const MSG_ID_TALK_STOP: u32 = 11;
 pub const MSG_ID_TALK_CONFIG: u32 = 201;
 pub const MSG_ID_TALK_DATA: u32 = 202;
+/// Moves to (or saves, or removes) a PTZ preset.
+pub const MSG_ID_PTZ_PRESET: u32 = 19;
+/// Lists the PTZ presets saved on the camera.
+pub const MSG_ID_GET_PTZ_PRESET: u32 = 190;
 /// Zoom and focus positions of a camera: read (294) and set (295).
 pub const MSG_ID_GET_ZOOM_FOCUS: u32 = 294;
 pub const MSG_ID_SET_ZOOM_FOCUS: u32 = 295;

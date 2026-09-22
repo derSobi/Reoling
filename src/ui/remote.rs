@@ -4,7 +4,8 @@
 
 use gtk4::prelude::*;
 use gtk4::{
-    Box as GtkBox, Button, GestureClick, Grid, Label, Orientation, PropagationPhase, Scale, Window,
+    Box as GtkBox, Button, Entry, GestureClick, Grid, Label, ListBox, ListBoxRow, Orientation,
+    PropagationPhase, Scale, Window,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -21,6 +22,9 @@ pub struct Handlers {
     pub on_stop: Box<dyn Fn()>,
     pub on_zoom: Box<dyn Fn(u32)>,
     pub on_focus: Box<dyn Fn(u32)>,
+    pub on_add_preset: Box<dyn Fn(String)>,
+    pub on_goto_preset: Box<dyn Fn(u8)>,
+    pub on_delete_preset: Box<dyn Fn(u8)>,
 }
 
 /// A slider with its name, its value, and − / + around it.
@@ -120,6 +124,9 @@ pub struct RemoteControl {
     pad: Grid,
     zoom: Rc<Adjuster>,
     focus: Rc<Adjuster>,
+    presets: ListBox,
+    preset_name: Entry,
+    handlers: Rc<Handlers>,
 }
 
 impl RemoteControl {
@@ -170,9 +177,41 @@ impl RemoteControl {
         let focus = Adjuster::new("Focus", move |p| (h.on_focus)(p));
         content.append(&zoom.row);
         content.append(&focus.row);
+
+        // Presets: a scrollable list, each with Go / Delete, and an entry to
+        // save the current position as a new one.
+        let preset_heading = Label::new(Some("Presets"));
+        preset_heading.add_css_class("heading");
+        preset_heading.set_halign(gtk4::Align::Start);
+        content.append(&preset_heading);
+        let presets = ListBox::new();
+        presets.add_css_class("boxed-list");
+        content.append(&presets);
+        let add_row = GtkBox::new(Orientation::Horizontal, 4);
+        let preset_name = Entry::builder().placeholder_text("New preset name").hexpand(true).build();
+        let add = Button::from_icon_name("list-add-symbolic");
+        add.set_tooltip_text(Some("Save the current position as a preset"));
+        add_row.append(&preset_name);
+        add_row.append(&add);
+        content.append(&add_row);
         window.set_child(Some(&content));
 
-        Rc::new(Self { window, target, pad, zoom, focus })
+        let this = Rc::new(Self { window, target, pad, zoom, focus, presets, preset_name, handlers });
+
+        let weak = Rc::downgrade(&this);
+        let commit = move || {
+            let Some(r) = weak.upgrade() else { return };
+            let name = r.preset_name.text().trim().to_string();
+            if name.is_empty() {
+                return;
+            }
+            (r.handlers.on_add_preset)(name);
+            r.preset_name.set_text("");
+        };
+        let c = commit.clone();
+        add.connect_clicked(move |_| c());
+        this.preset_name.connect_activate(move |_| commit());
+        this
     }
 
     /// Shows the window (or brings it forward).
@@ -208,5 +247,50 @@ impl RemoteControl {
     /// Focus range and position, from the camera.
     pub fn set_focus_range(&self, min: u32, max: u32, current: u32) {
         self.focus.set_range(min, max, current);
+    }
+
+    /// The camera's saved presets, replacing whatever was listed before.
+    pub fn set_presets(self: &Rc<Self>, presets: &[reoling::PtzPreset]) {
+        while let Some(child) = self.presets.first_child() {
+            self.presets.remove(&child);
+        }
+        for preset in presets {
+            let row = ListBoxRow::new();
+            row.set_selectable(false);
+            row.set_activatable(false);
+            let line = GtkBox::new(Orientation::Horizontal, 6);
+            line.set_margin_top(4);
+            line.set_margin_bottom(4);
+            line.set_margin_start(8);
+            line.set_margin_end(8);
+            let name = Label::new(Some(&preset.name));
+            name.set_hexpand(true);
+            name.set_halign(gtk4::Align::Start);
+            name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            let go = Button::from_icon_name("go-jump-symbolic");
+            go.set_tooltip_text(Some("Move to this preset"));
+            go.add_css_class("flat");
+            let remove = Button::from_icon_name("user-trash-symbolic");
+            remove.set_tooltip_text(Some("Delete"));
+            remove.add_css_class("flat");
+            line.append(&name);
+            line.append(&go);
+            line.append(&remove);
+            row.set_child(Some(&line));
+            self.presets.append(&row);
+
+            let (id, weak) = (preset.id, Rc::downgrade(self));
+            go.connect_clicked(move |_| {
+                if let Some(r) = weak.upgrade() {
+                    (r.handlers.on_goto_preset)(id);
+                }
+            });
+            let (id, weak) = (preset.id, Rc::downgrade(self));
+            remove.connect_clicked(move |_| {
+                if let Some(r) = weak.upgrade() {
+                    (r.handlers.on_delete_preset)(id);
+                }
+            });
+        }
     }
 }
