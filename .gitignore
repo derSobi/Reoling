@@ -18,6 +18,7 @@
 # The project's code
 !/src/**
 !/examples/**
+!/scripts/**
 !/data/**
 
 # But not the build output
