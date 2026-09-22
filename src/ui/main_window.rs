@@ -282,6 +282,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             }
         });
         let (w_move, w_stop, w_zoom, w_focus) = (weak.clone(), weak.clone(), weak.clone(), weak.clone());
+        let (w_add, w_goto, w_delete) = (weak.clone(), weak.clone(), weak.clone());
         let remote = RemoteControl::new(remote::Handlers {
             on_move: Box::new(move |command| {
                 if let Some(m) = w_move.upgrade() {
@@ -303,6 +304,23 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
                 if let Some(m) = w_focus.upgrade() {
                     m.control(move |link, channel| link.set_focus(channel, position));
                     m.refresh_zoom_focus_soon();
+                }
+            }),
+            on_add_preset: Box::new(move |name| {
+                if let Some(m) = w_add.upgrade() {
+                    m.add_preset(name);
+                }
+            }),
+            on_goto_preset: Box::new(move |id| {
+                if let Some(m) = w_goto.upgrade() {
+                    m.control(move |link, channel| link.goto_preset(channel, id));
+                }
+            }),
+            on_delete_preset: Box::new(move |id| {
+                if let Some(m) = w_delete.upgrade() {
+                    m.control(move |link, channel| link.delete_preset(channel, id));
+                    // The list only changes on the device; ask again shortly.
+                    m.query_presets_soon();
                 }
             }),
         });
@@ -758,6 +776,7 @@ impl MainWindow {
         } else {
             self.remote.present();
             self.query_zoom();
+            self.query_presets();
         }
     }
 
@@ -768,6 +787,33 @@ impl MainWindow {
         for delay in [Duration::from_millis(800), Duration::from_millis(2500)] {
             let this = Rc::clone(self);
             glib::timeout_add_local_once(delay, move || this.query_zoom());
+        }
+    }
+
+    /// Saves the current position as a new preset with an id the camera does
+    /// not already use (1..=63, the range neolink documents).
+    fn add_preset(self: &Rc<Self>, name: String) {
+        let Some(key) = self.playing_key() else { return };
+        let used: std::collections::HashSet<u8> = self
+            .device(&key)
+            .map(|d| d.presets.iter().map(|p| p.id).collect())
+            .unwrap_or_default();
+        let Some(id) = (1..=63u8).find(|id| !used.contains(id)) else {
+            self.notify("No free preset slot (63 max)");
+            return;
+        };
+        self.control(move |link, channel| link.set_preset(channel, id, name.clone()));
+        self.query_presets_soon();
+    }
+
+    fn query_presets(&self) {
+        self.control(|link, channel| link.query_presets(channel));
+    }
+
+    fn query_presets_soon(self: &Rc<Self>) {
+        for delay in [Duration::from_millis(500), Duration::from_millis(1500)] {
+            let this = Rc::clone(self);
+            glib::timeout_add_local_once(delay, move || this.query_presets());
         }
     }
 
@@ -1197,6 +1243,17 @@ impl MainWindow {
                     if let Some((min, max, current)) = focus {
                         self.remote.set_focus_range(min, max, current);
                     }
+                }
+            }
+            DeviceEvent::Presets { channel_id, presets } => {
+                if let Some(d) = self.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
+                    if d.channel == channel_id {
+                        d.presets = presets.clone();
+                    }
+                }
+                let watching = self.playing_key().and_then(|k| self.device(&k)).is_some_and(|d| d.channel == channel_id);
+                if watching {
+                    self.remote.set_presets(&presets);
                 }
             }
             DeviceEvent::ControlFailed(reason) => {

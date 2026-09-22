@@ -20,6 +20,13 @@ pub struct DeviceInfoSummary {
     pub resolution_name: Option<String>,
 }
 
+/// A saved PTZ preset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtzPreset {
+    pub id: u8,
+    pub name: String,
+}
+
 /// What one channel's camera can do.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChannelAbilities {
@@ -50,6 +57,8 @@ pub enum DeviceUpdate {
     Abilities(Vec<(u8, ChannelAbilities)>),
     /// Where a camera's zoom stands and how far it goes.
     ZoomFocus { channel_id: u8, zoom: Option<(u32, u32, u32)>, focus: Option<(u32, u32, u32)> },
+    /// The camera's saved presets.
+    Presets { channel_id: u8, presets: Vec<PtzPreset> },
     /// The device's answer to a control command (siren, spotlight).
     ControlReply { msg_id: u32, code: u16 },
 }
@@ -179,6 +188,15 @@ fn focus_xml(channel_id: u8, position: u32) -> Vec<u8> {
     ))
 }
 
+/// A PTZ preset command (`setPos`/`toPos`/`delPos`) in the shape neolink
+/// documents (`PtzPreset` > `presetList` > `preset`).
+fn preset_xml(channel_id: u8, id: u8, name: Option<&str>, command: &str) -> Vec<u8> {
+    let name_tag = name.map(|n| format!("<name>{}</name>", crate::protocol::bc::xml::xml_escape(n))).unwrap_or_default();
+    control_xml(&format!(
+        "<PtzPreset version=\"1.1\">\n<channelId>{channel_id}</channelId>\n<presetList>\n<preset><id>{id}</id>{name_tag}<command>{command}</command></preset>\n</presetList>\n</PtzPreset>\n"
+    ))
+}
+
 /// The spotlight command: on or off, with the 180 s duration both of the
 /// official app's messages carried (177 bytes each, as captured).
 fn spotlight_xml(channel_id: u8, on: bool) -> Vec<u8> {
@@ -194,6 +212,7 @@ fn pushed_update(bc: &Bc) -> Option<DeviceUpdate> {
     if bc.meta.msg_id == MSG_ID_PLAY_SIREN
         || bc.meta.msg_id == MSG_ID_SPOTLIGHT
         || bc.meta.msg_id == MSG_ID_PTZ
+        || bc.meta.msg_id == MSG_ID_PTZ_PRESET
         || bc.meta.msg_id == MSG_ID_SET_ZOOM_FOCUS
         || bc.meta.msg_id == MSG_ID_TALK_CONFIG
     {
@@ -206,6 +225,7 @@ fn pushed_update(bc: &Bc) -> Option<DeviceUpdate> {
         && bc.meta.msg_id != MSG_ID_OSD
         && bc.meta.msg_id != MSG_ID_SUPPORT
         && bc.meta.msg_id != MSG_ID_GET_ZOOM_FOCUS
+        && bc.meta.msg_id != MSG_ID_GET_PTZ_PRESET
     {
         return None;
     }
@@ -227,6 +247,10 @@ fn pushed_update(bc: &Bc) -> Option<DeviceUpdate> {
         return None;
     };
     let xml = BcXml::from_bytes(payload).ok()?;
+    if let Some(preset) = xml.ptz_preset {
+        let channel_id = preset.channel_id.unwrap_or(bc.meta.channel_id);
+        return Some(DeviceUpdate::Presets { channel_id, presets: preset.into_presets() });
+    }
     if let Some(zf) = xml.ptz_zoom_focus {
         // (min, max, current)
         let range = |r: Option<crate::protocol::bc::xml::PositionRange>| {
@@ -645,6 +669,33 @@ impl ReolinkClient {
     /// analogy with the captured `zoomPos`; not itself seen in a capture.
     pub async fn set_focus(&mut self, channel_id: u8, position: u32) -> crate::Result<()> {
         self.send_control(MSG_ID_SET_ZOOM_FOCUS, channel_id, focus_xml(channel_id, position)).await
+    }
+
+    /// Asks for the camera's saved presets; the answer arrives as
+    /// `DeviceUpdate::Presets`.
+    pub async fn query_presets(&mut self, channel_id: u8) {
+        self.request_for_channel(MSG_ID_GET_PTZ_PRESET, channel_id).await;
+    }
+
+    async fn send_preset(&mut self, channel_id: u8, id: u8, name: Option<&str>, command: &str) -> crate::Result<()> {
+        self.send_control(MSG_ID_PTZ_PRESET, channel_id, preset_xml(channel_id, id, name, command)).await
+    }
+
+    /// Saves the current position as preset `id`, named `name`.
+    pub async fn set_preset(&mut self, channel_id: u8, id: u8, name: &str) -> crate::Result<()> {
+        self.send_preset(channel_id, id, Some(name), "setPos").await
+    }
+
+    /// Moves the camera to preset `id`.
+    pub async fn goto_preset(&mut self, channel_id: u8, id: u8) -> crate::Result<()> {
+        self.send_preset(channel_id, id, None, "toPos").await
+    }
+
+    /// Removes preset `id`. Unverified against a real capture (see
+    /// `PtzPresetXml`'s doc comment) — the camera may accept the request
+    /// (code 200) without actually clearing the slot on some firmwares.
+    pub async fn delete_preset(&mut self, channel_id: u8, id: u8) -> crate::Result<()> {
+        self.send_preset(channel_id, id, None, "delPos").await
     }
 
     /// Switches the camera's spotlight on or off.
@@ -1401,6 +1452,23 @@ mod tests {
 #[cfg(test)]
 mod control_tests {
     use super::*;
+
+    #[test]
+    fn preset_commands_round_trip_through_bcxml() {
+        for xml in [
+            preset_xml(0, 5, Some("test1"), "setPos"),
+            preset_xml(0, 5, None, "toPos"),
+            preset_xml(0, 5, None, "delPos"),
+        ] {
+            let parsed = BcXml::from_bytes(&xml).unwrap().ptz_preset.unwrap();
+            let preset = &parsed.preset_list.unwrap().presets[0];
+            assert_eq!(preset.id, 5);
+        }
+        let named = BcXml::from_bytes(&preset_xml(0, 5, Some("a & b"), "setPos")).unwrap();
+        let preset = &named.ptz_preset.unwrap().preset_list.unwrap().presets[0];
+        assert_eq!(preset.name.as_deref(), Some("a & b"));
+    }
+
 
     // Lengths measured on the official app's messages (the payloads are
     // encrypted, but encryption keeps the length).

@@ -25,6 +25,57 @@ pub struct BcXml {
     pub support: Option<Support>,
     #[serde(rename = "PtzZoomFocus", skip_serializing_if = "Option::is_none")]
     pub ptz_zoom_focus: Option<PtzZoomFocus>,
+    #[serde(rename = "PtzPreset", skip_serializing_if = "Option::is_none")]
+    pub ptz_preset: Option<PtzPresetXml>,
+}
+
+/// A camera's saved PTZ presets, and the write form of one preset command
+/// (`setPos` saves the current position, `toPos` moves to it, `delPos`
+/// removes it — `setPos`/`toPos` are documented in neolink; `delPos` is
+/// this project's best guess, matched against a capture of the official app:
+/// one message per preset op with no retries, which fits `delPos` working in
+/// one shot rather than the multi-attempt fallbacks other tools use for
+/// deletion).
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct PtzPresetXml {
+    #[serde(rename = "channelId")]
+    pub channel_id: Option<u8>,
+    #[serde(rename = "presetList")]
+    pub preset_list: Option<PresetListXml>,
+}
+
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct PresetListXml {
+    #[serde(rename = "preset", default)]
+    pub presets: Vec<PresetXml>,
+}
+
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct PresetXml {
+    pub id: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+impl PtzPresetXml {
+    /// The saved presets: enabled and named, as the official app shows them
+    /// (a preset with `enable=0` or an empty name is treated as deleted).
+    pub fn into_presets(self) -> Vec<crate::client::PtzPreset> {
+        self.preset_list
+            .map(|l| l.presets)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.enable.as_deref() != Some("0"))
+            .filter_map(|p| {
+                let name = p.name?;
+                (!name.trim().is_empty()).then_some(crate::client::PtzPreset { id: p.id, name })
+            })
+            .collect()
+    }
 }
 
 /// A camera's zoom and focus: the range of positions and where they are.
@@ -289,6 +340,21 @@ pub struct Extension {
     pub check_value: Option<i32>,
 }
 
+/// Escapes the five XML special characters, for text inserted into a
+/// hand-built XML string (a preset name, typed by the user).
+pub fn xml_escape(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '&' => "&amp;".to_string(),
+            '<' => "&lt;".to_string(),
+            '>' => "&gt;".to_string(),
+            '"' => "&quot;".to_string(),
+            '\'' => "&apos;".to_string(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
 impl Extension {
     pub fn to_bytes(&self) -> Vec<u8> {
         let inner = quick_xml::se::to_string(self).expect("Extension always serializes");
@@ -376,6 +442,19 @@ mod channel_info_tests {
         let zoom = zf.zoom.unwrap();
         assert_eq!((zoom.min_pos, zoom.max_pos, zoom.cur_pos), (Some(1), Some(3200), Some(120)));
         assert_eq!(zf.focus.unwrap().cur_pos, Some(800));
+    }
+
+    #[test]
+    fn preset_list_skips_disabled_and_unnamed_entries() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" ?><body><PtzPreset version="1.1">
+            <channelId>0</channelId>
+            <presetList>
+            <preset><id>1</id><name>test1</name><enable>1</enable></preset>
+            <preset><id>2</id><name></name><enable>0</enable></preset>
+            <preset><id>3</id><enable>1</enable></preset>
+            </presetList></PtzPreset></body>"#;
+        let presets = BcXml::from_bytes(xml).unwrap().ptz_preset.unwrap().into_presets();
+        assert_eq!(presets, vec![crate::client::PtzPreset { id: 1, name: "test1".to_string() }]);
     }
 
     #[test]

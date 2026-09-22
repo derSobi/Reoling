@@ -18,6 +18,8 @@ pub enum DeviceEvent {
     Abilities(Vec<(u8, reoling::ChannelAbilities)>),
     /// A camera's zoom and focus as (min, max, current).
     ZoomFocus { channel_id: u8, zoom: Option<(u32, u32, u32)>, focus: Option<(u32, u32, u32)> },
+    /// The camera's saved presets.
+    Presets { channel_id: u8, presets: Vec<reoling::PtzPreset> },
     /// A channel's name, asked for because the channel list had none.
     ChannelName { channel_id: u8, name: String },
     /// The requested stream's first frame reached GStreamer.
@@ -40,6 +42,10 @@ enum Command {
     QueryZoomFocus { channel: u8 },
     Zoom { channel: u8, position: u32 },
     Focus { channel: u8, position: u32 },
+    QueryPresets { channel: u8 },
+    SetPreset { channel: u8, id: u8, name: String },
+    GotoPreset { channel: u8, id: u8 },
+    DeletePreset { channel: u8, id: u8 },
     TalkStart { channel: u8 },
     TalkBlock { channel: u8, block: Vec<u8> },
     TalkStop { channel: u8 },
@@ -86,6 +92,22 @@ impl DeviceLink {
 
     pub fn set_zoom(&self, channel: u8, position: u32) {
         let _ = self.commands.send(Command::Zoom { channel, position });
+    }
+
+    pub fn query_presets(&self, channel: u8) {
+        let _ = self.commands.send(Command::QueryPresets { channel });
+    }
+
+    pub fn set_preset(&self, channel: u8, id: u8, name: String) {
+        let _ = self.commands.send(Command::SetPreset { channel, id, name });
+    }
+
+    pub fn goto_preset(&self, channel: u8, id: u8) {
+        let _ = self.commands.send(Command::GotoPreset { channel, id });
+    }
+
+    pub fn delete_preset(&self, channel: u8, id: u8) {
+        let _ = self.commands.send(Command::DeletePreset { channel, id });
     }
 
     /// Opens a talk session; the camera's answer comes as a `ControlReply`
@@ -259,6 +281,24 @@ pub fn spawn_device(
                                 let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
                             }
                         }
+                        Some(Command::QueryPresets { channel }) => {
+                            client.query_presets(channel).await;
+                        }
+                        Some(Command::SetPreset { channel, id, name }) => {
+                            if let Err(e) = client.set_preset(channel, id, &name).await {
+                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                            }
+                        }
+                        Some(Command::GotoPreset { channel, id }) => {
+                            if let Err(e) = client.goto_preset(channel, id).await {
+                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                            }
+                        }
+                        Some(Command::DeletePreset { channel, id }) => {
+                            if let Err(e) = client.delete_preset(channel, id).await {
+                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                            }
+                        }
                         Some(Command::Focus { channel, position }) => {
                             if let Err(e) = client.set_focus(channel, position).await {
                                 let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
@@ -303,6 +343,9 @@ pub fn spawn_device(
                             DeviceUpdate::Abilities(abilities) => DeviceEvent::Abilities(abilities),
                             DeviceUpdate::ZoomFocus { channel_id, zoom, focus } => {
                                 DeviceEvent::ZoomFocus { channel_id, zoom, focus }
+                            }
+                            DeviceUpdate::Presets { channel_id, presets } => {
+                                DeviceEvent::Presets { channel_id, presets }
                             }
                             DeviceUpdate::ControlReply { msg_id, code } => {
                                 DeviceEvent::ControlReply { msg_id, code }

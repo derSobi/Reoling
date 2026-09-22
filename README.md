@@ -9,7 +9,7 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 
 ## Status
 
-Version **0.1.1**, early development. Login and live video work end to end
+Version **0.1.2**, early development. Login and live video work end to end
 against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
 only: Reoling races the device's local, NAT-mapped and relay addresses at
 the same time and uses whichever answers first, as the official client does.
@@ -22,26 +22,40 @@ the same time and uses whichever answers first, as the official client does.
   each channel offers (main / extern / sub) are read from the device.
 - Live view: click a device or one of its channels; the lightest stream is
   the default; Stop freezes the picture and becomes Play; the last stream
-  restarts on the next start; fullscreen with a control bar that slides in.
+  restarts on the next start; fullscreen with a control bar that slides in;
+  a latency setting (Low / Balanced / Smooth) trades reaction time for
+  smoothness over a poor connection.
 - Sound: the stream's audio with a volume control; Talk (microphone to the
   camera, ADPCM).
 - Camera controls, shown per channel from what the camera reports: siren,
-  spotlight, pan/tilt (hold a direction to move).
+  spotlight, and — in a separate "Camera control" window, independent of the
+  main window — pan/tilt (hold a direction to move), zoom and focus (read
+  back from the camera after every change, since zooming makes it
+  autofocus), and PTZ presets (save, go to, delete).
 - Snapshot (PNG in `~/Pictures/Reoling`) and recording (MKV in
   `~/Videos/Reoling`).
 - Settings: theme (Auto / Light / Dark), decoding (Auto / Hardware — with the
-  decoder to use if there are several — / Software). Colours are the active
-  theme's.
+  decoder to use if there are several — / Software), latency. Colours are
+  the active theme's.
 
 **Not done yet**
 
-- Playback (the tab is a placeholder), Split View, zoom on PTZ cameras.
+- Playback (the tab is a placeholder), Split View.
+- PTZ calibration and Monitor Point: not implemented — no reference
+  implementation documents their messages, and reading them from a capture
+  of the official app needs its session decrypted, which needs its
+  password.
+- Deleting a PTZ preset sends `delPos` (this project's best guess, matched
+  against message counts in a capture, not against decrypted bytes); some
+  firmwares are known to accept it without actually clearing the slot.
 - Packaging (see [Installation](#installation)).
 - Talk has been built from the official app's captured messages but is the
   least tested part.
 
 **Version history**
 
+- 0.1.2 — camera remote in its own window: zoom, focus (both read back after
+  a change), PTZ presets (save / go to / delete); a latency setting.
 - 0.1.1 — camera controls (siren, spotlight, pan/tilt, talk), snapshot,
   recording, audio, settings, per-channel streams, stop/play, fullscreen bar.
 - 0.1.0 — protocol, P2P discovery, login, live video, first UI.
