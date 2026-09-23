@@ -204,7 +204,7 @@ pub fn open(parent: &Window, current: &Settings, on_change: impl Fn(Settings) + 
         .modal(true)
         .title("Client Settings")
         .default_width(760)
-        .default_height(520)
+        .default_height(700)
         .build();
 
     // Every control edits this one copy and reports the whole of it.
@@ -508,6 +508,9 @@ fn system_status(parent: &Window) {
     let w = window.clone();
     close.connect_clicked(move |_| w.close());
     window.present();
+    // The selectable text would otherwise take the focus, and with it a
+    // full selection, on opening.
+    close.grab_focus();
 }
 
 /// The "About" window: name, version, where to follow and support the
@@ -555,7 +558,7 @@ fn about_window(parent: &Window) {
     blurb.set_justify(gtk4::Justification::Center);
     content.append(&blurb);
     content.append(&link("Source code and issues", "GitHub", "https://github.com/derSobi/Reoling"));
-    content.append(&link("Support the project", "Buy me a coffee", "https://buymeacoffee.com/dersobi"));
+    content.append(&link("Support the project", "GitHub Sponsors", "https://github.com/sponsors/derSobi"));
     let legal = Label::new(Some(
         "Licensed under the AGPL-3.0-or-later. Reoling is not affiliated with, endorsed by, or sponsored by Reolink; \"Reolink\" is a trademark of its respective owner.",
     ));

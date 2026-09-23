@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Reoling
+GenericName=Reolink client
+Comment=Unofficial client for Reolink cameras, NVRs and Home Hubs
+Exec=reoling
+Icon=de.dersobi.reoling
+Terminal=false
+Categories=AudioVideo;Video;
+StartupWMClass=de.dersobi.reoling
