@@ -1,6 +1,7 @@
 use crate::protocol::bc::header_codec::{read_header, write_header};
 use crate::protocol::bc::model::{
-    has_payload_offset, Bc, BcBody, BcHeader, BcMeta, LegacyMsg, ModernMsg, MSG_ID_LOGIN, MSG_ID_TALK_DATA,
+    has_payload_offset, Bc, BcBody, BcHeader, BcMeta, LegacyMsg, ModernMsg, MSG_ID_IMAGE_UPLOAD, MSG_ID_LOGIN,
+    MSG_ID_TALK_DATA,
 };
 use crate::protocol::bc::xml::Extension;
 use crate::protocol::crypto::EncryptionProtocol;
@@ -30,12 +31,12 @@ pub fn write_bc(bc: &Bc, enc: &EncryptionProtocol) -> Vec<u8> {
                 body.extend_from_slice(&encrypted_ext);
             }
             if let Some(payload) = &modern.payload {
-                // Talk audio (which announces binary data in its extension)
-                // goes out unencrypted: the official app's messages, captured,
+                // Talk audio and image uploads (which announce binary data in
+                // their extension) go out unencrypted: the official app's messages, captured,
                 // start with a plain BcMedia magic while their extension is
                 // encrypted. Only these: the camera's own video messages
                 // encrypt their payload (partly, see `encryptLen`).
-                let is_binary = bc.meta.msg_id == MSG_ID_TALK_DATA
+                let is_binary = (bc.meta.msg_id == MSG_ID_TALK_DATA || bc.meta.msg_id == MSG_ID_IMAGE_UPLOAD)
                     && modern
                         .extension_xml
                         .as_deref()
@@ -469,6 +470,22 @@ mod tests {
         // The bug: AES-decrypting this already-clear payload would turn it
         // into garbage. It must come back untouched.
         assert_eq!(payload2, plain_payload2);
+    }
+
+    #[test]
+    fn image_upload_payload_goes_out_in_the_clear_but_its_extension_does_not() {
+        // Captured from the official app saving a preset's picture (420): the
+        // JPEG bytes sit unencrypted after an encrypted extension.
+        let key = EncryptionProtocol::Aes { key: [7u8; 16] };
+        let jpeg = b"\xff\xd8\xff\xe0-jpeg-bytes-\xff\xd9".to_vec();
+        let ext = b"<Extension version=\"1.1\"><binaryData>1</binaryData><channelId>0</channelId></Extension>".to_vec();
+        let bc = Bc {
+            meta: BcMeta { msg_id: MSG_ID_IMAGE_UPLOAD, channel_id: 0, stream_type: 0, msg_num: 3, response_code: 0, class: 0x6414 },
+            body: BcBody::Modern(ModernMsg { extension_xml: Some(ext.clone()), payload: Some(jpeg.clone()) }),
+        };
+        let wire = write_bc(&bc, &key);
+        assert!(wire.windows(jpeg.len()).any(|w| w == jpeg));
+        assert!(!wire.windows(ext.len()).any(|w| w == ext));
     }
 
     #[test]
