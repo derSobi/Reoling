@@ -9,7 +9,7 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 
 ## Status
 
-Version **0.1.7**, early development. Login and live video work end to end
+Version **0.1.8**, early development. Login and live video work end to end
 against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
 only: Reoling races the device's local, NAT-mapped and relay addresses at
 the same time and uses whichever answers first, as the official client does.
@@ -66,6 +66,14 @@ the same time and uses whichever answers first, as the official client does.
 
 **Version history**
 
+- 0.1.8 — the 0.1.7 fix wasn't the whole story: a real capture (Monitor
+  Point refresh clicked twice, then Preset Points opened) showed the
+  camera stays confused by a 4th image-file request sent before the
+  earlier ones had each fully finished — even back-to-back, not truly
+  concurrent — replying with a malformed header that desynced the
+  connection. The client now refuses a new image request outright while
+  one is still outstanding (for Monitor Point or any preset), with a 10s
+  safety timeout in case the camera never replies at all.
 - 0.1.7 — fixed a real-hardware bug where opening Preset Points
   disconnected the camera (`bad magic header`): it was fetching every
   preset's thumbnail at once, which the camera's image-file transfer

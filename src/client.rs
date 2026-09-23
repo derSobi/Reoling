@@ -794,6 +794,18 @@ impl ReolinkClient {
     }
 
     async fn query_image(&mut self, channel_id: u8, image_name: String, kind: ImageKind) {
+        // The device can only run one image-file transfer at a time —
+        // confirmed 2026-09-23 against a real capture: a 4th `MSG_ID_IMAGE_FILE`
+        // request sent before the previous ones had each fully finished (not
+        // even truly concurrent, just back-to-back without waiting) got the
+        // device to reply with a malformed header (`response_code`/`class`
+        // both `0xffff`) followed by stray bytes that desynced the whole
+        // connection, disconnecting it. `pending_images` already tracks
+        // exactly "is a transfer outstanding" — skip a new request outright
+        // while one is, rather than queueing it.
+        if !self.pending_images.lock().expect("pending_images mutex poisoned").is_empty() {
+            return;
+        }
         let msg_num = self.next_msg_num();
         self.pending_images.lock().expect("pending_images mutex poisoned").insert(msg_num, kind);
         let extension = Extension {
@@ -817,7 +829,16 @@ impl ReolinkClient {
         };
         if self.connection.lock().await.send_bc(&request, &self.encryption).await.is_err() {
             self.pending_images.lock().expect("pending_images mutex poisoned").remove(&msg_num);
+            return;
         }
+        // Safety net: if the device never replies at all (drops the request
+        // outright, seen under load), the pending entry would otherwise
+        // block every later image query for the rest of the connection.
+        let pending_images = Arc::clone(&self.pending_images);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            pending_images.lock().expect("pending_images mutex poisoned").remove(&msg_num);
+        });
     }
 
     /// Configures Monitor Point (Auto Return on/off, its timeout) without
