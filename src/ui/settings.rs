@@ -59,6 +59,14 @@ pub struct Settings {
     pub hardware_decoder: Option<String>,
     /// 0.0..=1.0
     pub volume: f64,
+    /// Fill the whole view with the picture instead of keeping its aspect.
+    pub stretch: bool,
+    /// Start showing the last watched device as soon as it connects.
+    pub auto_live_view: bool,
+    /// Where snapshots / recordings go; `None` is `~/Pictures/Reoling` /
+    /// `~/Videos/Reoling`.
+    pub screenshot_dir: Option<String>,
+    pub recording_dir: Option<String>,
 }
 
 fn path() -> PathBuf {
@@ -73,6 +81,10 @@ impl Default for Settings {
             latency: Latency::default(),
             hardware_decoder: None,
             volume: 0.5,
+            stretch: false,
+            auto_live_view: true,
+            screenshot_dir: None,
+            recording_dir: None,
         }
     }
 }
@@ -101,6 +113,10 @@ impl Settings {
                 _ => Latency::Balanced,
             },
             hardware_decoder: get("hardware_decoder").filter(|s| !s.is_empty()),
+            stretch: get("stretch").as_deref() == Some("true"),
+            auto_live_view: get("auto_live_view").as_deref() != Some("false"),
+            screenshot_dir: get("screenshot_dir").filter(|s| !s.is_empty()),
+            recording_dir: get("recording_dir").filter(|s| !s.is_empty()),
             volume: get("volume").and_then(|v| v.parse().ok()).map_or(0.5, |v: f64| v.clamp(0.0, 1.0)),
         }
     }
@@ -135,6 +151,10 @@ impl Settings {
             },
         );
         file.set_string("settings", "volume", &self.volume.to_string());
+        file.set_string("settings", "stretch", &self.stretch.to_string());
+        file.set_string("settings", "auto_live_view", &self.auto_live_view.to_string());
+        file.set_string("settings", "screenshot_dir", self.screenshot_dir.as_deref().unwrap_or(""));
+        file.set_string("settings", "recording_dir", self.recording_dir.as_deref().unwrap_or(""));
         file.set_string("settings", "hardware_decoder", self.hardware_decoder.as_deref().unwrap_or(""));
         let path = path();
         if let Some(dir) = path.parent() {
@@ -259,6 +279,36 @@ fn hardware_key(factory: &gstreamer::ElementFactory) -> (String, String) {
         .replace(" H.265", "")
         .replace(" Decoder", "");
     (format!("{plugin}|{device}"), label)
+}
+
+const AUTOSTART_FILE: &str = "de.dersobi.reoling.desktop";
+
+fn autostart_path() -> PathBuf {
+    glib::user_config_dir().join("autostart").join(AUTOSTART_FILE)
+}
+
+/// Whether Reoling starts with the desktop session.
+pub fn autostart_enabled() -> bool {
+    autostart_path().is_file()
+}
+
+/// Adds or removes the XDG autostart entry.
+pub fn set_autostart(on: bool) {
+    let path = autostart_path();
+    if !on {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "reoling".to_string());
+    let entry = format!(
+        "[Desktop Entry]\nType=Application\nName=Reoling\nComment=Client for Reolink cameras\nExec={exe}\nIcon=de.dersobi.reoling\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+    );
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&path, entry) {
+        eprintln!("could not enable autostart: {e}");
+    }
 }
 
 /// The hardware decoders on this machine, one entry per device.

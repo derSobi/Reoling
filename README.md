@@ -9,7 +9,7 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 
 ## Status
 
-Version **0.1.16**, early development. Login and live video work end to end
+Version **0.1.17**, early development. Login and live video work end to end
 against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
 only: Reoling races the device's local, NAT-mapped and relay addresses at
 the same time and uses whichever answers first, as the official client does.
@@ -46,9 +46,17 @@ the same time and uses whichever answers first, as the official client does.
   runs — all confirmed working against real hardware.
 - Snapshot (PNG in `~/Pictures/Reoling`) and recording (MKV in
   `~/Videos/Reoling`).
-- Settings: theme (Auto / Light / Dark), decoding (Auto / Hardware — with the
-  decoder to use if there are several — / Software), latency. Colours are
-  the active theme's.
+- Settings (the "Client Settings" window):
+  System Settings (General, Live View & Playback, Alarm), Download Settings,
+  Local Record and About. Working: Run at Startup (an XDG autostart entry),
+  Theme, System Status (versions and hardware decoders), Auto Live View,
+  Stretch Mode, decoding (Auto / Hardware — with the decoder to use if there
+  are several — / Software), latency, and the folders for screenshots and
+  recordings. The window's rows Reoling cannot act on yet (client
+  update, add devices automatically, lockscreen password, date format,
+  language, detection overlays, scrollview time, alarm beep, temporary and
+  download folders, local record) are shown greyed out. Colours are the
+  active theme's.
 
 **Not done yet**
 
@@ -67,6 +75,11 @@ the same time and uses whichever answers first, as the official client does.
 
 **Version history**
 
+- 0.1.17 — the settings window is rebuilt after the official app's
+  (sidebar with System / Download / Local Record / About, tabs under System
+  Settings); new working settings: Run at Startup, Auto Live View, Stretch
+  Mode, and where screenshots and recordings are saved; System Status and
+  About windows.
 - 0.1.16 — presets are listed in the camera's own order again (an id sort and
   a locally remembered order were tried and dropped).
 - 0.1.14 — "New Preset Point" now takes the camera's current picture as it

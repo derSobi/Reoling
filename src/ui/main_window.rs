@@ -679,7 +679,10 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
 
     let (devices, last) = device_store::load();
     *main.last_played.borrow_mut() = last.clone();
-    *main.autoplay.borrow_mut() = last;
+    if main.settings.borrow().auto_live_view {
+        *main.autoplay.borrow_mut() = last;
+    }
+    main.video.widget().set_keep_aspect_ratio(!main.settings.borrow().stretch);
     for device in devices {
         main.sidebar.add_device(&device);
         main.devices.borrow_mut().push(device);
@@ -814,9 +817,21 @@ impl MainWindow {
         });
     }
 
-    /// `~/Pictures/Reoling` or `~/Videos/Reoling`, created on demand.
-    fn media_dir(kind: glib::UserDirectory) -> Option<std::path::PathBuf> {
-        let dir = glib::user_special_dir(kind)?.join("Reoling");
+    /// Where snapshots (Pictures) or recordings (Videos) go — the folder
+    /// chosen in the settings, else `~/Pictures/Reoling` / `~/Videos/Reoling`
+    /// — created on demand.
+    fn media_dir(&self, kind: glib::UserDirectory) -> Option<std::path::PathBuf> {
+        let chosen = {
+            let settings = self.settings.borrow();
+            match kind {
+                glib::UserDirectory::Pictures => settings.screenshot_dir.clone(),
+                _ => settings.recording_dir.clone(),
+            }
+        };
+        let dir = match chosen {
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => glib::user_special_dir(kind)?.join("Reoling"),
+        };
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir)
     }
@@ -1127,8 +1142,8 @@ impl MainWindow {
             self.notify("Nothing to save yet");
             return;
         };
-        let Some(dir) = Self::media_dir(glib::UserDirectory::Pictures) else {
-            self.notify("Could not create the Pictures/Reoling folder");
+        let Some(dir) = self.media_dir(glib::UserDirectory::Pictures) else {
+            self.notify("Could not create the screenshot folder");
             return;
         };
         let path = dir.join(self.media_file_name("png"));
@@ -1149,8 +1164,8 @@ impl MainWindow {
             }
             return;
         }
-        let Some(dir) = Self::media_dir(glib::UserDirectory::Videos) else {
-            self.notify("Could not create the Videos/Reoling folder");
+        let Some(dir) = self.media_dir(glib::UserDirectory::Videos) else {
+            self.notify("Could not create the recording folder");
             self.set_record_button(false);
             return;
         };
@@ -1281,9 +1296,10 @@ impl MainWindow {
     fn settings_dialog(self: &Rc<Self>) {
         let this = Rc::clone(self);
         let current = self.settings.borrow().clone();
-        dialogs::settings(self.window.upcast_ref(), &current, move |mut new| {
+        crate::ui::settings_window::open(self.window.upcast_ref(), &current, move |mut new| {
             // The volume slider lives in the main window; keep its value.
             new.volume = this.settings.borrow().volume;
+            this.video.widget().set_keep_aspect_ratio(!new.stretch);
             let decoding_changed = {
                 let old = this.settings.borrow();
                 old.decoding != new.decoding
