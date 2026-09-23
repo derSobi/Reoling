@@ -9,7 +9,7 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 
 ## Status
 
-Version **0.1.9**, early development. Login and live video work end to end
+Version **0.1.10**, early development. Login and live video work end to end
 against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
 only: Reoling races the device's local, NAT-mapped and relay addresses at
 the same time and uses whichever answers first, as the official client does.
@@ -41,9 +41,11 @@ the same time and uses whichever answers first, as the official client does.
   click-to-refresh like Monitor Point's — never fetched automatically for
   every preset at once, since the camera only tolerates one image-file
   transfer at a time and disconnected when this project first tried
-  fetching all of them together on opening the page. Calibration disables
-  the panel with a spinner while it runs — all confirmed working against
-  real hardware.
+  fetching all of them together on opening the page. Every fetched
+  thumbnail is cached in `~/.cache/reoling/thumbnails` and shown instantly
+  from there on the next start, while a fresh copy is still asked for in
+  the background. Calibration disables the panel with a spinner while it
+  runs — all confirmed working against real hardware.
 - Snapshot (PNG in `~/Pictures/Reoling`) and recording (MKV in
   `~/Videos/Reoling`).
 - Settings: theme (Auto / Light / Dark), decoding (Auto / Hardware — with the
@@ -70,6 +72,10 @@ the same time and uses whichever answers first, as the official client does.
 
 **Version history**
 
+- 0.1.10 — Monitor Point's and every preset's thumbnail is now cached
+  locally (`~/.cache/reoling/thumbnails`) and shown immediately from there
+  on the next start or page open, instead of staying blank until the
+  camera answers.
 - 0.1.9 — found the real root cause with a second capture (Monitor Point
   worked fine twice, but asking for a *preset that never got a thumbnail*
   — e.g. one Reoling itself saved — always broke the connection, even as
