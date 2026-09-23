@@ -54,7 +54,12 @@ pub struct Handlers {
     pub on_stop: Box<dyn Fn()>,
     pub on_zoom: Box<dyn Fn(u32)>,
     pub on_focus: Box<dyn Fn(u32)>,
-    pub on_add_preset: Box<dyn Fn(String)>,
+    /// A free preset id for the "New Preset Point" dialog, whose picture is
+    /// taken as it opens (`None` when there is no free slot).
+    pub on_next_preset_id: Box<dyn Fn() -> Option<u8>>,
+    /// New preset's Confirm: its id, its name, and whether the dialog
+    /// already took (and uploaded) a picture for it.
+    pub on_add_preset: Box<dyn Fn(u8, String, bool)>,
     pub on_goto_preset: Box<dyn Fn(u8)>,
     pub on_delete_preset: Box<dyn Fn(u8)>,
     /// Re-calibrates the pan/tilt mechanism.
@@ -693,10 +698,16 @@ impl RemoteControl {
     /// A fresh picture, taken for the preset the Edit dialog is open on:
     /// shown at once (there and in the list) and remembered for Confirm.
     pub fn show_new_picture(&self, preset_id: u8, jpeg: &[u8]) {
-        if self.edit_image.borrow().as_ref().is_some_and(|(id, _)| *id == preset_id) {
-            self.edit_new_picture.set(true);
+        self.preset_jpegs.borrow_mut().insert(preset_id, jpeg.to_vec());
+        if let Some((id, image)) = self.edit_image.borrow().as_ref() {
+            if *id == preset_id {
+                self.edit_new_picture.set(true);
+                Self::show_thumbnail(image, jpeg, 210, 118);
+            }
         }
-        self.set_preset_image(preset_id, jpeg);
+        if let Some(image) = self.preset_images.borrow().get(&preset_id) {
+            Self::show_thumbnail(image, jpeg, 150, 84);
+        }
     }
 
     fn show_thumbnail(image: &ImageWidget, jpeg: &[u8], max_width: i32, max_height: i32) {
@@ -720,8 +731,11 @@ impl RemoteControl {
 
     /// The camera's saved presets, replacing whatever was listed before.
     pub fn set_presets(self: &Rc<Self>, presets: &[reoling::PtzPreset]) {
-        *self.preset_list.borrow_mut() = presets.to_vec();
-        self.preset_jpegs.borrow_mut().retain(|id, _| presets.iter().any(|p| p.id == *id));
+        // In id order, whatever order the camera lists them in (it moves an
+        // edited one to the top).
+        let mut sorted = presets.to_vec();
+        sorted.sort_by_key(|p| p.id);
+        *self.preset_list.borrow_mut() = sorted;
         self.rebuild_presets();
     }
 
@@ -804,6 +818,7 @@ impl RemoteControl {
             let (id, weak) = (preset.id, Rc::downgrade(self));
             remove.connect_clicked(move |_| {
                 if let Some(r) = weak.upgrade() {
+                    r.preset_jpegs.borrow_mut().remove(&id);
                     (r.handlers.on_delete_preset)(id);
                 }
             });
@@ -813,6 +828,14 @@ impl RemoteControl {
     /// "Adjust Preset Point" (`Some`) or a new preset (`None`): a name, and
     /// for an existing one its picture, which a click refreshes.
     fn open_edit_dialog(self: &Rc<Self>, preset: Option<reoling::PtzPreset>) {
+        let is_new = preset.is_none();
+        let dialog_id = match &preset {
+            Some(p) => p.id,
+            None => match (self.handlers.on_next_preset_id)() {
+                Some(id) => id,
+                None => return,
+            },
+        };
         let dialog = Window::builder()
             .title(if preset.is_some() { "Adjust Preset Point" } else { "New Preset Point" })
             .transient_for(&self.window)
@@ -827,24 +850,24 @@ impl RemoteControl {
         body.set_margin_end(12);
 
         let name = Entry::builder().placeholder_text("Name").text(preset.as_ref().map_or("", |p| p.name.as_str())).build();
-        if let Some(p) = &preset {
+        {
             let image = ImageWidget::from_icon_name("view-refresh-symbolic");
             image.set_pixel_size(48);
-            if let Some(jpeg) = self.preset_jpegs.borrow().get(&p.id) {
-                Self::show_thumbnail(&image, jpeg, 210, 118);
+            if let Some(jpeg) = preset.as_ref().and_then(|p| self.preset_jpegs.borrow().get(&p.id).cloned()) {
+                Self::show_thumbnail(&image, &jpeg, 210, 118);
             }
             let picture = Button::new();
             picture.add_css_class("flat");
             picture.set_tooltip_text(Some("Refresh the picture"));
             picture.set_child(Some(&image));
-            let (id, weak) = (p.id, Rc::downgrade(self));
+            let (id, weak) = (dialog_id, Rc::downgrade(self));
             picture.connect_clicked(move |_| {
                 if let Some(r) = weak.upgrade() {
                     (r.handlers.on_snapshot_preset)(id);
                 }
             });
             body.append(&picture);
-            *self.edit_image.borrow_mut() = Some((p.id, image));
+            *self.edit_image.borrow_mut() = Some((dialog_id, image));
         }
         self.edit_new_picture.set(false);
         body.append(&name);
@@ -878,12 +901,16 @@ impl RemoteControl {
                         let name = if text.is_empty() { p.name.clone() } else { text };
                         (r.handlers.on_rename_preset)(p.id, name, new_picture);
                     }
-                    None if !text.is_empty() => (r.handlers.on_add_preset)(text),
+                    None if !text.is_empty() => (r.handlers.on_add_preset)(dialog_id, text, new_picture),
                     _ => {}
                 }
             }
             d.close();
         });
         dialog.present();
+        if is_new {
+            // The new preset's picture is what the camera sees right now.
+            (self.handlers.on_snapshot_preset)(dialog_id);
+        }
     }
 }
