@@ -82,6 +82,10 @@ pub enum DeviceUpdate {
     MonitorPointImage { channel_id: u8, jpeg: Vec<u8> },
     /// A preset's saved thumbnail (JPEG bytes), fully reassembled.
     PresetImage { channel_id: u8, preset_id: u8, jpeg: Vec<u8> },
+    /// The camera answered an image request with "no such file" (`preset_id`
+    /// is `None` for Monitor Point's) — nothing to show, but the request is
+    /// over, so a queue of further ones can move on.
+    ImageNotFound { channel_id: u8, preset_id: Option<u8> },
     /// The device's answer to a control command (siren, spotlight).
     ControlReply { msg_id: u32, code: u16 },
 }
@@ -299,8 +303,12 @@ fn pushed_update(
             // capture; `read_bc` already strips the 4 stray bytes this
             // reply carries beyond its own declared body length. Nothing
             // to reassemble; just free the slot for the next request.
-            pending_images.lock().expect("pending_images mutex poisoned").remove(&bc.meta.msg_num);
-            return None;
+            let kind = pending_images.lock().expect("pending_images mutex poisoned").remove(&bc.meta.msg_num);
+            let preset_id = match kind {
+                Some(ImageKind::Preset(id)) => Some(id),
+                _ => None,
+            };
+            return Some(DeviceUpdate::ImageNotFound { channel_id: bc.meta.channel_id, preset_id });
         }
         let BcBody::Modern(ModernMsg { extension_xml, payload }) = &bc.body else {
             return None;

@@ -90,6 +90,9 @@ pub struct MainWindow {
     remember: RefCell<HashSet<String>>,
     /// Every device is connected all the time; streaming is separate.
     links: RefCell<HashMap<String, Link>>,
+    preset_queue: RefCell<std::collections::VecDeque<u8>>,
+    preset_in_flight: Cell<bool>,
+    preset_queue_generation: Cell<u64>,
     /// The devices that have logged in on their current link.
     connected: RefCell<HashSet<String>>,
     next_link_id: Cell<u64>,
@@ -283,8 +286,8 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         });
         let (w_move, w_stop, w_zoom, w_focus) = (weak.clone(), weak.clone(), weak.clone(), weak.clone());
         let (w_add, w_goto, w_delete) = (weak.clone(), weak.clone(), weak.clone());
-        let (w_calibrate, w_mp_config, w_mp_reset, w_mp_goto, w_mp_image, w_preset_image) =
-            (weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone());
+        let (w_calibrate, w_mp_config, w_mp_reset, w_mp_goto, w_mp_image, w_preset_image, w_preset_all, w_preset_rename) =
+            (weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone());
         let remote = RemoteControl::new(remote::Handlers {
             on_move: Box::new(move |command| {
                 if let Some(m) = w_move.upgrade() {
@@ -354,7 +357,22 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             }),
             on_refresh_preset_image: Box::new(move |id| {
                 if let Some(m) = w_preset_image.upgrade() {
-                    m.control(move |link, channel| link.query_preset_image(channel, id));
+                    m.enqueue_preset_images(&[id]);
+                }
+            }),
+            on_refresh_all_presets: Box::new(move || {
+                if let Some(m) = w_preset_all.upgrade() {
+                    let ids: Vec<u8> = m
+                        .playing_key()
+                        .and_then(|k| m.device(&k))
+                        .map(|d| d.presets.iter().map(|p| p.id).collect())
+                        .unwrap_or_default();
+                    m.enqueue_preset_images(&ids);
+                }
+            }),
+            on_rename_preset: Box::new(move |_, _| {
+                if let Some(m) = w_preset_rename.upgrade() {
+                    m.notify("Renaming a preset is not supported yet");
                 }
             }),
         });
@@ -620,6 +638,9 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             passwords: RefCell::new(HashMap::new()),
             remember: RefCell::new(HashSet::new()),
             links: RefCell::new(HashMap::new()),
+            preset_queue: RefCell::new(std::collections::VecDeque::new()),
+            preset_in_flight: Cell::new(false),
+            preset_queue_generation: Cell::new(0),
             connected: RefCell::new(HashSet::new()),
             next_link_id: Cell::new(1),
             playing: RefCell::new(None),
@@ -795,32 +816,43 @@ impl MainWindow {
         format!("{name}-{now}.{extension}")
     }
 
-    /// Where a Monitor Point/preset thumbnail is cached, keyed by the
-    /// device's own stable identity — so it survives a restart and shows
-    /// instantly, without waiting on the camera, while a fresh copy is
-    /// still asked for in the background.
-    fn thumbnail_cache_path(device_key: &str, channel: u8, image_name: &str) -> std::path::PathBuf {
-        let safe_key: String =
-            device_key.chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' }).collect();
-        glib::user_cache_dir()
-            .join("reoling")
-            .join("thumbnails")
-            .join(safe_key)
-            .join(format!("ch{channel}"))
-            .join(format!("{image_name}.jpg"))
-    }
-
-    fn load_cached_thumbnail(device_key: &str, channel: u8, image_name: &str) -> Option<Vec<u8>> {
-        std::fs::read(Self::thumbnail_cache_path(device_key, channel, image_name)).ok()
-    }
-
-    fn save_thumbnail_cache(device_key: &str, channel: u8, image_name: &str, jpeg: &[u8]) {
-        let path = Self::thumbnail_cache_path(device_key, channel, image_name);
-        if let Some(parent) = path.parent() {
-            if std::fs::create_dir_all(parent).is_ok() {
-                let _ = std::fs::write(&path, jpeg);
+    /// Preset thumbnails are read one at a time — the camera breaks on
+    /// overlapping image-file requests — each next one starting when the
+    /// previous answered (or a 6 s watchdog says it never will).
+    fn enqueue_preset_images(self: &Rc<Self>, ids: &[u8]) {
+        {
+            let mut queue = self.preset_queue.borrow_mut();
+            for id in ids {
+                if !queue.contains(id) {
+                    queue.push_back(*id);
+                }
             }
         }
+        self.pump_preset_images();
+    }
+
+    fn pump_preset_images(self: &Rc<Self>) {
+        if self.preset_in_flight.get() {
+            return;
+        }
+        let Some(id) = self.preset_queue.borrow_mut().pop_front() else { return };
+        self.preset_in_flight.set(true);
+        self.control(move |link, channel| link.query_preset_image(channel, id));
+        let generation = self.preset_queue_generation.get() + 1;
+        self.preset_queue_generation.set(generation);
+        let this = Rc::clone(self);
+        glib::timeout_add_local_once(Duration::from_secs(6), move || {
+            if this.preset_queue_generation.get() == generation {
+                this.preset_in_flight.set(false);
+                this.pump_preset_images();
+            }
+        });
+    }
+
+    fn preset_image_done(self: &Rc<Self>) {
+        self.preset_in_flight.set(false);
+        self.preset_queue_generation.set(self.preset_queue_generation.get() + 1);
+        self.pump_preset_images();
     }
 
     /// Sends a control command to the channel being watched.
@@ -1368,12 +1400,6 @@ impl MainWindow {
                 let watching = self.playing_key().and_then(|k| self.device(&k)).is_some_and(|d| d.channel == channel_id);
                 if watching {
                     self.remote.set_presets(&presets);
-                    for preset in &presets {
-                        let image_name = format!("preset_{:02}", preset.id);
-                        if let Some(jpeg) = Self::load_cached_thumbnail(key, channel_id, &image_name) {
-                            self.remote.set_preset_image(preset.id, &jpeg);
-                        }
-                    }
                 }
             }
             DeviceEvent::MonitorPoint { channel_id, state } => {
@@ -1381,12 +1407,6 @@ impl MainWindow {
                 if watching {
                     self.remote.set_monitor_point(state);
                     if state.valid {
-                        // Shows instantly while a fresh copy is fetched in
-                        // the background — `MonitorPointImage` overwrites
-                        // it (and the cache file) once that reply arrives.
-                        if let Some(jpeg) = Self::load_cached_thumbnail(key, channel_id, "guard") {
-                            self.remote.set_monitor_point_image(&jpeg);
-                        }
                         self.control(|link, channel| link.query_monitor_point_image(channel));
                     } else {
                         self.remote.clear_monitor_point_image();
@@ -1394,17 +1414,21 @@ impl MainWindow {
                 }
             }
             DeviceEvent::MonitorPointImage { channel_id, jpeg } => {
-                Self::save_thumbnail_cache(key, channel_id, "guard", &jpeg);
                 let watching = self.playing_key().and_then(|k| self.device(&k)).is_some_and(|d| d.channel == channel_id);
                 if watching {
                     self.remote.set_monitor_point_image(&jpeg);
                 }
             }
             DeviceEvent::PresetImage { channel_id, preset_id, jpeg } => {
-                Self::save_thumbnail_cache(key, channel_id, &format!("preset_{preset_id:02}"), &jpeg);
                 let watching = self.playing_key().and_then(|k| self.device(&k)).is_some_and(|d| d.channel == channel_id);
                 if watching {
                     self.remote.set_preset_image(preset_id, &jpeg);
+                }
+                self.preset_image_done();
+            }
+            DeviceEvent::ImageNotFound { preset_id } => {
+                if preset_id.is_some() {
+                    self.preset_image_done();
                 }
             }
             DeviceEvent::ControlFailed(reason) => {

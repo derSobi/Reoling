@@ -75,6 +75,10 @@ pub struct Handlers {
     /// tolerates one at a time, and a burst of concurrent requests (once
     /// tried here) got the camera to drop the connection.
     pub on_refresh_preset_image: Box<dyn Fn(u8)>,
+    /// The Preset Points page opened, or its "refresh all" was pressed —
+    /// the official app re-reads every thumbnail from the camera each time.
+    pub on_refresh_all_presets: Box<dyn Fn()>,
+    pub on_rename_preset: Box<dyn Fn(u8, String)>,
 }
 
 /// A slider with its name, its value, and − / + around it.
@@ -234,18 +238,26 @@ pub struct RemoteControl {
     /// Set while the code (not the user) moves the switch.
     updating_monitor_enabled: Rc<Cell<bool>>,
     presets: ListBox,
+    preset_list: std::cell::RefCell<Vec<reoling::PtzPreset>>,
+    /// The pictures received this session (not saved anywhere: the official
+    /// app re-reads them on every opening too), so a switch between the
+    /// list and thumbnail views can rebuild the rows.
+    preset_jpegs: std::cell::RefCell<std::collections::HashMap<u8, Vec<u8>>>,
+    thumbnail_mode: Cell<bool>,
+    mode_button: Button,
     /// Each listed preset's thumbnail widget, by preset id, so a later
     /// `set_preset_image` can update one in place without rebuilding the
     /// whole list.
     preset_images: std::cell::RefCell<std::collections::HashMap<u8, ImageWidget>>,
-    preset_name: Entry,
+    /// The open "Adjust Preset Point" dialog's picture, with its preset id.
+    edit_image: std::cell::RefCell<Option<(u8, ImageWidget)>>,
     handlers: Rc<Handlers>,
 }
 
 impl RemoteControl {
     pub fn new(handlers: Handlers) -> Rc<Self> {
         let handlers = Rc::new(handlers);
-        let window = Window::builder().title("Camera control").resizable(false).build();
+        let window = Window::builder().title("Camera control").resizable(false).default_width(250).build();
         // Closing the remote only hides it: it comes back where it was.
         window.connect_close_request(|w| {
             w.set_visible(false);
@@ -309,7 +321,7 @@ impl RemoteControl {
         calibration_spinner.set_visible(false);
         let calibration_status = Label::new(None);
         calibration_status.set_wrap(true);
-        calibration_status.set_max_width_chars(28);
+        calibration_status.set_max_width_chars(24);
         calibration_status.set_justify(gtk4::Justification::Center);
         calibration_status.set_visible(false);
         calibration_status.add_css_class("dim-label");
@@ -342,7 +354,7 @@ impl RemoteControl {
         ));
         hint.add_css_class("dim-label");
         hint.set_wrap(true);
-        hint.set_max_width_chars(28);
+        hint.set_max_width_chars(24);
         hint.set_halign(gtk4::Align::Start);
         monitor_page.append(&hint);
 
@@ -428,16 +440,26 @@ impl RemoteControl {
         preset_page.set_margin_start(12);
         preset_page.set_margin_end(12);
         preset_page.append(&page_header(&stack, "Preset Points"));
+        // View toggle, refresh all, add — the official app's own three.
+        let mode_button = Button::from_icon_name("view-list-symbolic");
+        mode_button.add_css_class("flat");
+        mode_button.set_tooltip_text(Some("Switch between thumbnails and a list"));
+        let refresh_all = Button::from_icon_name("view-refresh-symbolic");
+        refresh_all.add_css_class("flat");
+        refresh_all.set_tooltip_text(Some("Refresh all pictures"));
+        let add = Button::from_icon_name("list-add-symbolic");
+        add.add_css_class("flat");
+        add.set_tooltip_text(Some("Save the current position as a preset"));
+        let toolbar = GtkBox::new(Orientation::Horizontal, 2);
+        toolbar.set_halign(gtk4::Align::End);
+        toolbar.append(&mode_button);
+        toolbar.append(&refresh_all);
+        toolbar.append(&add);
+        preset_page.append(&toolbar);
         let presets = ListBox::new();
         presets.add_css_class("boxed-list");
+        presets.set_selection_mode(gtk4::SelectionMode::None);
         preset_page.append(&presets);
-        let add_row = GtkBox::new(Orientation::Horizontal, 4);
-        let preset_name = Entry::builder().placeholder_text("New preset name").hexpand(true).build();
-        let add = Button::from_icon_name("list-add-symbolic");
-        add.set_tooltip_text(Some("Save the current position as a preset"));
-        add_row.append(&preset_name);
-        add_row.append(&add);
-        preset_page.append(&add_row);
         stack.add_named(&preset_page, Some("presets"));
 
         stack.set_visible_child_name("main");
@@ -465,8 +487,12 @@ impl RemoteControl {
             monitor_state,
             updating_monitor_enabled,
             presets,
+            preset_list: std::cell::RefCell::new(Vec::new()),
+            preset_jpegs: std::cell::RefCell::new(std::collections::HashMap::new()),
+            thumbnail_mode: Cell::new(true),
+            mode_button,
             preset_images: std::cell::RefCell::new(std::collections::HashMap::new()),
-            preset_name,
+            edit_image: std::cell::RefCell::new(None),
             handlers,
         });
 
@@ -481,6 +507,7 @@ impl RemoteControl {
         this.open_presets.connect_clicked(move |_| {
             if let Some(r) = weak.upgrade() {
                 r.stack.set_visible_child_name("presets");
+                (r.handlers.on_refresh_all_presets)();
             }
         });
         let weak = Rc::downgrade(&this);
@@ -503,18 +530,24 @@ impl RemoteControl {
         });
 
         let weak = Rc::downgrade(&this);
-        let commit = move || {
-            let Some(r) = weak.upgrade() else { return };
-            let name = r.preset_name.text().trim().to_string();
-            if name.is_empty() {
-                return;
+        this.mode_button.connect_clicked(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.thumbnail_mode.set(!r.thumbnail_mode.get());
+                r.rebuild_presets();
             }
-            (r.handlers.on_add_preset)(name);
-            r.preset_name.set_text("");
-        };
-        let c = commit.clone();
-        add.connect_clicked(move |_| c());
-        this.preset_name.connect_activate(move |_| commit());
+        });
+        let weak = Rc::downgrade(&this);
+        refresh_all.connect_clicked(move |_| {
+            if let Some(r) = weak.upgrade() {
+                (r.handlers.on_refresh_all_presets)();
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        add.connect_clicked(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.open_edit_dialog(None);
+            }
+        });
         this
     }
 
@@ -638,22 +671,30 @@ impl RemoteControl {
     }
 
     /// A single preset's saved thumbnail, once its download has finished.
-    /// No-op if the preset is no longer listed (e.g. a refresh reply arrived
-    /// after the preset was deleted or the list was replaced).
+    /// Kept for the session so the view can be rebuilt; a no-op for a
+    /// preset no longer listed.
     pub fn set_preset_image(&self, preset_id: u8, jpeg: &[u8]) {
-        const MAX_WIDTH: i32 = 48;
-        const MAX_HEIGHT: i32 = 48;
+        if !self.preset_list.borrow().iter().any(|p| p.id == preset_id) {
+            return;
+        }
+        self.preset_jpegs.borrow_mut().insert(preset_id, jpeg.to_vec());
+        if let Some(image) = self.preset_images.borrow().get(&preset_id) {
+            Self::show_thumbnail(image, jpeg, 150, 84);
+        }
+        if let Some((id, image)) = self.edit_image.borrow().as_ref() {
+            if *id == preset_id {
+                Self::show_thumbnail(image, jpeg, 210, 118);
+            }
+        }
+    }
 
-        let Some(image) = self.preset_images.borrow().get(&preset_id).cloned() else {
+    fn show_thumbnail(image: &ImageWidget, jpeg: &[u8], max_width: i32, max_height: i32) {
+        let Some((thumbnail, w, h)) = decode_and_scale(jpeg, max_width, max_height) else {
+            eprintln!("could not decode a preset thumbnail");
             return;
         };
-        let Some((thumbnail, target_width, target_height)) = decode_and_scale(jpeg, MAX_WIDTH, MAX_HEIGHT) else {
-            eprintln!("could not decode preset {preset_id}'s thumbnail");
-            return;
-        };
-        image.set_pixel_size(target_width.max(target_height));
+        image.set_pixel_size(w.max(h));
         image.set_from_pixbuf(Some(&thumbnail));
-        image.set_visible(true);
     }
 
     /// Zoom range and position, from the camera.
@@ -668,56 +709,85 @@ impl RemoteControl {
 
     /// The camera's saved presets, replacing whatever was listed before.
     pub fn set_presets(self: &Rc<Self>, presets: &[reoling::PtzPreset]) {
+        *self.preset_list.borrow_mut() = presets.to_vec();
+        self.preset_jpegs.borrow_mut().retain(|id, _| presets.iter().any(|p| p.id == *id));
+        self.rebuild_presets();
+    }
+
+    fn rebuild_presets(self: &Rc<Self>) {
         while let Some(child) = self.presets.first_child() {
             self.presets.remove(&child);
         }
         self.preset_images.borrow_mut().clear();
-        for preset in presets {
+        let thumbnails = self.thumbnail_mode.get();
+        self.mode_button
+            .set_icon_name(if thumbnails { "view-list-symbolic" } else { "image-x-generic-symbolic" });
+        let presets = self.preset_list.borrow().clone();
+        for preset in &presets {
             let row = ListBoxRow::new();
             row.set_selectable(false);
             row.set_activatable(false);
-            let line = GtkBox::new(Orientation::Horizontal, 6);
+            let line = GtkBox::new(Orientation::Horizontal, 4);
             line.set_margin_top(4);
             line.set_margin_bottom(4);
-            line.set_margin_start(8);
-            line.set_margin_end(8);
-            // Wrapped in a flat button, like Monitor Point's own thumbnail:
-            // clicking it asks the camera for it again. Never fetched for
-            // every preset at once — see `on_refresh_preset_image`'s doc.
-            let thumbnail = ImageWidget::new();
-            thumbnail.set_visible(false);
-            let refresh_thumbnail = Button::new();
-            refresh_thumbnail.add_css_class("flat");
-            refresh_thumbnail.set_tooltip_text(Some("Refresh the picture"));
-            refresh_thumbnail.set_child(Some(&thumbnail));
+            line.set_margin_start(6);
+            line.set_margin_end(6);
+
+            // The whole card — picture and name included — moves the camera
+            // to the preset, like the official app's.
             let name = Label::new(Some(&preset.name));
-            name.set_hexpand(true);
             name.set_halign(gtk4::Align::Start);
             name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            let go = Button::from_icon_name("go-jump-symbolic");
-            go.set_tooltip_text(Some("Move to this preset"));
-            go.add_css_class("flat");
+            name.set_max_width_chars(16);
+            let card = Button::new();
+            card.add_css_class("flat");
+            card.set_hexpand(true);
+            card.set_tooltip_text(Some("Move to this preset"));
+            if thumbnails {
+                let image = ImageWidget::from_icon_name("image-x-generic-symbolic");
+                image.set_pixel_size(48);
+                if let Some(jpeg) = self.preset_jpegs.borrow().get(&preset.id) {
+                    Self::show_thumbnail(&image, jpeg, 150, 84);
+                }
+                let content = GtkBox::new(Orientation::Vertical, 2);
+                content.append(&image);
+                content.append(&name);
+                card.set_child(Some(&content));
+                self.preset_images.borrow_mut().insert(preset.id, image);
+            } else {
+                card.set_child(Some(&name));
+            }
+
+            let edit = Button::from_icon_name("document-edit-symbolic");
+            edit.set_tooltip_text(Some("Edit"));
+            edit.add_css_class("flat");
             let remove = Button::from_icon_name("user-trash-symbolic");
             remove.set_tooltip_text(Some("Delete"));
             remove.add_css_class("flat");
-            line.append(&refresh_thumbnail);
-            line.append(&name);
-            line.append(&go);
-            line.append(&remove);
+            line.append(&card);
+            if thumbnails {
+                let side = GtkBox::new(Orientation::Vertical, 2);
+                side.set_valign(gtk4::Align::Center);
+                side.append(&edit);
+                side.append(&remove);
+                line.append(&side);
+            } else {
+                line.append(&edit);
+                line.append(&remove);
+            }
             row.set_child(Some(&line));
             self.presets.append(&row);
-            self.preset_images.borrow_mut().insert(preset.id, thumbnail);
 
             let (id, weak) = (preset.id, Rc::downgrade(self));
-            refresh_thumbnail.connect_clicked(move |_| {
-                if let Some(r) = weak.upgrade() {
-                    (r.handlers.on_refresh_preset_image)(id);
-                }
-            });
-            let (id, weak) = (preset.id, Rc::downgrade(self));
-            go.connect_clicked(move |_| {
+            card.connect_clicked(move |_| {
                 if let Some(r) = weak.upgrade() {
                     (r.handlers.on_goto_preset)(id);
+                }
+            });
+            let (edited, weak) = (preset.clone(), Rc::downgrade(self));
+            edit.connect_clicked(move |_| {
+                if let Some(r) = weak.upgrade() {
+                    r.open_edit_dialog(Some(edited.clone()));
                 }
             });
             let (id, weak) = (preset.id, Rc::downgrade(self));
@@ -727,5 +797,77 @@ impl RemoteControl {
                 }
             });
         }
+    }
+
+    /// "Adjust Preset Point" (`Some`) or a new preset (`None`): a name, and
+    /// for an existing one its picture, which a click refreshes.
+    fn open_edit_dialog(self: &Rc<Self>, preset: Option<reoling::PtzPreset>) {
+        let dialog = Window::builder()
+            .title(if preset.is_some() { "Adjust Preset Point" } else { "New Preset Point" })
+            .transient_for(&self.window)
+            .modal(true)
+            .resizable(false)
+            .default_width(240)
+            .build();
+        let body = GtkBox::new(Orientation::Vertical, 10);
+        body.set_margin_top(12);
+        body.set_margin_bottom(12);
+        body.set_margin_start(12);
+        body.set_margin_end(12);
+
+        let name = Entry::builder().placeholder_text("Name").text(preset.as_ref().map_or("", |p| p.name.as_str())).build();
+        if let Some(p) = &preset {
+            let image = ImageWidget::from_icon_name("view-refresh-symbolic");
+            image.set_pixel_size(48);
+            if let Some(jpeg) = self.preset_jpegs.borrow().get(&p.id) {
+                Self::show_thumbnail(&image, jpeg, 210, 118);
+            }
+            let picture = Button::new();
+            picture.add_css_class("flat");
+            picture.set_tooltip_text(Some("Refresh the picture"));
+            picture.set_child(Some(&image));
+            let (id, weak) = (p.id, Rc::downgrade(self));
+            picture.connect_clicked(move |_| {
+                if let Some(r) = weak.upgrade() {
+                    (r.handlers.on_refresh_preset_image)(id);
+                }
+            });
+            body.append(&picture);
+            *self.edit_image.borrow_mut() = Some((p.id, image));
+        }
+        body.append(&name);
+
+        let cancel = Button::with_label("Cancel");
+        let confirm = Button::with_label("Confirm");
+        confirm.add_css_class("suggested-action");
+        let buttons = GtkBox::new(Orientation::Horizontal, 8);
+        buttons.set_homogeneous(true);
+        buttons.append(&cancel);
+        buttons.append(&confirm);
+        body.append(&buttons);
+        dialog.set_child(Some(&body));
+
+        let weak = Rc::downgrade(self);
+        dialog.connect_close_request(move |_| {
+            if let Some(r) = weak.upgrade() {
+                *r.edit_image.borrow_mut() = None;
+            }
+            glib::Propagation::Proceed
+        });
+        let d = dialog.clone();
+        cancel.connect_clicked(move |_| d.close());
+        let (d, weak, name) = (dialog.clone(), Rc::downgrade(self), name.clone());
+        confirm.connect_clicked(move |_| {
+            if let Some(r) = weak.upgrade() {
+                let text = name.text().trim().to_string();
+                match &preset {
+                    Some(p) if !text.is_empty() && text != p.name => (r.handlers.on_rename_preset)(p.id, text),
+                    None if !text.is_empty() => (r.handlers.on_add_preset)(text),
+                    _ => {}
+                }
+            }
+            d.close();
+        });
+        dialog.present();
     }
 }

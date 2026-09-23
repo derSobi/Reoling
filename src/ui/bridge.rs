@@ -26,6 +26,7 @@ pub enum DeviceEvent {
     MonitorPointImage { channel_id: u8, jpeg: Vec<u8> },
     /// A preset's saved thumbnail (JPEG bytes), fully reassembled.
     PresetImage { channel_id: u8, preset_id: u8, jpeg: Vec<u8> },
+    ImageNotFound { preset_id: Option<u8> },
     /// A channel's name, asked for because the channel list had none.
     ChannelName { channel_id: u8, name: String },
     /// The requested stream's first frame reached GStreamer.
@@ -432,6 +433,9 @@ pub fn spawn_device(
                             }
                             DeviceUpdate::MonitorPointImage { channel_id, jpeg } => {
                                 DeviceEvent::MonitorPointImage { channel_id, jpeg }
+                            }
+                            DeviceUpdate::ImageNotFound { preset_id, .. } => {
+                                DeviceEvent::ImageNotFound { preset_id }
                             }
                             DeviceUpdate::PresetImage { channel_id, preset_id, jpeg } => {
                                 DeviceEvent::PresetImage { channel_id, preset_id, jpeg }

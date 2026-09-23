@@ -9,7 +9,7 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 
 ## Status
 
-Version **0.1.10**, early development. Login and live video work end to end
+Version **0.1.11**, early development. Login and live video work end to end
 against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
 only: Reoling races the device's local, NAT-mapped and relay addresses at
 the same time and uses whichever answers first, as the official client does.
@@ -37,14 +37,13 @@ the same time and uses whichever answers first, as the official client does.
   (click it to refresh — a point saved from Reoling has none until this is
   pressed once), Auto Return on/off and its timeout in 1-second steps,
   "Return to Monitor Point", "Reset Monitor Point" to save the current
-  position. Presets: save / go to / delete, each with its own thumbnail,
-  click-to-refresh like Monitor Point's — never fetched automatically for
-  every preset at once, since the camera only tolerates one image-file
-  transfer at a time and disconnected when this project first tried
-  fetching all of them together on opening the page. Every fetched
-  thumbnail is cached in `~/.cache/reoling/thumbnails` and shown instantly
-  from there on the next start, while a fresh copy is still asked for in
-  the background. Calibration disables the panel with a spinner while it
+  position. Presets: laid out like the official app's Preset Points — a
+  thumbnail card per preset (or a plain list, via the toggle), a click
+  anywhere on it moves the camera there, Edit (name and picture; click the
+  picture to refresh it) and Delete beside it, "refresh all" and "add" on
+  top. Every opening of the page re-reads all pictures from the camera,
+  one at a time (it breaks on overlapping image requests). Calibration
+  disables the panel with a spinner while it
   runs — all confirmed working against real hardware.
 - Snapshot (PNG in `~/Pictures/Reoling`) and recording (MKV in
   `~/Videos/Reoling`).
@@ -72,6 +71,12 @@ the same time and uses whichever answers first, as the official client does.
 
 **Version history**
 
+- 0.1.11 — Preset Points redesigned after the official app's screenshots
+  (thumbnail/list toggle, refresh all, add, Edit dialog, whole-card click
+  moves the camera); pictures re-read one at a time on every opening; the
+  local thumbnail cache from 0.1.10 is gone again (the official app does not
+  keep one either); narrower remote window. Renaming a preset is not wired
+  yet — the wire message for it is unconfirmed.
 - 0.1.10 — Monitor Point's and every preset's thumbnail is now cached
   locally (`~/.cache/reoling/thumbnails`) and shown immediately from there
   on the next start or page open, instead of staying blank until the
