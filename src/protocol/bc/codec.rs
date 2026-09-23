@@ -85,7 +85,19 @@ pub fn read_bc(
         return Ok(None);
     };
     let total_len = header_len + header.body_len as usize;
-    if buf.len() < total_len {
+    // `class == 0xffff` marks an error reply specific to `MSG_ID_IMAGE_FILE`
+    // (confirmed 2026-09-23 against two real captures, both a preset
+    // Reoling itself had saved and so never got a thumbnail file for:
+    // asking to read a named image file that doesn't exist on the device
+    // gets this back instead of an orderly "not found"). `response_code`
+    // and `class` both come back `0xffff`, `body_len` truthfully `0`, but
+    // the device still puts 4 extra zero bytes on the wire that its own
+    // `body_len` doesn't account for. Left unskipped, those 4 bytes get
+    // read as the next message's magic (always 0 — AES/BcEncrypt never
+    // produces an all-zero ciphertext from a real header) and desync the
+    // whole connection's framing.
+    let consumed = if header.class == 0xffff { total_len + 4 } else { total_len };
+    if buf.len() < consumed {
         return Ok(None);
     }
     let body = &buf[header_len..total_len];
@@ -215,7 +227,7 @@ pub fn read_bc(
             meta,
             body: bc_body,
         },
-        total_len,
+        consumed,
     )))
 }
 
@@ -457,6 +469,43 @@ mod tests {
         // The bug: AES-decrypting this already-clear payload would turn it
         // into garbage. It must come back untouched.
         assert_eq!(payload2, plain_payload2);
+    }
+
+    #[test]
+    fn skips_the_four_stray_bytes_after_an_image_file_not_found_reply() {
+        // Confirmed 2026-09-23 against two real captures: the device's
+        // "no file by that name" reply for `MSG_ID_IMAGE_FILE` (asking to
+        // read a preset's thumbnail that was never saved) declares
+        // `body_len = 0` but still puts 4 extra zero bytes on the wire —
+        // unskipped, those get read as the next message's magic (always 0)
+        // and break parsing for everything after it on the connection.
+        let not_found_header = BcHeader {
+            msg_id: MSG_ID_IMAGE_FILE,
+            body_len: 0,
+            channel_id: 0,
+            stream_type: 0,
+            msg_num: 17,
+            response_code: 0xffff,
+            class: 0xffff,
+            payload_offset: None,
+        };
+        let mut buf = write_header(&not_found_header);
+        buf.extend_from_slice(&[0u8; 4]); // the stray bytes
+        let next = Bc {
+            meta: BcMeta { msg_id: 3, channel_id: 0, stream_type: 0, msg_num: 6, response_code: 200, class: 0x0000 },
+            body: BcBody::Modern(ModernMsg { extension_xml: None, payload: Some(b"frame".to_vec()) }),
+        };
+        buf.extend_from_slice(&write_bc(&next, &EncryptionProtocol::Unencrypted));
+
+        let mut bin_mode = HashSet::new();
+        let (first, consumed) = read_bc(&buf, &EncryptionProtocol::Unencrypted, &mut bin_mode).unwrap().unwrap();
+        assert_eq!(first.meta.response_code, 0xffff);
+        assert_eq!(first.meta.class, 0xffff);
+        assert_eq!(consumed, 24, "the header's own 20 bytes plus the 4 stray ones");
+
+        let (second, _) =
+            read_bc(&buf[consumed..], &EncryptionProtocol::Unencrypted, &mut bin_mode).unwrap().unwrap();
+        assert_eq!(second, next, "parsing resumes correctly after the stray bytes");
     }
 }
 

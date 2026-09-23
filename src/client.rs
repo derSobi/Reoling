@@ -292,6 +292,16 @@ fn pushed_update(
     pending_images: &std::sync::Mutex<HashMap<u16, ImageKind>>,
 ) -> Option<DeviceUpdate> {
     if bc.meta.msg_id == MSG_ID_IMAGE_FILE {
+        if bc.meta.response_code == 0xffff {
+            // The device's answer for "no file by that name" (e.g. a
+            // preset Reoling itself saved, which never got a thumbnail
+            // from the official app) — confirmed 2026-09-23 against a real
+            // capture; `read_bc` already strips the 4 stray bytes this
+            // reply carries beyond its own declared body length. Nothing
+            // to reassemble; just free the slot for the next request.
+            pending_images.lock().expect("pending_images mutex poisoned").remove(&bc.meta.msg_num);
+            return None;
+        }
         let BcBody::Modern(ModernMsg { extension_xml, payload }) = &bc.body else {
             return None;
         };

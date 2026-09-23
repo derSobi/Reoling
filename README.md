@@ -9,7 +9,7 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 
 ## Status
 
-Version **0.1.8**, early development. Login and live video work end to end
+Version **0.1.9**, early development. Login and live video work end to end
 against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
 only: Reoling races the device's local, NAT-mapped and relay addresses at
 the same time and uses whichever answers first, as the official client does.
@@ -63,9 +63,23 @@ the same time and uses whichever answers first, as the official client does.
 - Packaging (see [Installation](#installation)).
 - Talk has been built from the official app's captured messages but is the
   least tested part.
+- A preset saved from Reoling itself never gets a thumbnail (the device has
+  no file to read yet — nothing here writes one; only the official app's
+  own snapshot action does) — Reoling reads that "no file" reply correctly
+  now, so it just shows no picture instead of disconnecting.
 
 **Version history**
 
+- 0.1.9 — found the real root cause with a second capture (Monitor Point
+  worked fine twice, but asking for a *preset that never got a thumbnail*
+  — e.g. one Reoling itself saved — always broke the connection, even as
+  a single, fully-serialized request): the camera's "no file by that
+  name" reply for that case declares a 0-byte body but still puts 4 extra
+  bytes on the wire that its own header doesn't account for, desyncing
+  every message read after it. The wire parser (`read_bc`) now recognizes
+  and skips those bytes, with a unit test pinning the exact captured byte
+  pattern; the 0.1.8 fix (refuse an overlapping image request) stays too,
+  since it's real and correct on its own, just wasn't what was disconnecting here.
 - 0.1.8 — the 0.1.7 fix wasn't the whole story: a real capture (Monitor
   Point refresh clicked twice, then Preset Points opened) showed the
   camera stays confused by a 4th image-file request sent before the
