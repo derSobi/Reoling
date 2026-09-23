@@ -9,7 +9,7 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 
 ## Status
 
-Version **0.1.13**, early development. Login and live video work end to end
+Version **0.1.14**, early development. Login and live video work end to end
 against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
 only: Reoling races the device's local, NAT-mapped and relay addresses at
 the same time and uses whichever answers first, as the official client does.
@@ -69,6 +69,10 @@ the same time and uses whichever answers first, as the official client does.
 
 **Version history**
 
+- 0.1.14 — "New Preset Point" now takes the camera's current picture as it
+  opens (click it to retake) and Confirm saves the preset with that picture,
+  which shows in the list at once; presets are listed in id order instead of
+  the camera's order (it moves an edited one to the top).
 - 0.1.13 — Add and Edit now do what the official app does, from a decrypted
   capture of it: Add takes a live picture (`Snap`, 109), shrinks it to
   169×95, uploads it (420) and saves the preset at the current position with

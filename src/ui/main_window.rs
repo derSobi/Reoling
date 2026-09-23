@@ -295,7 +295,8 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         });
         let (w_move, w_stop, w_zoom, w_focus) = (weak.clone(), weak.clone(), weak.clone(), weak.clone());
         let (w_add, w_goto, w_delete) = (weak.clone(), weak.clone(), weak.clone());
-        let (w_calibrate, w_mp_config, w_mp_reset, w_mp_goto, w_mp_image, w_preset_all, w_preset_rename, w_preset_snap) = (
+        let (w_calibrate, w_mp_config, w_mp_reset, w_mp_goto, w_mp_image, w_preset_all, w_preset_rename, w_preset_snap, w_next_id) = (
+            weak.clone(),
             weak.clone(),
             weak.clone(),
             weak.clone(),
@@ -328,9 +329,10 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
                     m.refresh_zoom_focus_soon();
                 }
             }),
-            on_add_preset: Box::new(move |name| {
+            on_next_preset_id: Box::new(move || w_next_id.upgrade().and_then(|m| m.next_preset_id())),
+            on_add_preset: Box::new(move |id, name, has_picture| {
                 if let Some(m) = w_add.upgrade() {
-                    m.add_preset(name);
+                    m.add_preset(id, name, has_picture);
                 }
             }),
             on_goto_preset: Box::new(move |id| {
@@ -915,19 +917,29 @@ impl MainWindow {
 
     /// Saves the current position as a new preset with an id the camera does
     /// not already use (1..=63, the range neolink documents).
-    fn add_preset(self: &Rc<Self>, name: String) {
-        let Some(key) = self.playing_key() else { return };
+    fn next_preset_id(self: &Rc<Self>) -> Option<u8> {
+        let key = self.playing_key()?;
         let used: std::collections::HashSet<u8> = self
             .device(&key)
             .map(|d| d.presets.iter().map(|p| p.id).collect())
             .unwrap_or_default();
-        let Some(id) = (1..=63u8).find(|id| !used.contains(id)) else {
+        let id = (1..=63u8).find(|id| !used.contains(id));
+        if id.is_none() {
             self.notify("No free preset slot (63 max)");
-            return;
-        };
-        // Like the official app: a fresh picture first, then the preset
-        // (current position) saved together with it.
-        self.begin_snapshot(SnapPurpose::Add(id, name), 0);
+        }
+        id
+    }
+
+    /// Saves the current position as a new preset. Like the official app,
+    /// with the picture the dialog already took (and uploaded), or — if that
+    /// one never arrived — a fresh one taken now.
+    fn add_preset(self: &Rc<Self>, id: u8, name: String, has_picture: bool) {
+        if has_picture {
+            self.control(move |link, channel| link.save_preset_with_image(channel, id, name.clone()));
+            self.query_presets_soon();
+        } else {
+            self.begin_snapshot(SnapPurpose::Add(id, name), 0);
+        }
     }
 
     /// Takes a picture of what the camera sees now. Shares the one-at-a-time
