@@ -9,5 +9,6 @@ pub mod main_window;
 pub mod remote;
 pub mod secrets;
 pub mod settings;
+pub mod settings_window;
 pub mod sidebar;
 pub mod video_view;
