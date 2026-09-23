@@ -25,7 +25,7 @@ const SETTLE: Duration = Duration::from_millis(120);
 /// `max_height`, preserving aspect ratio and never upscaling. Returns the
 /// scaled pixbuf and its actual pixel size, or `None` if the bytes don't
 /// decode.
-fn decode_and_scale(bytes: &[u8], max_width: i32, max_height: i32) -> Option<(gtk4::gdk_pixbuf::Pixbuf, i32, i32)> {
+pub(crate) fn decode_and_scale(bytes: &[u8], max_width: i32, max_height: i32) -> Option<(gtk4::gdk_pixbuf::Pixbuf, i32, i32)> {
     use gtk4::gdk_pixbuf::{prelude::*, InterpType, PixbufLoader};
 
     let loader = PixbufLoader::new();
@@ -69,16 +69,15 @@ pub struct Handlers {
     /// on it — the official app treats its thumbnail as its own refresh
     /// button, and a preset saved without one only gets it after a refresh).
     pub on_refresh_monitor_point_image: Box<dyn Fn()>,
-    /// A preset's thumbnail was asked for again (a click on it, same as
-    /// Monitor Point's own thumbnail) — never fetched automatically for
-    /// every preset at once: the camera's own image-file transfer only
-    /// tolerates one at a time, and a burst of concurrent requests (once
-    /// tried here) got the camera to drop the connection.
-    pub on_refresh_preset_image: Box<dyn Fn(u8)>,
     /// The Preset Points page opened, or its "refresh all" was pressed —
     /// the official app re-reads every thumbnail from the camera each time.
     pub on_refresh_all_presets: Box<dyn Fn()>,
-    pub on_rename_preset: Box<dyn Fn(u8, String)>,
+    /// The picture in the Edit dialog was clicked: take a fresh picture of
+    /// what the camera sees now (not re-read the saved one).
+    pub on_snapshot_preset: Box<dyn Fn(u8)>,
+    /// Edit's Confirm: the preset's id, its name, and whether a new picture
+    /// was taken in the dialog.
+    pub on_rename_preset: Box<dyn Fn(u8, String, bool)>,
 }
 
 /// A slider with its name, its value, and − / + around it.
@@ -251,6 +250,8 @@ pub struct RemoteControl {
     preset_images: std::cell::RefCell<std::collections::HashMap<u8, ImageWidget>>,
     /// The open "Adjust Preset Point" dialog's picture, with its preset id.
     edit_image: std::cell::RefCell<Option<(u8, ImageWidget)>>,
+    /// A new picture was taken since the Edit dialog opened.
+    edit_new_picture: Cell<bool>,
     handlers: Rc<Handlers>,
 }
 
@@ -493,6 +494,7 @@ impl RemoteControl {
             mode_button,
             preset_images: std::cell::RefCell::new(std::collections::HashMap::new()),
             edit_image: std::cell::RefCell::new(None),
+            edit_new_picture: Cell::new(false),
             handlers,
         });
 
@@ -688,6 +690,15 @@ impl RemoteControl {
         }
     }
 
+    /// A fresh picture, taken for the preset the Edit dialog is open on:
+    /// shown at once (there and in the list) and remembered for Confirm.
+    pub fn show_new_picture(&self, preset_id: u8, jpeg: &[u8]) {
+        if self.edit_image.borrow().as_ref().is_some_and(|(id, _)| *id == preset_id) {
+            self.edit_new_picture.set(true);
+        }
+        self.set_preset_image(preset_id, jpeg);
+    }
+
     fn show_thumbnail(image: &ImageWidget, jpeg: &[u8], max_width: i32, max_height: i32) {
         let Some((thumbnail, w, h)) = decode_and_scale(jpeg, max_width, max_height) else {
             eprintln!("could not decode a preset thumbnail");
@@ -829,12 +840,13 @@ impl RemoteControl {
             let (id, weak) = (p.id, Rc::downgrade(self));
             picture.connect_clicked(move |_| {
                 if let Some(r) = weak.upgrade() {
-                    (r.handlers.on_refresh_preset_image)(id);
+                    (r.handlers.on_snapshot_preset)(id);
                 }
             });
             body.append(&picture);
             *self.edit_image.borrow_mut() = Some((p.id, image));
         }
+        self.edit_new_picture.set(false);
         body.append(&name);
 
         let cancel = Button::with_label("Cancel");
@@ -860,8 +872,12 @@ impl RemoteControl {
         confirm.connect_clicked(move |_| {
             if let Some(r) = weak.upgrade() {
                 let text = name.text().trim().to_string();
+                let new_picture = r.edit_new_picture.get();
                 match &preset {
-                    Some(p) if !text.is_empty() && text != p.name => (r.handlers.on_rename_preset)(p.id, text),
+                    Some(p) if new_picture || (!text.is_empty() && text != p.name) => {
+                        let name = if text.is_empty() { p.name.clone() } else { text };
+                        (r.handlers.on_rename_preset)(p.id, name, new_picture);
+                    }
                     None if !text.is_empty() => (r.handlers.on_add_preset)(text),
                     _ => {}
                 }

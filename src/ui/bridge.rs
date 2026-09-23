@@ -27,6 +27,7 @@ pub enum DeviceEvent {
     /// A preset's saved thumbnail (JPEG bytes), fully reassembled.
     PresetImage { channel_id: u8, preset_id: u8, jpeg: Vec<u8> },
     ImageNotFound { preset_id: Option<u8> },
+    Snapshot { preset_id: u8, jpeg: Vec<u8> },
     /// A channel's name, asked for because the channel list had none.
     ChannelName { channel_id: u8, name: String },
     /// The requested stream's first frame reached GStreamer.
@@ -60,6 +61,10 @@ enum Command {
     QueryMonitorPoint { channel: u8 },
     QueryMonitorPointImage { channel: u8 },
     QueryPresetImage { channel: u8, preset_id: u8 },
+    CapturePresetImage { channel: u8, preset_id: u8 },
+    UploadPresetImage { channel: u8, preset_id: u8, jpeg: Vec<u8> },
+    SavePresetWithImage { channel: u8, id: u8, name: String },
+    ModifyPreset { channel: u8, id: u8, name: String, with_image: bool },
     SetMonitorPointConfig { channel: u8, enabled: bool, timeout_seconds: u32 },
     SetMonitorPointHere { channel: u8, enabled: bool, timeout_seconds: u32 },
     GoToMonitorPoint { channel: u8, timeout_seconds: u32 },
@@ -141,6 +146,23 @@ impl DeviceLink {
     }
 
     /// Asks for a preset's saved thumbnail (answered as `PresetImage`).
+    /// Takes a fresh live picture for a preset (answered as `Snapshot`).
+    pub fn capture_preset_image(&self, channel: u8, preset_id: u8) {
+        let _ = self.commands.send(Command::CapturePresetImage { channel, preset_id });
+    }
+
+    pub fn upload_preset_image(&self, channel: u8, preset_id: u8, jpeg: Vec<u8>) {
+        let _ = self.commands.send(Command::UploadPresetImage { channel, preset_id, jpeg });
+    }
+
+    pub fn save_preset_with_image(&self, channel: u8, id: u8, name: String) {
+        let _ = self.commands.send(Command::SavePresetWithImage { channel, id, name });
+    }
+
+    pub fn modify_preset(&self, channel: u8, id: u8, name: String, with_image: bool) {
+        let _ = self.commands.send(Command::ModifyPreset { channel, id, name, with_image });
+    }
+
     pub fn query_preset_image(&self, channel: u8, preset_id: u8) {
         let _ = self.commands.send(Command::QueryPresetImage { channel, preset_id });
     }
@@ -360,6 +382,22 @@ pub fn spawn_device(
                         Some(Command::QueryMonitorPointImage { channel }) => {
                             client.query_monitor_point_image(channel).await;
                         }
+                        Some(Command::CapturePresetImage { channel, preset_id }) => {
+                            client.request_snapshot(channel, preset_id).await;
+                        }
+                        Some(Command::UploadPresetImage { channel, preset_id, jpeg }) => {
+                            client.upload_preset_image(channel, preset_id, jpeg).await;
+                        }
+                        Some(Command::SavePresetWithImage { channel, id, name }) => {
+                            if let Err(e) = client.save_preset_with_image(channel, id, &name).await {
+                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                            }
+                        }
+                        Some(Command::ModifyPreset { channel, id, name, with_image }) => {
+                            if let Err(e) = client.modify_preset(channel, id, &name, with_image).await {
+                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                            }
+                        }
                         Some(Command::QueryPresetImage { channel, preset_id }) => {
                             client.query_preset_image(channel, preset_id).await;
                         }
@@ -433,6 +471,9 @@ pub fn spawn_device(
                             }
                             DeviceUpdate::MonitorPointImage { channel_id, jpeg } => {
                                 DeviceEvent::MonitorPointImage { channel_id, jpeg }
+                            }
+                            DeviceUpdate::Snapshot { preset_id, jpeg, .. } => {
+                                DeviceEvent::Snapshot { preset_id, jpeg }
                             }
                             DeviceUpdate::ImageNotFound { preset_id, .. } => {
                                 DeviceEvent::ImageNotFound { preset_id }

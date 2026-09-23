@@ -33,6 +33,14 @@ const LOGO_MARGIN: i32 = 5;
 
 const DISCONNECT_GRACE: Duration = Duration::from_millis(200);
 
+/// Why a live picture was asked for.
+enum SnapPurpose {
+    /// A new preset (id, name): saved with this picture and the current position.
+    Add(u8, String),
+    /// An existing preset's Edit dialog: a new picture for it.
+    Edit(u8),
+}
+
 /// A device's live connection. `id` tells a replaced connection's late events
 /// apart from the current one's.
 struct Link {
@@ -93,6 +101,7 @@ pub struct MainWindow {
     preset_queue: RefCell<std::collections::VecDeque<u8>>,
     preset_in_flight: Cell<bool>,
     preset_queue_generation: Cell<u64>,
+    snap_purpose: RefCell<Option<SnapPurpose>>,
     /// The devices that have logged in on their current link.
     connected: RefCell<HashSet<String>>,
     next_link_id: Cell<u64>,
@@ -286,8 +295,16 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         });
         let (w_move, w_stop, w_zoom, w_focus) = (weak.clone(), weak.clone(), weak.clone(), weak.clone());
         let (w_add, w_goto, w_delete) = (weak.clone(), weak.clone(), weak.clone());
-        let (w_calibrate, w_mp_config, w_mp_reset, w_mp_goto, w_mp_image, w_preset_image, w_preset_all, w_preset_rename) =
-            (weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone());
+        let (w_calibrate, w_mp_config, w_mp_reset, w_mp_goto, w_mp_image, w_preset_all, w_preset_rename, w_preset_snap) = (
+            weak.clone(),
+            weak.clone(),
+            weak.clone(),
+            weak.clone(),
+            weak.clone(),
+            weak.clone(),
+            weak.clone(),
+            weak.clone(),
+        );
         let remote = RemoteControl::new(remote::Handlers {
             on_move: Box::new(move |command| {
                 if let Some(m) = w_move.upgrade() {
@@ -355,11 +372,6 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
                     m.control(|link, channel| link.query_monitor_point_image(channel));
                 }
             }),
-            on_refresh_preset_image: Box::new(move |id| {
-                if let Some(m) = w_preset_image.upgrade() {
-                    m.enqueue_preset_images(&[id]);
-                }
-            }),
             on_refresh_all_presets: Box::new(move || {
                 if let Some(m) = w_preset_all.upgrade() {
                     let ids: Vec<u8> = m
@@ -373,9 +385,15 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
                     m.enqueue_preset_images(&ids);
                 }
             }),
-            on_rename_preset: Box::new(move |_, _| {
+            on_snapshot_preset: Box::new(move |id| {
+                if let Some(m) = w_preset_snap.upgrade() {
+                    m.begin_snapshot(SnapPurpose::Edit(id), 0);
+                }
+            }),
+            on_rename_preset: Box::new(move |id, name, with_image| {
                 if let Some(m) = w_preset_rename.upgrade() {
-                    m.notify("Renaming a preset is not supported yet");
+                    m.control(move |link, channel| link.modify_preset(channel, id, name.clone(), with_image));
+                    m.query_presets_soon();
                 }
             }),
         });
@@ -644,6 +662,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             preset_queue: RefCell::new(std::collections::VecDeque::new()),
             preset_in_flight: Cell::new(false),
             preset_queue_generation: Cell::new(0),
+            snap_purpose: RefCell::new(None),
             connected: RefCell::new(HashSet::new()),
             next_link_id: Cell::new(1),
             playing: RefCell::new(None),
@@ -906,8 +925,75 @@ impl MainWindow {
             self.notify("No free preset slot (63 max)");
             return;
         };
-        self.control(move |link, channel| link.set_preset(channel, id, name.clone()));
-        self.query_presets_soon();
+        // Like the official app: a fresh picture first, then the preset
+        // (current position) saved together with it.
+        self.begin_snapshot(SnapPurpose::Add(id, name), 0);
+    }
+
+    /// Takes a picture of what the camera sees now. Shares the one-at-a-time
+    /// slot of the preset-picture queue (`preset_in_flight`): the camera
+    /// breaks on overlapping image transfers.
+    fn begin_snapshot(self: &Rc<Self>, purpose: SnapPurpose, tries: u32) {
+        if self.preset_in_flight.get() {
+            if tries < 15 {
+                let this = Rc::clone(self);
+                glib::timeout_add_local_once(Duration::from_millis(400), move || {
+                    this.begin_snapshot(purpose, tries + 1)
+                });
+            } else {
+                self.notify("The camera is busy, try again");
+            }
+            return;
+        }
+        let id = match &purpose {
+            SnapPurpose::Add(id, _) | SnapPurpose::Edit(id) => *id,
+        };
+        self.preset_in_flight.set(true);
+        *self.snap_purpose.borrow_mut() = Some(purpose);
+        let generation = self.preset_queue_generation.get() + 1;
+        self.preset_queue_generation.set(generation);
+        let this = Rc::clone(self);
+        glib::timeout_add_local_once(Duration::from_secs(10), move || {
+            if this.preset_queue_generation.get() != generation {
+                return;
+            }
+            this.preset_in_flight.set(false);
+            match this.snap_purpose.borrow_mut().take() {
+                Some(SnapPurpose::Add(id, name)) => {
+                    this.notify("Could not take a picture; saving the preset without one");
+                    this.control(move |link, channel| link.set_preset(channel, id, name.clone()));
+                    this.query_presets_soon();
+                }
+                Some(SnapPurpose::Edit(_)) => this.notify("Could not take a picture"),
+                None => {}
+            }
+            this.pump_preset_images();
+        });
+        self.control(move |link, channel| link.capture_preset_image(channel, id));
+    }
+
+    /// The snapshot arrived: shrink it to the size the official app stores
+    /// (169×95), upload it, and finish whatever asked for it.
+    fn snapshot_ready(self: &Rc<Self>, preset_id: u8, jpeg: &[u8]) {
+        let Some(purpose) = self.snap_purpose.borrow_mut().take() else { return };
+        self.preset_image_done();
+        let small = remote::decode_and_scale(jpeg, 169, 95)
+            .and_then(|(pixbuf, _, _)| pixbuf.save_to_bufferv("jpeg", &[("quality", "80")]).ok());
+        let Some(small) = small else {
+            self.notify("Could not read the camera's picture");
+            return;
+        };
+        {
+            let small = small.clone();
+            self.control(move |link, channel| link.upload_preset_image(channel, preset_id, small));
+        }
+        match purpose {
+            SnapPurpose::Add(id, name) => {
+                self.control(move |link, channel| link.save_preset_with_image(channel, id, name.clone()));
+                self.query_presets_soon();
+            }
+            SnapPurpose::Edit(id) => self.remote.show_new_picture(id, &small),
+        }
     }
 
     fn query_presets(&self) {
@@ -1434,6 +1520,9 @@ impl MainWindow {
                     self.remote.set_preset_image(preset_id, &jpeg);
                 }
                 self.preset_image_done();
+            }
+            DeviceEvent::Snapshot { preset_id, jpeg } => {
+                self.snapshot_ready(preset_id, &jpeg);
             }
             DeviceEvent::ImageNotFound { preset_id } => {
                 if preset_id.is_some() {

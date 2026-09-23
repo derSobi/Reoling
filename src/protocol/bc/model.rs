@@ -36,6 +36,14 @@ pub const MSG_ID_PTZ_CALIBRATE: u32 = 341;
 /// followed by one or more `binaryData=1` chunks, ended by a response code
 /// other than 200 (201, empty body) rather than a size field.
 pub const MSG_ID_IMAGE_FILE: u32 = 421;
+/// Takes a fresh live picture ("Snap"); the answer is a metadata message and
+/// then `binaryData=1` chunks (AES-encrypted per `encryptLen`), ended like
+/// `MSG_ID_IMAGE_FILE`'s by a code other than 200.
+pub const MSG_ID_SNAP: u32 = 109;
+/// Writes a named image file to the device: an `imageFileInfo` message, then
+/// a `binaryData=1` message under the same `msg_num` carrying the JPEG in
+/// the clear.
+pub const MSG_ID_IMAGE_UPLOAD: u32 = 420;
 /// Per-channel support table (which camera has a siren, spotlight, ...).
 pub const MSG_ID_SUPPORT: u32 = 199;
 /// Plays the siren once. Seen in a capture of the official app.

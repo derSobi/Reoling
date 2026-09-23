@@ -86,6 +86,8 @@ pub enum DeviceUpdate {
     /// is `None` for Monitor Point's) — nothing to show, but the request is
     /// over, so a queue of further ones can move on.
     ImageNotFound { channel_id: u8, preset_id: Option<u8> },
+    /// A fresh live picture (full size) taken for `preset_id`.
+    Snapshot { channel_id: u8, preset_id: u8, jpeg: Vec<u8> },
     /// The device's answer to a control command (siren, spotlight).
     ControlReply { msg_id: u32, code: u16 },
 }
@@ -178,6 +180,8 @@ pub struct ReolinkClient {
 enum ImageKind {
     MonitorPoint,
     Preset(u8),
+    /// A live snapshot taken for this preset (Add / Edit's picture).
+    Snapshot(u8),
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +243,17 @@ fn preset_xml(channel_id: u8, id: u8, name: Option<&str>, command: &str) -> Vec<
     ))
 }
 
+/// A PTZ preset message in the full shape the official app sends
+/// (position fields and all, zeroed) — `command` `None` is a plain edit.
+fn preset_full_xml(channel_id: u8, id: u8, command: Option<&str>, name: &str, with_image: bool) -> Vec<u8> {
+    let command = command.map(|c| format!("<command>{c}</command>")).unwrap_or_default();
+    let name = crate::protocol::bc::xml::xml_escape(name);
+    let image = if with_image { format!("<imageName>preset_{id:02}</imageName>") } else { String::new() };
+    control_xml(&format!(
+        "<PtzPreset version=\"1.1\">\n<channelId>{channel_id}</channelId>\n<presetList>\n<preset><id>{id}</id>{command}<name>{name}</name>{image}<xpos>0.000000e+00</xpos><ypos>0.000000e+00</ypos><height>0.000000e+00</height><width>0.000000e+00</width><mode>global</mode></preset>\n</presetList>\n</PtzPreset>\n"
+    ))
+}
+
 /// Extension for reading Monitor Point (332): unlike every other control
 /// message here, the READ extension carries `chnType` — the WRITE one
 /// (331) doesn't. Confirmed against a real capture (see
@@ -295,7 +310,7 @@ fn pushed_update(
     image_chunks: &mut HashMap<u16, Vec<u8>>,
     pending_images: &std::sync::Mutex<HashMap<u16, ImageKind>>,
 ) -> Option<DeviceUpdate> {
-    if bc.meta.msg_id == MSG_ID_IMAGE_FILE {
+    if bc.meta.msg_id == MSG_ID_IMAGE_FILE || bc.meta.msg_id == MSG_ID_SNAP {
         if bc.meta.response_code == 0xffff {
             // The device's answer for "no file by that name" (e.g. a
             // preset Reoling itself saved, which never got a thumbnail
@@ -336,6 +351,10 @@ fn pushed_update(
         }
         let kind = pending_images.lock().expect("pending_images mutex poisoned").remove(&bc.meta.msg_num);
         return match kind {
+            Some(ImageKind::Snapshot(preset_id)) => {
+                Some(DeviceUpdate::Snapshot { channel_id: bc.meta.channel_id, preset_id, jpeg })
+            }
+            _ if bc.meta.msg_id == MSG_ID_SNAP => None,
             Some(ImageKind::Preset(preset_id)) => {
                 Some(DeviceUpdate::PresetImage { channel_id: bc.meta.channel_id, preset_id, jpeg })
             }
@@ -812,18 +831,63 @@ impl ReolinkClient {
     }
 
     async fn query_image(&mut self, channel_id: u8, image_name: String, kind: ImageKind) {
-        // The device can only run one image-file transfer at a time —
-        // confirmed 2026-09-23 against a real capture: a 4th `MSG_ID_IMAGE_FILE`
-        // request sent before the previous ones had each fully finished (not
-        // even truly concurrent, just back-to-back without waiting) got the
-        // device to reply with a malformed header (`response_code`/`class`
-        // both `0xffff`) followed by stray bytes that desynced the whole
-        // connection, disconnecting it. `pending_images` already tracks
-        // exactly "is a transfer outstanding" — skip a new request outright
-        // while one is, rather than queueing it.
-        if !self.pending_images.lock().expect("pending_images mutex poisoned").is_empty() {
-            return;
+        let payload = image_file_read_xml(channel_id, &image_name);
+        self.start_image_transfer(channel_id, MSG_ID_IMAGE_FILE, payload, kind).await;
+    }
+
+    /// Asks the camera for a fresh live picture, for `preset_id`; arrives as
+    /// `DeviceUpdate::Snapshot`.
+    pub async fn request_snapshot(&mut self, channel_id: u8, preset_id: u8) {
+        let payload = control_xml(&format!(
+            "<Snap version=\"1.1\">\n<channelId>{channel_id}</channelId>\n<logicChannel>{channel_id}</logicChannel>\n<time>0</time>\n<fullFrame>0</fullFrame>\n<streamType>sub</streamType>\n</Snap>\n"
+        ));
+        self.start_image_transfer(channel_id, MSG_ID_SNAP, payload, ImageKind::Snapshot(preset_id)).await;
+    }
+
+    /// Writes `jpeg` as preset `preset_id`'s picture, the way the official
+    /// app does (a metadata message, then the bytes, same `msg_num`).
+    pub async fn upload_preset_image(&mut self, channel_id: u8, preset_id: u8, jpeg: Vec<u8>) {
+        let msg_num = self.next_msg_num();
+        let info = control_xml(&format!(
+            "<imageFileInfo version=\"1.1\">\n<channelId>{channel_id}</channelId>\n<fileSize>{}</fileSize>\n<imageName>preset_{preset_id:02}</imageName>\n</imageFileInfo>\n",
+            jpeg.len()
+        ));
+        let meta = BcMeta { msg_id: MSG_ID_IMAGE_UPLOAD, channel_id, stream_type: 0, msg_num, response_code: 0, class: 0x6414 };
+        let plain = Extension { version: XML_VERSION.to_string(), channel_id: Some(channel_id), ..Default::default() };
+        let binary = Extension {
+            version: XML_VERSION.to_string(),
+            binary_data: Some(1),
+            channel_id: Some(channel_id),
+            ..Default::default()
+        };
+        let first = Bc {
+            meta: meta.clone(),
+            body: BcBody::Modern(ModernMsg { extension_xml: Some(plain.to_bytes()), payload: Some(info) }),
+        };
+        let second = Bc {
+            meta,
+            body: BcBody::Modern(ModernMsg { extension_xml: Some(binary.to_bytes()), payload: Some(jpeg) }),
+        };
+        let mut connection = self.connection.lock().await;
+        if connection.send_bc(&first, &self.encryption).await.is_ok() {
+            let _ = connection.send_bc(&second, &self.encryption).await;
         }
+    }
+
+    /// Saves the current position as preset `id` (`setPos`), with the picture
+    /// just uploaded for it, in the full shape the official app sends.
+    pub async fn save_preset_with_image(&mut self, channel_id: u8, id: u8, name: &str) -> crate::Result<()> {
+        self.send_control(MSG_ID_PTZ_PRESET, channel_id, preset_full_xml(channel_id, id, Some("setPos"), name, true)).await
+    }
+
+    /// Renames preset `id` and/or gives it the picture just uploaded for it
+    /// — a `preset` entry with no `command` at all, as captured from the
+    /// official app's Edit dialog; the position is left alone.
+    pub async fn modify_preset(&mut self, channel_id: u8, id: u8, name: &str, with_image: bool) -> crate::Result<()> {
+        self.send_control(MSG_ID_PTZ_PRESET, channel_id, preset_full_xml(channel_id, id, None, name, with_image)).await
+    }
+
+    async fn start_image_transfer(&mut self, channel_id: u8, msg_id: u32, payload: Vec<u8>, kind: ImageKind) {
         let msg_num = self.next_msg_num();
         self.pending_images.lock().expect("pending_images mutex poisoned").insert(msg_num, kind);
         let extension = Extension {
@@ -833,7 +897,7 @@ impl ReolinkClient {
         };
         let request = Bc {
             meta: BcMeta {
-                msg_id: MSG_ID_IMAGE_FILE,
+                msg_id,
                 channel_id,
                 stream_type: 0,
                 msg_num,
@@ -842,7 +906,7 @@ impl ReolinkClient {
             },
             body: BcBody::Modern(ModernMsg {
                 extension_xml: Some(extension.to_bytes()),
-                payload: Some(image_file_read_xml(channel_id, &image_name)),
+                payload: Some(payload),
             }),
         };
         if self.connection.lock().await.send_bc(&request, &self.encryption).await.is_err() {
@@ -1802,5 +1866,14 @@ mod control_tests {
     fn spotlight_commands_have_the_length_of_the_official_ones() {
         assert_eq!(spotlight_xml(0, true).len(), 177);
         assert_eq!(spotlight_xml(0, false).len(), 177);
+    }
+
+    #[test]
+    fn full_preset_xml_matches_the_captured_edit_and_save_shapes() {
+        let edit = String::from_utf8(preset_full_xml(0, 3, None, "Test3-Rename", true)).unwrap();
+        assert!(edit.contains("<preset><id>3</id><name>Test3-Rename</name><imageName>preset_03</imageName><xpos>"));
+        assert!(!edit.contains("<command>"));
+        let save = String::from_utf8(preset_full_xml(0, 0, Some("setPos"), "Test5", true)).unwrap();
+        assert!(save.contains("<id>0</id><command>setPos</command><name>Test5</name><imageName>preset_00</imageName>"));
     }
 }
