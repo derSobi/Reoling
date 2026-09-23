@@ -485,6 +485,9 @@ fn system_status(parent: &Window) {
     lines.push(format!("Settings: {}", glib::user_config_dir().join("reoling").join("settings.ini").display()));
     let text = Label::new(Some(&lines.join("\n")));
     text.set_selectable(true);
+    // A selectable label takes the focus, and with it a select-all, when the
+    // window opens; clicking the text still selects and copies.
+    text.set_focusable(false);
     text.set_halign(gtk4::Align::Start);
     text.set_xalign(0.0);
     text.set_wrap(true);
@@ -507,10 +510,8 @@ fn system_status(parent: &Window) {
     window.set_child(Some(&content));
     let w = window.clone();
     close.connect_clicked(move |_| w.close());
+    window.set_focus(Some(&close));
     window.present();
-    // The selectable text would otherwise take the focus, and with it a
-    // full selection, on opening.
-    close.grab_focus();
 }
 
 /// The "About" window: name, version, where to follow and support the

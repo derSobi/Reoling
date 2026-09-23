@@ -9,7 +9,7 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 
 ## Status
 
-Version **0.1.18**, early development. Login and live video work end to end
+Version **0.1.19**, early development. Login and live video work end to end
 against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
 only: Reoling races the device's local, NAT-mapped and relay addresses at
 the same time and uses whichever answers first, as the official client does.
@@ -77,6 +77,8 @@ the same time and uses whichever answers first, as the official client does.
 
 **Version history**
 
+- 0.1.19 — System Status: the text no longer takes the focus (it opened with
+  everything selected); the Confirm button has it instead.
 - 0.1.18 — the dock shows "Reoling" with its icon when run from a source
   checkout (a per-user desktop entry is written at start unless the system
   has one; `data/de.dersobi.reoling.desktop` is the one to install);
