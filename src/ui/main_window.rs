@@ -795,6 +795,34 @@ impl MainWindow {
         format!("{name}-{now}.{extension}")
     }
 
+    /// Where a Monitor Point/preset thumbnail is cached, keyed by the
+    /// device's own stable identity — so it survives a restart and shows
+    /// instantly, without waiting on the camera, while a fresh copy is
+    /// still asked for in the background.
+    fn thumbnail_cache_path(device_key: &str, channel: u8, image_name: &str) -> std::path::PathBuf {
+        let safe_key: String =
+            device_key.chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' }).collect();
+        glib::user_cache_dir()
+            .join("reoling")
+            .join("thumbnails")
+            .join(safe_key)
+            .join(format!("ch{channel}"))
+            .join(format!("{image_name}.jpg"))
+    }
+
+    fn load_cached_thumbnail(device_key: &str, channel: u8, image_name: &str) -> Option<Vec<u8>> {
+        std::fs::read(Self::thumbnail_cache_path(device_key, channel, image_name)).ok()
+    }
+
+    fn save_thumbnail_cache(device_key: &str, channel: u8, image_name: &str, jpeg: &[u8]) {
+        let path = Self::thumbnail_cache_path(device_key, channel, image_name);
+        if let Some(parent) = path.parent() {
+            if std::fs::create_dir_all(parent).is_ok() {
+                let _ = std::fs::write(&path, jpeg);
+            }
+        }
+    }
+
     /// Sends a control command to the channel being watched.
     fn control(&self, send: impl FnOnce(&crate::ui::bridge::DeviceLink, u8)) {
         let Some(key) = self.playing_key() else { return };
@@ -1340,6 +1368,12 @@ impl MainWindow {
                 let watching = self.playing_key().and_then(|k| self.device(&k)).is_some_and(|d| d.channel == channel_id);
                 if watching {
                     self.remote.set_presets(&presets);
+                    for preset in &presets {
+                        let image_name = format!("preset_{:02}", preset.id);
+                        if let Some(jpeg) = Self::load_cached_thumbnail(key, channel_id, &image_name) {
+                            self.remote.set_preset_image(preset.id, &jpeg);
+                        }
+                    }
                 }
             }
             DeviceEvent::MonitorPoint { channel_id, state } => {
@@ -1347,6 +1381,12 @@ impl MainWindow {
                 if watching {
                     self.remote.set_monitor_point(state);
                     if state.valid {
+                        // Shows instantly while a fresh copy is fetched in
+                        // the background — `MonitorPointImage` overwrites
+                        // it (and the cache file) once that reply arrives.
+                        if let Some(jpeg) = Self::load_cached_thumbnail(key, channel_id, "guard") {
+                            self.remote.set_monitor_point_image(&jpeg);
+                        }
                         self.control(|link, channel| link.query_monitor_point_image(channel));
                     } else {
                         self.remote.clear_monitor_point_image();
@@ -1354,12 +1394,14 @@ impl MainWindow {
                 }
             }
             DeviceEvent::MonitorPointImage { channel_id, jpeg } => {
+                Self::save_thumbnail_cache(key, channel_id, "guard", &jpeg);
                 let watching = self.playing_key().and_then(|k| self.device(&k)).is_some_and(|d| d.channel == channel_id);
                 if watching {
                     self.remote.set_monitor_point_image(&jpeg);
                 }
             }
             DeviceEvent::PresetImage { channel_id, preset_id, jpeg } => {
+                Self::save_thumbnail_cache(key, channel_id, &format!("preset_{preset_id:02}"), &jpeg);
                 let watching = self.playing_key().and_then(|k| self.device(&k)).is_some_and(|d| d.channel == channel_id);
                 if watching {
                     self.remote.set_preset_image(preset_id, &jpeg);
