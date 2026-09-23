@@ -9,7 +9,7 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 
 ## Status
 
-Version **0.1.11**, early development. Login and live video work end to end
+Version **0.1.12**, early development. Login and live video work end to end
 against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
 only: Reoling races the device's local, NAT-mapped and relay addresses at
 the same time and uses whichever answers first, as the official client does.
@@ -64,6 +64,9 @@ the same time and uses whichever answers first, as the official client does.
 - Packaging (see [Installation](#installation)).
 - Talk has been built from the official app's captured messages but is the
   least tested part.
+- Adding a preset does not yet take its picture, and editing one does not
+  yet rename it or take a new picture (needs the snapshot/upload messages,
+  109 and 420, and the rename message, from a capture of the official app).
 - A preset saved from Reoling itself never gets a thumbnail (the device has
   no file to read yet — nothing here writes one; only the official app's
   own snapshot action does) — Reoling reads that "no file" reply correctly
@@ -71,6 +74,8 @@ the same time and uses whichever answers first, as the official client does.
 
 **Version history**
 
+- 0.1.12 — `REOLING_DEBUG_PRESETS=1` prints the preset-picture queue's steps
+  (to chase a "refresh all" that did nothing on real hardware).
 - 0.1.11 — Preset Points redesigned after the official app's screenshots
   (thumbnail/list toggle, refresh all, add, Edit dialog, whole-card click
   moves the camera); pictures re-read one at a time on every opening; the

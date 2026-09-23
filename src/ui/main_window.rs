@@ -367,6 +367,9 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
                         .and_then(|k| m.device(&k))
                         .map(|d| d.presets.iter().map(|p| p.id).collect())
                         .unwrap_or_default();
+                    if std::env::var("REOLING_DEBUG_PRESETS").is_ok() {
+                        eprintln!("PRESETS refresh all: {ids:?}");
+                    }
                     m.enqueue_preset_images(&ids);
                 }
             }),
@@ -836,6 +839,9 @@ impl MainWindow {
             return;
         }
         let Some(id) = self.preset_queue.borrow_mut().pop_front() else { return };
+        if std::env::var("REOLING_DEBUG_PRESETS").is_ok() {
+            eprintln!("PRESETS asking for the picture of preset {id}");
+        }
         self.preset_in_flight.set(true);
         self.control(move |link, channel| link.query_preset_image(channel, id));
         let generation = self.preset_queue_generation.get() + 1;
@@ -850,6 +856,9 @@ impl MainWindow {
     }
 
     fn preset_image_done(self: &Rc<Self>) {
+        if std::env::var("REOLING_DEBUG_PRESETS").is_ok() {
+            eprintln!("PRESETS a picture request finished");
+        }
         self.preset_in_flight.set(false);
         self.preset_queue_generation.set(self.preset_queue_generation.get() + 1);
         self.pump_preset_images();
