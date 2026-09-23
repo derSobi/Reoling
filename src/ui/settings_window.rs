@@ -510,7 +510,7 @@ fn system_status(parent: &Window) {
     window.set_child(Some(&content));
     let w = window.clone();
     close.connect_clicked(move |_| w.close());
-    window.set_focus(Some(&close));
+    GtkWindowExt::set_focus(&window, Some(&close));
     window.present();
 }
 
