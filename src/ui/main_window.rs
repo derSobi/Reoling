@@ -917,13 +917,45 @@ impl MainWindow {
 
     /// Saves the current position as a new preset with an id the camera does
     /// not already use (1..=63, the range neolink documents).
+    /// The camera lists presets in an order of its own (an edited one jumps
+    /// to the top) and says nothing of when each was added. Oldest first,
+    /// newest last is kept here: the order each id was first seen in
+    /// (remembered per device and channel; ids never seen before, on a first
+    /// run, by id), with new ones appended.
+    fn in_added_order(device_key: &str, channel: u8, presets: &[reoling::PtzPreset]) -> Vec<reoling::PtzPreset> {
+        let safe_key: String =
+            device_key.chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' }).collect();
+        let path = glib::user_config_dir().join("reoling").join(format!("preset-order-{safe_key}-ch{channel}.txt"));
+        let known: Vec<u8> = std::fs::read_to_string(&path)
+            .map(|t| t.split_whitespace().filter_map(|w| w.parse().ok()).collect())
+            .unwrap_or_default();
+        let mut order: Vec<u8> = known.iter().copied().filter(|id| presets.iter().any(|p| p.id == *id)).collect();
+        let mut fresh: Vec<u8> = presets.iter().map(|p| p.id).filter(|id| !order.contains(id)).collect();
+        fresh.sort_unstable();
+        order.extend(fresh);
+        if order != known {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let text: Vec<String> = order.iter().map(u8::to_string).collect();
+            let _ = std::fs::write(&path, text.join(" "));
+        }
+        let mut sorted = presets.to_vec();
+        sorted.sort_by_key(|p| order.iter().position(|id| *id == p.id));
+        sorted
+    }
+
     fn next_preset_id(self: &Rc<Self>) -> Option<u8> {
         let key = self.playing_key()?;
         let used: std::collections::HashSet<u8> = self
             .device(&key)
             .map(|d| d.presets.iter().map(|p| p.id).collect())
             .unwrap_or_default();
-        let id = (1..=63u8).find(|id| !used.contains(id));
+        // After the highest id in use, so ids grow with age; only once 63 is
+        // taken does it look for a gap.
+        let id = (used.iter().max().copied().unwrap_or(0).saturating_add(1)..=63u8)
+            .chain(1..=63u8)
+            .find(|id| !used.contains(id));
         if id.is_none() {
             self.notify("No free preset slot (63 max)");
         }
@@ -1506,7 +1538,7 @@ impl MainWindow {
                 }
                 let watching = self.playing_key().and_then(|k| self.device(&k)).is_some_and(|d| d.channel == channel_id);
                 if watching {
-                    self.remote.set_presets(&presets);
+                    self.remote.set_presets(&Self::in_added_order(key, channel_id, &presets));
                 }
             }
             DeviceEvent::MonitorPoint { channel_id, state } => {

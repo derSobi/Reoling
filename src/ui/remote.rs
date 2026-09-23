@@ -731,11 +731,7 @@ impl RemoteControl {
 
     /// The camera's saved presets, replacing whatever was listed before.
     pub fn set_presets(self: &Rc<Self>, presets: &[reoling::PtzPreset]) {
-        // In id order, whatever order the camera lists them in (it moves an
-        // edited one to the top).
-        let mut sorted = presets.to_vec();
-        sorted.sort_by_key(|p| p.id);
-        *self.preset_list.borrow_mut() = sorted;
+        *self.preset_list.borrow_mut() = presets.to_vec();
         self.rebuild_presets();
     }
 
