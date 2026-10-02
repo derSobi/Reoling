@@ -21,6 +21,9 @@
 !/scripts/**
 !/data/**
 
+# The README's screenshots
+!/docs/**
+
 # But not the build output
 /target/
 
