@@ -6,7 +6,7 @@ rust-version = "1.75"
 license = "AGPL-3.0-or-later"
 description = "Reoling, an unofficial Linux client for Reolink cameras, NVRs and Home Hubs over the Baichuan P2P protocol"
 repository = "https://github.com/derSobi/Reoling"
-homepage = "https://reoling.eu/"
+homepage = "https://reoling.eu"
 
 [lib]
 name = "reoling"

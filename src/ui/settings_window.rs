@@ -558,7 +558,7 @@ fn about_window(parent: &Window) {
     blurb.set_wrap(true);
     blurb.set_justify(gtk4::Justification::Center);
     content.append(&blurb);
-    content.append(&link("Website", "reoling.eu", "https://reoling.eu/"));
+    content.append(&link("Website", "reoling.eu", "https://reoling.eu"));
     content.append(&link("Source code and issues", "GitHub", "https://github.com/derSobi/Reoling"));
     content.append(&link("Support the project", "GitHub Sponsors", "https://github.com/sponsors/derSobi"));
     let legal = Label::new(Some(

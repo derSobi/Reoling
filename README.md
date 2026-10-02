@@ -4,7 +4,7 @@ An unofficial client for Reolink® devices — cameras, NVRs, and Home Hubs —
 that connects over Reolink's proprietary "Baichuan" P2P protocol using only
 a device's UID (no manual IP/port configuration, no cloud account required).
 
-**Website: <https://reoling.eu/>**
+**Website: <https://reoling.eu>**
 
 Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 "Reolink" is a trademark of its respective owner.
@@ -20,7 +20,7 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
   <img src="docs/screenshots/download-settings.png" alt="Client Settings, Download Settings" width="49%">
 </p>
 
-More on <https://reoling.eu/>.
+More on <https://reoling.eu>.
 
 ## Status
 
@@ -92,7 +92,7 @@ the same time and uses whichever answers first, as the official client does.
 
 **Version history**
 
-- 0.1.20 — the official website, <https://reoling.eu/>, is linked from the
+- 0.1.20 — the official website, <https://reoling.eu>, is linked from the
   README (with its screenshots, now kept in `docs/screenshots`), the About
   window and the package metadata.
 - 0.1.19 — System Status: the text no longer takes the focus (it opened with
