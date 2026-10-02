@@ -24,7 +24,7 @@ More on <https://reoling.eu>.
 
 ## Status
 
-Version **0.1.20**, early development. Login and live video work end to end
+Version **0.1.21**, early development. Login and live video work end to end
 against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
 only: Reoling races the device's local, NAT-mapped and relay addresses at
 the same time and uses whichever answers first, as the official client does.
@@ -92,6 +92,8 @@ the same time and uses whichever answers first, as the official client does.
 
 **Version history**
 
+- 0.1.21 — the Download Settings screenshot is replaced by one without the
+  background behind the window.
 - 0.1.20 — the official website, <https://reoling.eu>, is linked from the
   README (with its screenshots, now kept in `docs/screenshots`), the About
   window and the package metadata.
