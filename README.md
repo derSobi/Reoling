@@ -4,12 +4,27 @@ An unofficial client for Reolink® devices — cameras, NVRs, and Home Hubs —
 that connects over Reolink's proprietary "Baichuan" P2P protocol using only
 a device's UID (no manual IP/port configuration, no cloud account required).
 
+**Website: <https://reoling.eu/>**
+
 Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 "Reolink" is a trademark of its respective owner.
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/main-screen.png" alt="Live view of a night camera stream, with the Home Hub Pro and RLN36 NVR devices and the camera controls" width="49%">
+  <img src="docs/screenshots/remote.png" alt="The camera remote: pan/tilt, zoom, focus, Calibration, Monitor Point and Preset" width="49%">
+</p>
+<p align="center">
+  <img src="docs/screenshots/live-settings.png" alt="Client Settings, Live View &amp; Playback" width="49%">
+  <img src="docs/screenshots/download-settings.png" alt="Client Settings, Download Settings" width="49%">
+</p>
+
+More on <https://reoling.eu/>.
+
 ## Status
 
-Version **0.1.19**, early development. Login and live video work end to end
+Version **0.1.20**, early development. Login and live video work end to end
 against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
 only: Reoling races the device's local, NAT-mapped and relay addresses at
 the same time and uses whichever answers first, as the official client does.
@@ -77,6 +92,9 @@ the same time and uses whichever answers first, as the official client does.
 
 **Version history**
 
+- 0.1.20 — the official website, <https://reoling.eu/>, is linked from the
+  README (with its screenshots, now kept in `docs/screenshots`), the About
+  window and the package metadata.
 - 0.1.19 — System Status: the text no longer takes the focus (it opened with
   everything selected); the Confirm button has it instead.
 - 0.1.18 — the dock shows "Reoling" with its icon when run from a source
@@ -189,7 +207,8 @@ src/
 │                dialogs, settings, video and audio).
 └── main.rs      The `reoling` binary.
 examples/        Small diagnostic tools (UID probe, media trace analysis).
-data/            Icons.
+data/            Icons and the desktop entry.
+docs/            Screenshots used by this README.
 ```
 
 Reoling is a Linux-only desktop application.

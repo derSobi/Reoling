@@ -21,6 +21,9 @@
 !/scripts/**
 !/data/**
 
+# Capturile de ecran din README
+!/docs/**
+
 # Dar nu artefactele de build
 /target/
 
