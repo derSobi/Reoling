@@ -271,7 +271,7 @@ mod tests {
         // 0xdc02 instead of the real 0xdc12, and `channel_id` was being
         // set to the target camera's channel instead of 0 (login is a
         // host-level operation, even on an NVR — see `bug #14`/`#15` in
-        // .plans/reolink-linux-project.md).
+        // .plans/reoling-project.md).
         let bc = Bc {
             meta: BcMeta {
                 msg_id: MSG_ID_LOGIN,

@@ -665,11 +665,12 @@ For more information on this, and how to apply and follow the GNU AGPL, see
 Third-party components
 =======================
 
-The AGPL-3.0 above covers Reoling's own source code (`crates/`, `apps/`).
-It does not and cannot relicense anything below.
+The AGPL-3.0 above covers Reoling's own source code (the `reoling` Cargo
+package at the repository root). It does not and cannot relicense anything
+below.
 
 GTK 4
-    LGPL-2.1-or-later. `apps/reoling-linux` links against it (via the
+    LGPL-2.1-or-later. Reoling links against it (via the
     `gtk4`/`glib` Rust bindings, which are themselves MIT-licensed — only
     the underlying C library carries the LGPL). Reoling links it
     dynamically, which is what LGPL-2.1 asks of a differently-licensed
@@ -684,15 +685,15 @@ GStreamer
     bundled, or modified by Reoling.
 
 Rust crate dependencies (Cargo-managed)
-    Every direct dependency of `reolink-protocol`, `reolink-core`, and
-    `apps/reoling-linux` is MIT and/or Apache-2.0 licensed (permissive,
-    no copyleft obligations): thiserror, quick-xml, serde, aes, cfb-mode,
-    md-5, crc32fast, tokio, tokio-stream, rand, futures-util, gtk4, glib,
-    async-channel, gstreamer, gstreamer-app — confirmed directly against
-    `cargo metadata` for the versions actually locked in `Cargo.lock`,
-    2026-09-13. This list will drift as dependencies are added or
-    upgraded; `cargo metadata` (or `cargo license`, if installed) against
-    the current `Cargo.lock` is the authoritative source, not this file.
+    Every direct dependency of the `reoling` package is MIT and/or
+    Apache-2.0 licensed (permissive, no copyleft obligations): thiserror,
+    quick-xml, serde, aes, cfb-mode, md-5, crc32fast, tokio, tokio-stream,
+    rand, futures-util, gtk4, glib, async-channel, gstreamer, gstreamer-app
+    — confirmed directly against `cargo metadata` for the versions actually
+    locked in `Cargo.lock`, 2026-09-13. This list will drift as dependencies
+    are added or upgraded; `cargo metadata` (or `cargo license`, if installed)
+    against the current `Cargo.lock` is the authoritative source, not this
+    file.
 
 Protocol documentation
     Reoling's understanding of the Baichuan protocol was built by reading

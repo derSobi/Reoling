@@ -610,7 +610,7 @@ impl ReolinkClient {
     /// contradicts an earlier reading of neolink's `BcCameraOpt::channel_id`
     /// doc comment ("Channel the camera is on 0 unless using a NVR"), which
     /// led this code to thread the target camera's channel into login's
-    /// `BcMeta` too (see bug #13/#14 in `.plans/reolink-linux-project.md`) — real
+    /// `BcMeta` too (see bug #13/#14 in `.plans/reoling-project.md`) — real
     /// capture evidence for the exact device class this project targets
     /// overrides that inference. `channel_id` is passed only to
     /// `start_video`/`stop_video`, which is where the real client's own

@@ -420,7 +420,7 @@ pub async fn connect_relay(
     // instead of once — tried reproducing that (2026-09-13) on the theory
     // that a single lost packet here was causing the device to tear the
     // relay session down, but a real-hardware retest with the retry in
-    // place still hit the same disconnect (see `.plans/reolink-linux-project.md`,
+    // place still hit the same disconnect (see `.plans/reoling-project.md`,
     // bug #13) while adding ~1s to every connect for no measured benefit,
     // so reverted back to a single send.
     let confirm = BcUdp::Discovery(UdpDiscovery {
