@@ -269,6 +269,40 @@ impl RemoteControl {
             w.set_visible(false);
             glib::Propagation::Stop
         });
+        // A pan/tilt runs until a stop arrives, so the camera must never be
+        // left moving because the release happened somewhere we didn't see
+        // it: hiding the window or switching away from it stops it too.
+        let moving = Rc::new(Cell::new(false));
+        let stop_if_moving = {
+            let (handlers, moving) = (Rc::clone(&handlers), Rc::clone(&moving));
+            move || {
+                if moving.replace(false) {
+                    debug_ptz("stop (window hidden, unfocused or button released)");
+                    (handlers.on_stop)();
+                }
+            }
+        };
+        let s = stop_if_moving.clone();
+        window.connect_hide(move |_| s());
+        let s = stop_if_moving.clone();
+        window.connect_is_active_notify(move |w| {
+            if !w.is_active() {
+                s();
+            }
+        });
+        // Belt and braces for the pad below: any mouse-button release
+        // delivered to this window ends a move, whatever the arrow's own
+        // gesture made of the pointer wandering off it in between.
+        let release_watch = gtk4::EventControllerLegacy::new();
+        release_watch.set_propagation_phase(PropagationPhase::Capture);
+        let s = stop_if_moving;
+        release_watch.connect_event(move |_, event| {
+            if event.event_type() == gtk4::gdk::EventType::ButtonRelease {
+                s();
+            }
+            glib::Propagation::Proceed
+        });
+        window.add_controller(release_watch);
 
         let stack = Stack::new();
         // Each page keeps its own natural size instead of the window sizing
@@ -294,17 +328,37 @@ impl RemoteControl {
             (1, 2, "→", "right"),
             (2, 1, "↓", "down"),
         ] {
-            // Moves while held: the camera goes on until told to stop.
+            // Moves while held: one move on press, one stop on release, as
+            // the official app does. The press is claimed so the button's
+            // own click handling can't take the sequence over (that cancels
+            // this gesture mid-hold). `stopped` is deliberately not a stop:
+            // GTK emits it when its double-click timer runs out, ~0.4 s into
+            // a perfectly ordinary hold — which used to cut every move short.
             let button = Button::with_label(label);
             button.set_size_request(56, 48);
             let hold = GestureClick::new();
             hold.set_propagation_phase(PropagationPhase::Capture);
-            let h = Rc::clone(&handlers);
-            hold.connect_pressed(move |_, _, _, _| (h.on_move)(command));
-            let h = Rc::clone(&handlers);
-            hold.connect_released(move |_, _, _, _| (h.on_stop)());
-            let h = Rc::clone(&handlers);
-            hold.connect_stopped(move |_| (h.on_stop)());
+            let (h, m) = (Rc::clone(&handlers), Rc::clone(&moving));
+            hold.connect_pressed(move |gesture, _, _, _| {
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                m.set(true);
+                debug_ptz(command);
+                (h.on_move)(command);
+            });
+            let (h, m) = (Rc::clone(&handlers), Rc::clone(&moving));
+            hold.connect_released(move |_, _, _, _| {
+                if m.replace(false) {
+                    debug_ptz("stop (released)");
+                    (h.on_stop)();
+                }
+            });
+            let (h, m) = (Rc::clone(&handlers), Rc::clone(&moving));
+            hold.connect_cancel(move |_, _| {
+                if m.replace(false) {
+                    debug_ptz("stop (cancelled)");
+                    (h.on_stop)();
+                }
+            });
             button.add_controller(hold);
             pad.attach(&button, col, row, 1, 1);
         }
@@ -908,5 +962,13 @@ impl RemoteControl {
             // The new preset's picture is what the camera sees right now.
             (self.handlers.on_snapshot_preset)(dialog_id);
         }
+    }
+}
+
+/// `REOLING_DEBUG_UI`: when each pan/tilt press and release happened, to
+/// line up against the send times `REOLING_DEBUG_PTZ` prints.
+fn debug_ptz(what: &str) {
+    if std::env::var("REOLING_DEBUG_UI").is_ok() {
+        eprintln!("UI ptz {what} at {:?}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default());
     }
 }
