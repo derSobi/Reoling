@@ -548,19 +548,25 @@ pub async fn connect_race(
     Ok(peer)
 }
 
-const P2P_RELAY_HOSTNAMES: [&str; 12] = [
-    "p2p.reolink.com",
+/// The P2P servers asked about a UID, all in parallel. Exactly the set the
+/// official Windows client resolves and queries in our captures
+/// (2026-09-13, `Reolink-UDP`/`Reolink-ALL-New-Install`): `p2p1`..`p2p16`
+/// except `p2p4` and `p2p5`, and not the bare `p2p.reolink.com`.
+const P2P_RELAY_HOSTNAMES: [&str; 14] = [
     "p2p1.reolink.com",
     "p2p2.reolink.com",
     "p2p3.reolink.com",
-    "p2p4.reolink.com",
-    "p2p5.reolink.com",
     "p2p6.reolink.com",
     "p2p7.reolink.com",
     "p2p8.reolink.com",
     "p2p9.reolink.com",
     "p2p10.reolink.com",
     "p2p11.reolink.com",
+    "p2p12.reolink.com",
+    "p2p13.reolink.com",
+    "p2p14.reolink.com",
+    "p2p15.reolink.com",
+    "p2p16.reolink.com",
 ];
 
 /// Shared prefix of `connect_by_uid`: resolve the relay hostnames, broadcast

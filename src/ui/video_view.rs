@@ -36,6 +36,36 @@ struct PtsState {
     // the previous `push_frame`, to log real inter-arrival gaps alongside
     // the computed PTS and the pipeline's running time.
     last_push_wall: Option<std::time::Instant>,
+    /// The latency anchor (on unless `REOLING_NO_PTS_ANCHOR` is set): the
+    /// smallest `running_time - camera_time` seen so far, in µs — see
+    /// `push_frame`.
+    anchor_us: Option<i64>,
+    /// The last PTS handed to the decoding pipeline, kept strictly rising.
+    last_display_pts_us: Option<u64>,
+    /// When the next `REOLING_DEBUG_LATENCY` summary line is due.
+    next_latency_report: Option<std::time::Instant>,
+    /// The even display clock (µs) and the average frame interval it
+    /// advances by — see `push_frame`.
+    even_us: Option<f64>,
+    average_step_us: Option<f64>,
+    /// Frames pushed into the pipeline so far (for that summary line).
+    pushed_frames: u64,
+}
+
+/// Whether the latency anchor is on: the default since 2026-10-11, when a
+/// side-by-side run on real hardware (Home Hub channel, Balanced = 1 s)
+/// showed the picture stuck 2.6 s behind after one network hiccup without
+/// it, and back at ~0.95 s within a second with it.
+/// `REOLING_NO_PTS_ANCHOR` turns it off, for comparison.
+fn anchor_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REOLING_NO_PTS_ANCHOR").is_err();
+        if std::env::var("REOLING_DEBUG_LATENCY").is_ok() {
+            eprintln!("video timing: camera cadence, latency anchor {}", if on { "on" } else { "off (REOLING_NO_PTS_ANCHOR)" });
+        }
+        on
+    })
 }
 
 /// A cheap, `Send + Sync` handle to a built pipeline's `appsrc` — cloning
@@ -62,6 +92,8 @@ pub struct VideoSink {
     /// The file being recorded to, if any; fed by the same `push_frame`.
     recorder: Arc<Mutex<Option<Recorder>>>,
     video_type: VideoType,
+    /// Frames out of the decoder so far (`REOLING_DEBUG_LATENCY` only).
+    decoded_frames: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Writes the incoming H.264/H.265 units into a Matroska file (which stays
@@ -183,7 +215,9 @@ impl VideoView {
     /// elementary H.264/H.265, not RTP, so rtph264depay/rtph265depay must
     /// not be inserted here.
     ///
-    /// PTS is computed per-frame from the camera's own capture clock
+    /// PTS follows the camera's own capture clock, anchored to the
+    /// pipeline's running time so delay can't pile up (see `push_frame`);
+    /// the cadence itself comes from the camera clock
     /// (`frame.microseconds`), guarded against implausible jumps — see
     /// `VideoSink::push_frame`'s doc comment. Arrival-time pacing
     /// (`do-timestamp`) was tried 2026-09-15/16 and replaced 2026-09-16
@@ -291,7 +325,17 @@ impl VideoView {
          * Keeps the output portable across the raw pixel formats produced
          * by whichever decoder decodebin selects.
          */
+        // `qos=false`: the display sink reports every frame that reaches it
+        // late, and videoconvert (QoS on by default) then silently discards
+        // the next ones — uncounted anywhere. With sub's H.264 the decoder
+        // legitimately holds frames longer than the pipeline latency, so
+        // this cut sub down to ~1 frame per second (2026-10-11: reproduced
+        // offline with the same frames, 24 of 226 shown; all shown with
+        // videoconvert's QoS off). The sink still shows late frames
+        // (`max-lateness = -1`); nothing between decoder and sink may
+        // throw them away.
         let convert = gstreamer::ElementFactory::make("videoconvert")
+            .property("qos", false)
             .build()
             .expect("videoconvert element missing — install gstreamer1.0-plugins-base");
 
@@ -299,6 +343,7 @@ impl VideoView {
          * GTK4 video sink
          */
         let sink = gstreamer::ElementFactory::make("gtk4paintablesink")
+            .name("display")
             .property("max-lateness", -1i64)
             .build()
             .expect(
@@ -350,7 +395,10 @@ impl VideoView {
          */
         let convert_weak = convert.downgrade();
 
+        let decoded_frames = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let decoded_for_pad = decoded_frames.clone();
         decodebin.connect_pad_added(move |_decodebin, src_pad| {
+            let decoded_frames = &decoded_for_pad;
             let Some(convert) = convert_weak.upgrade() else {
                 return;
             };
@@ -378,6 +426,21 @@ impl VideoView {
                 return;
             }
 
+            // `REOLING_DEBUG_LATENCY`: count what leaves the decoder, and
+            // show what the display negotiated, to tell decoder losses from
+            // display losses.
+            if std::env::var("REOLING_DEBUG_LATENCY").is_ok() {
+                let decoded = decoded_frames.clone();
+                src_pad.add_probe(gstreamer::PadProbeType::BUFFER, move |_, _| {
+                    decoded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    gstreamer::PadProbeReturn::Ok
+                });
+                src_pad.connect_notify(Some("caps"), |pad, _| {
+                    if let Some(caps) = pad.current_caps() {
+                        eprintln!("LATENCY decoder output caps: {caps}");
+                    }
+                });
+            }
             match src_pad.link(&convert_sink_pad) {
                 Ok(_) => {}
                 Err(err) => {
@@ -399,6 +462,40 @@ impl VideoView {
                 }
             });
         }
+
+        /*
+         * Whatever video decoder decodebin picks: never discard late frames,
+         * and hand each picture out as soon as it is decoded.
+         *
+         * These cameras' H.264 streams carry no VUI, so a decoder can't know
+         * they never reorder frames (they have no B-frames) and holds up to
+         * 16 decoded pictures before releasing any. That costs 0.64 s at
+         * main's 25 fps but 1.6 s at sub's 10 fps — longer than the pipeline
+         * latency, so nearly every frame reached the display late and the
+         * decoder's QoS threw it away: measured 2026-10-11 on real hardware,
+         * sub showed ~1 frame per second out of ~10 received, with every
+         * decoder tried (NVIDIA and Intel), while the same frames dumped to a
+         * file decoded completely offline.
+         *
+         * `compliance=flexible` (decoders built on GStreamer's H.264 base
+         * class: va, nv, v4l2) drops that 16-frame hold — 0.64 s down to
+         * 0-40 ms reported on the dumped sub stream, all 226 frames out, in
+         * order. `qos=false` covers every other decoder (qsv, libav): a
+         * late frame is still shown instead of being discarded.
+         */
+        pipeline.connect_deep_element_added(|_, _, element| {
+            let Some(factory) = element.factory() else { return };
+            let klass = factory.klass();
+            if !(klass.contains("Decoder") && klass.contains("Video")) {
+                return;
+            }
+            if element.find_property("qos").is_some() {
+                element.set_property("qos", false);
+            }
+            if element.find_property("compliance").is_some() {
+                element.set_property_from_str("compliance", "flexible");
+            }
+        });
 
         /*
          * Connect gtk4paintablesink to GtkPicture.
@@ -437,6 +534,7 @@ impl VideoView {
             pts_state: Arc::new(Mutex::new(PtsState::default())),
             recorder: Arc::new(Mutex::new(None)),
             video_type,
+            decoded_frames,
         }
     }
 
@@ -581,10 +679,90 @@ impl VideoSink {
                 step_us
             };
             state.accumulated_us += step_us;
+            // An even display clock locked to the camera's: the next frame
+            // is due one *average* interval after the previous one, nudged
+            // a tenth of the way towards the camera's own time so it never
+            // drifts away from it. The camera stamps frames on its 40 ms
+            // (25 fps) sensor grid, so a 10 fps sub stream arrives as 80,
+            // 120, 80, 120 ms… — shown as such on a 60 Hz screen that is 5
+            // then 7 refreshes per picture, a visible stutter main's steady
+            // 40 ms never has. On the real sub timestamps (2026-10-11) this
+            // gives 100-104 ms steps, never more than 84 ms off the camera.
+            let average = state.average_step_us.map_or(step_us as f64, |a| a + (step_us as f64 - a) * 0.05);
+            state.average_step_us = Some(average);
+            let camera = state.accumulated_us as f64;
+            let predicted = state.even_us.map_or(camera, |even| even + average);
+            state.even_us = Some(predicted + (camera - predicted) * 0.1);
+        } else {
+            state.even_us = Some(state.accumulated_us as f64);
         }
         state.last_raw_time = Some(frame.microseconds);
 
         let pts = gstreamer::ClockTime::from_useconds(state.accumulated_us);
+        state.pushed_frames += 1;
+        // What the display pipeline gets. By default the camera-cadence PTS
+        // above, which starts at 0 for the first frame: whatever the camera
+        // sends in a burst when a stream starts (its buffered seconds), and
+        // every network stall after that, stays in the picture as delay for
+        // good, since the pipeline plays it all back at the camera's pace.
+        //
+        // With the anchor (the default), each frame is placed at `camera_time + anchor`,
+        // where `anchor` is the smallest `running_time - camera_time` seen
+        // so far: the frame that arrived earliest relative to its own
+        // timestamp sets the pace, everything later than it uses the
+        // pipeline latency as its jitter margin. The anchor only ever moves
+        // earlier, so a startup burst plays through quickly once and the
+        // picture then stays at the configured latency; nothing ever jumps
+        // back. Kept strictly rising for the decoder.
+        let display_pts = if anchor_enabled() {
+            let camera_us = state.even_us.map_or(state.accumulated_us as i64, |even| even.round() as i64);
+            if let Some(running) = self.pipeline.current_running_time().filter(|t| t.useconds() > 0) {
+                let offset = running.useconds() as i64 - camera_us;
+                state.anchor_us = Some(state.anchor_us.map_or(offset, |a| a.min(offset)));
+            }
+            let wanted = state.anchor_us.map_or(camera_us, |a| camera_us + a).max(0) as u64;
+            let rising = state.last_display_pts_us.map_or(wanted, |last| wanted.max(last + 1));
+            state.last_display_pts_us = Some(rising);
+            gstreamer::ClockTime::from_useconds(rising)
+        } else {
+            pts
+        };
+        if std::env::var("REOLING_DEBUG_LATENCY").is_ok() {
+            let now = std::time::Instant::now();
+            if state.next_latency_report.is_none_or(|due| now >= due) {
+                state.next_latency_report = Some(now + std::time::Duration::from_secs(1));
+                if let Some(running) = self.pipeline.current_running_time() {
+                    // How far ahead of "now" this frame is scheduled: the
+                    // picture's delay behind the network, configured
+                    // latency included.
+                    let ahead_ms = (display_pts.useconds() as i64 + crate::ui::settings::latency().as_micros() as i64
+                        - running.useconds() as i64)
+                        / 1000;
+                    // What the display actually did since the start:
+                    // frames it rendered and frames it threw away (late or
+                    // QoS), next to how many we pushed in.
+                    let shown = self
+                        .pipeline
+                        .by_name("display")
+                        .map(|sink| sink.property::<gstreamer::Structure>("stats"))
+                        .map(|stats| {
+                            format!(
+                                "rendered {} dropped {}",
+                                stats.get::<u64>("rendered").unwrap_or(0),
+                                stats.get::<u64>("dropped").unwrap_or(0)
+                            )
+                        })
+                        .unwrap_or_default();
+                    eprintln!(
+                        "LATENCY frame shown {ahead_ms} ms after it arrived (configured {} ms, anchor {}); pushed {} decoded {} {shown}",
+                        crate::ui::settings::latency().as_millis(),
+                        if anchor_enabled() { "on" } else { "off" },
+                        state.pushed_frames,
+                        self.decoded_frames.load(std::sync::atomic::Ordering::Relaxed)
+                    );
+                }
+            }
+        }
 
         // DEBUG-ONLY, temporary: real wall-clock gap since the last pushed
         // frame (how fast data is actually arriving) alongside the computed
@@ -609,11 +787,24 @@ impl VideoSink {
             recorder.push(frame, pts);
         }
 
+        // `REOLING_DUMP_VIDEO=<file>`: append every access unit exactly as
+        // handed to the parser (H.264/H.265 byte-stream), plus a sidecar
+        // `<file>.idx` line per unit — for checking a stream offline.
+        if let Ok(path) = std::env::var("REOLING_DUMP_VIDEO") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = f.write_all(&frame.data);
+            }
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(format!("{path}.idx")) {
+                let _ = writeln!(f, "{} {} {}", frame.data.len(), frame.is_keyframe, frame.microseconds);
+            }
+        }
+
         /*
          * VideoFrame::data already represents one complete access unit.
          */
         let mut buffer = gstreamer::Buffer::from_slice(frame.data.clone());
-        buffer.get_mut().unwrap().set_pts(pts);
+        buffer.get_mut().unwrap().set_pts(display_pts);
 
         match self.appsrc.push_buffer(buffer) {
             // The pipeline was torn down (stream stopped or replaced) while

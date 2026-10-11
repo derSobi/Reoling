@@ -781,7 +781,13 @@ impl ReolinkClient {
     /// `leftDown`, `rightUp`, `rightDown`) or, with `stop`, stops it. It
     /// moves until told to stop.
     pub async fn ptz(&mut self, channel_id: u8, command: &str, speed: u8) -> crate::Result<()> {
-        self.send_control(MSG_ID_PTZ, channel_id, ptz_xml(channel_id, command, speed)).await
+        let asked = std::time::Instant::now();
+        let result = self.send_control(MSG_ID_PTZ, channel_id, ptz_xml(channel_id, command, speed)).await;
+        if std::env::var("REOLING_DEBUG_PTZ").is_ok() {
+            let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            eprintln!("PTZ {command} sent at {at:?}, waited {:?} for the connection", asked.elapsed());
+        }
+        result
     }
 
     /// Re-calibrates the pan/tilt mechanism. A successful reply means the
@@ -1450,8 +1456,18 @@ impl ReolinkClient {
                         }
                         Ok(None) => break,
                         Err(e) => {
-                            let _ = tx.send(Err(e)).await;
-                            return;
+                            // Not the start of a unit — typically the tail of
+                            // the stream we just switched away from, still in
+                            // flight when the new one began. Skip to the next
+                            // unit instead of ending the stream.
+                            let skip = crate::protocol::bcmedia::model::resync_offset(&buffer);
+                            if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
+                                eprintln!("NEGOTIATION media resync: {e}; skipped {skip} bytes");
+                            }
+                            if skip == 0 {
+                                break;
+                            }
+                            buffer.drain(..skip);
                         }
                     }
                 }

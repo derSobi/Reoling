@@ -288,8 +288,14 @@ pub fn spawn_device(
             };
             match client.login(&username, &password).await {
                 Ok(_) => {}
-                Err(reoling::Error::LoginFailed { .. }) => {
-                    let _ = tx.send(DeviceEvent::LoginRejected).await;
+                Err(reoling::Error::LoginFailed { code }) => {
+                    // Only a password problem should make us forget the
+                    // saved password; a locked or busy device keeps it.
+                    let event = match reoling::login_refusal_reason(code) {
+                        Some(reason) => DeviceEvent::Lost(reason.to_string()),
+                        None => DeviceEvent::LoginRejected,
+                    };
+                    let _ = tx.send(event).await;
                     return;
                 }
                 Err(e) => {

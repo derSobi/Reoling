@@ -10,4 +10,4 @@ pub mod bcmedia;
 pub mod crypto;
 mod error;
 
-pub use error::{Error, Result};
+pub use error::{login_refusal_reason, Error, Result};

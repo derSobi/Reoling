@@ -24,7 +24,7 @@ More on <https://reoling.eu>.
 
 ## Status
 
-Version **0.1.21**, early development. Login and live video work end to end
+Version **0.1.22**, early development. Login and live video work end to end
 against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
 only: Reoling races the device's local, NAT-mapped and relay addresses at
 the same time and uses whichever answers first, as the official client does.
@@ -92,6 +92,24 @@ the same time and uses whichever answers first, as the official client does.
 
 **Version history**
 
+- 0.1.22 — live video and camera control:
+  - Pan/tilt keeps moving for as long as an arrow is held. A GTK timer used
+    to send a stop about 0.4 s into every hold, so the camera moved in
+    bursts.
+  - The picture stays at the chosen latency. Before, a burst or a network
+    hiccup added delay that never went away (measured: 2.6 s instead of 1 s
+    on Balanced).
+  - Sub and extern streams show every frame. On sub only about 1 frame in
+    10 reached the screen: frames the decoder released late were discarded
+    on the way to the display. Low frame rates are also paced evenly now.
+  - Switching streams no longer fails with "unsupported bcmedia magic" when
+    the end of the previous stream is still arriving.
+  - A locked or busy device (too many users, device occupied…) now says so
+    instead of "Incorrect password", and the saved password is kept.
+  - The P2P servers asked about a UID are now the same set the official
+    client uses.
+  - New debug switches: `REOLING_DEBUG_LATENCY`, `REOLING_DEBUG_PTZ`,
+    `REOLING_DUMP_VIDEO`, and `examples/replay_dump.rs` to replay a dump.
 - 0.1.21 — the Download Settings screenshot is replaced by one without the
   background behind the window.
 - 0.1.20 — the official website, <https://reoling.eu>, is linked from the

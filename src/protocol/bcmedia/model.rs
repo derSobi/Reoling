@@ -50,6 +50,27 @@ fn video_type_from_tag(tag: &[u8]) -> crate::protocol::Result<VideoType> {
     }
 }
 
+/// Where the next BcMedia unit could start after `buf` stopped making
+/// sense at offset 0: the first later offset holding a known unit magic,
+/// or, if there is none yet, how much can be dropped while keeping the last
+/// three bytes (a magic may be split across chunks). Used when a stream
+/// switch leaves the tail of the previous stream in front of the new one.
+pub fn resync_offset(buf: &[u8]) -> usize {
+    let known = |m: u32| {
+        matches!(
+            m,
+            MAGIC_HEADER_BCMEDIA_INFO_V1
+                | MAGIC_HEADER_BCMEDIA_INFO_V2
+                | MAGIC_HEADER_BCMEDIA_IFRAME..=MAGIC_HEADER_BCMEDIA_IFRAME_LAST
+                | MAGIC_HEADER_BCMEDIA_PFRAME..=MAGIC_HEADER_BCMEDIA_PFRAME_LAST
+                | MAGIC_HEADER_BCMEDIA_AAC
+        )
+    };
+    (1..buf.len().saturating_sub(3))
+        .find(|&i| known(u32::from_le_bytes(buf[i..i + 4].try_into().unwrap())))
+        .unwrap_or_else(|| buf.len().saturating_sub(3))
+}
+
 /// Parses exactly one BcMedia unit from the start of `buf`. Returns
 /// `Ok(None)` if `buf` doesn't yet contain a complete unit.
 pub fn parse_one(buf: &[u8]) -> crate::protocol::Result<Option<(BcMediaMessage, usize)>> {
@@ -123,6 +144,17 @@ pub fn parse_one(buf: &[u8]) -> crate::protocol::Result<Option<(BcMediaMessage, 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resync_skips_garbage_up_to_the_next_known_unit() {
+        let mut buf = vec![0xd9, 0xba, 0x80, 0x5f, 1, 2, 3];
+        buf.extend_from_slice(&super::MAGIC_HEADER_BCMEDIA_PFRAME.to_le_bytes());
+        buf.extend_from_slice(&[0; 8]);
+        assert_eq!(super::resync_offset(&buf), 7);
+        // Nothing recognisable yet: keep the last three bytes for later.
+        assert_eq!(super::resync_offset(&[9u8; 10]), 7);
+        assert_eq!(super::resync_offset(&[9u8; 2]), 0);
+    }
+
     use super::*;
 
     fn info_v1_bytes(width: u32, height: u32) -> Vec<u8> {
