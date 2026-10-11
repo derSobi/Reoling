@@ -24,7 +24,7 @@ More on <https://reoling.eu>.
 
 ## Status
 
-Version **0.1.23**, early development. Login and live video work end to end
+Version **0.1.24**, early development. Login and live video work end to end
 against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
 only: Reoling races the device's local, NAT-mapped and relay addresses at
 the same time and uses whichever answers first, as the official client does.
@@ -100,6 +100,8 @@ the same time and uses whichever answers first, as the official client does.
 
 **Version history**
 
+- 0.1.24 — Camera settings: a malformed encoding reply from a device can no
+  longer crash the app, and an implausible I-frame range is not offered.
 - 0.1.23 — Camera settings: the camera's picture, model and firmware, and
   its encoding per stream (resolution, frame rate, bitrate, I-frame
   interval), changeable within the values the camera allows — for example

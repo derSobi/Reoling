@@ -85,8 +85,7 @@ impl Encoding {
 
     /// Parses a 56 reply body. `None` without a `<Compression>` element.
     pub fn parse(xml: &str) -> Option<Encoding> {
-        let start = xml.find("<Compression")?;
-        let end = xml.find("</Compression>")? + "</Compression>".len();
+        let (start, end) = element_span(xml, "Compression")?;
         let raw = xml[start..end].to_string();
         let channel_id = number(&raw, "channelId").unwrap_or(0) as u8;
         let stream = |tag: &str| element(&raw, tag).map(parse_stream);
@@ -238,6 +237,8 @@ fn element_span(xml: &str, tag: &str) -> Option<(usize, usize)> {
         // Not a longer tag that merely starts the same way.
         let next = xml[start + open.len()..].chars().next()?;
         if next == '>' || next == ' ' || next == '/' {
+            // The closing tag is looked for after the opening one only, so
+            // the span can never run backwards on malformed input.
             let end = start + xml[start..].find(&close)? + close.len();
             return Some((start, end));
         }
@@ -263,7 +264,8 @@ fn text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     let block = element(xml, tag)?;
     let inner_start = block.find('>')? + 1;
     let inner_end = block.rfind("</")?;
-    Some(block[inner_start..inner_end].trim())
+    // `<tag/>…</tag>` and similar malformed input: nothing to read.
+    (inner_start <= inner_end).then(|| block[inner_start..inner_end].trim())
 }
 
 fn number(xml: &str, tag: &str) -> Option<u32> {
@@ -279,6 +281,9 @@ fn replace_value(xml: &str, tag: &str, value: &str) -> String {
     let Some(gt) = block.find('>') else {
         return xml.to_string();
     };
+    if gt + 1 > block.len() - (tag.len() + 3) {
+        return xml.to_string(); // self-closing or malformed: leave it be
+    }
     format!("{}{}{}</{tag}>{}", &xml[..s], &block[..=gt], value, &xml[e..])
 }
 
@@ -291,6 +296,22 @@ mod tests {
     const COMPRESSION: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<Compression version=\"1.1\">\n<channelId>11</channelId>\n<isNoTranslateFrame>1</isNoTranslateFrame>\n<mainStream>\n<audio>1</audio>\n<resolutionName>3840*2160</resolutionName>\n<width>3840</width>\n<height>2160</height>\n<encoderType>vbr</encoderType>\n<frame>25</frame>\n<bitRate>6144</bitRate>\n<encoderProfile>high</encoderProfile>\n<videoEncType>1</videoEncType>\n<gop>\n<cur>2</cur>\n<max>2</max>\n<min>1</min>\n</gop>\n</mainStream>\n<subStream>\n<audio>1</audio>\n<resolutionName>640*360</resolutionName>\n<width>640</width>\n<height>360</height>\n<encoderType>vbr</encoderType>\n<frame>10</frame>\n<bitRate>256</bitRate>\n<encoderProfile>high</encoderProfile>\n<videoEncType>0</videoEncType>\n<gop>\n<cur>4</cur>\n<max>4</max>\n<min>1</min>\n</gop>\n</subStream>\n<thirdStream>\n<audio>1</audio>\n<resolutionName>896*512</resolutionName>\n<width>896</width>\n<height>512</height>\n<encoderType>vbr</encoderType>\n<frame>20</frame>\n<bitRate>1228</bitRate>\n<encoderProfile>high</encoderProfile>\n<videoEncType>0</videoEncType>\n<gop>\n<cur>0</cur>\n<max>0</max>\n<min>0</min>\n</gop>\n</thirdStream>\n</Compression>\n</body>\n";
 
     const LOGIN_LIST: &str = "<body><DeviceInfo version=\"1.1\"><type>nvr</type></DeviceInfo><StreamInfoList version=\"1.1\"><StreamInfo><channelBits>511</channelBits><encodeTable><type>mainStream</type><resolution><width>4512</width><height>2512</height></resolution><videoEncType>1</videoEncType><defaultFramerate>20</defaultFramerate><defaultBitrate>8192</defaultBitrate><defaultGop>2</defaultGop><framerateTable>20,18,16,15,12,10,8,6,4,2</framerateTable><bitrateTable>3072,4096</bitrateTable></encodeTable></StreamInfo><StreamInfo><channelBits>7680</channelBits><encodeTable><type>mainStream</type><resolution><width>3840</width><height>2160</height></resolution><videoEncType>0</videoEncType><defaultFramerate>25</defaultFramerate><defaultBitrate>6144</defaultBitrate><defaultGop>2</defaultGop><framerateTable>25,22,20,18,16,15,12,10,8,6,4,2</framerateTable><bitrateTable>4096,5120,6144,7168,8192</bitrateTable></encodeTable><encodeTable><type>subStream</type><resolution><width>640</width><height>360</height></resolution><videoEncType>0</videoEncType><defaultFramerate>10</defaultFramerate><defaultBitrate>256</defaultBitrate><defaultGop>4</defaultGop><framerateTable>15,10,7,4</framerateTable><bitrateTable>64,128,160,192,256,384,512</bitrateTable></encodeTable></StreamInfo></StreamInfoList></body>";
+
+    #[test]
+    fn malformed_replies_never_panic() {
+        for bad in [
+            "</Compression><Compression>",
+            "<Compression><subStream/></subStream></Compression>",
+            "<Compression><frame/>x</frame></Compression>",
+            "<StreamInfoList><StreamInfo><channelBits/></channelBits></StreamInfo></StreamInfoList>",
+            "<Compression><gop><cur>4294967295</cur><min>0</min><max>4294967295</max></gop></Compression>",
+        ] {
+            if let Some(e) = Encoding::parse(bad) {
+                let _ = e.with_changes(EncodedStream::Sub, &StreamEncoding::default());
+            }
+            let _ = EncodeProfile::parse_list(bad);
+        }
+    }
 
     #[test]
     fn parses_the_current_settings() {

@@ -353,7 +353,9 @@ impl CameraSettings {
         let mut bitrates = table.map(|t| t.bitrates.clone()).unwrap_or_default();
         let bitrate_at = position(&mut bitrates, current.bitrate);
         let (mut gops, gop_at) = match current.gop {
-            Some(g) if g.max >= g.min && g.min > 0 => {
+            // A sane interval range is a handful of seconds; anything
+            // else from the device is not offered (and never allocated).
+            Some(g) if g.max >= g.min && g.min > 0 && g.max - g.min <= 30 => {
                 let mut v: Vec<u32> = (g.min..=g.max).collect();
                 let at = position(&mut v, g.current);
                 (v, at)
