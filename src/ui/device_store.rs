@@ -22,6 +22,10 @@ pub struct Device {
     pub abilities: std::collections::HashMap<u8, reoling::ChannelAbilities>,
     /// The watched channel's saved presets, as the device last reported them.
     pub presets: Vec<reoling::PtzPreset>,
+    /// The device's own model string, as it reported it this run.
+    pub model: String,
+    /// The encoder values the device allows, from its login reply this run.
+    pub encode_profiles: Vec<reoling::encoding::EncodeProfile>,
 }
 
 impl Device {
@@ -42,6 +46,8 @@ impl Device {
             channels: Vec::new(),
             abilities: Default::default(),
             presets: Vec::new(),
+            model: String::new(),
+            encode_profiles: Vec::new(),
         }
     }
 }
@@ -83,6 +89,8 @@ pub fn load() -> (Vec<Device>, Option<String>) {
             channels: Vec::new(),
             abilities: Default::default(),
             presets: Vec::new(),
+            model: String::new(),
+            encode_profiles: Vec::new(),
         });
     }
     (devices, last)

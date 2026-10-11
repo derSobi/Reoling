@@ -2,10 +2,12 @@
 //! and the GStreamer video view.
 pub mod audio;
 pub mod bridge;
+pub mod camera_settings;
 pub mod device_store;
 pub mod dialogs;
 pub mod icon;
 pub mod main_window;
+pub mod product_image;
 pub mod remote;
 pub mod secrets;
 pub mod settings;

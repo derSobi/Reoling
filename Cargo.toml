@@ -1,6 +1,6 @@
 [package]
 name = "reoling"
-version = "0.1.22"
+version = "0.1.23"
 edition = "2021"
 rust-version = "1.75"
 license = "AGPL-3.0-or-later"
@@ -42,6 +42,9 @@ async-channel = "2"
 gstreamer = "0.23"
 gstreamer-app = "0.23"
 oo7 = { version = "0.3.3", default-features = false, features = ["tokio", "native_crypto"] }
+# Product pictures from Reolink's CDN (plain HTTPS GET, rustls: no system
+# TLS library needed).
+ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }

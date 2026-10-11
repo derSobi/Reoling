@@ -15,6 +15,7 @@ pub mod client;
 pub mod media_trace;
 pub mod media_guard;
 pub mod talk;
+pub mod encoding;
 
 pub use protocol::{login_refusal_reason, Error, Result};
 pub use client::{looks_multi_channel, ChannelAbilities, ChannelInfo, DeviceIdentity, DeviceUpdate, DeviceInfoSummary, MonitorPoint, PtzPreset, ReolinkClient, StreamProfile, VideoFrame, VideoType};
