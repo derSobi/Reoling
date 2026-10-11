@@ -267,9 +267,13 @@ impl ChannelInfoList {
 /// name the owner gave it and its model.
 #[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct VersionInfo {
+    #[serde(rename = "channelId")]
+    pub channel_id: Option<u8>,
     pub name: Option<String>,
     #[serde(rename = "type")]
     pub model: Option<String>,
+    #[serde(rename = "firmwareVersion")]
+    pub firmware_version: Option<String>,
 }
 
 impl BcXml {

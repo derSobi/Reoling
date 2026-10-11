@@ -131,3 +131,14 @@ mod tests {
         assert!(has_payload_offset(0x0000)); // most modern messages
     }
 }
+
+/// A channel's encoder settings: read (56) and written (57) as `Compression`.
+pub const MSG_ID_GET_COMPRESSION: u32 = 56;
+pub const MSG_ID_SET_COMPRESSION: u32 = 57;
+/// The encoder values one channel allows (a `StreamInfoList`), for channels
+/// the login reply's list doesn't cover. A Home Hub answers it; an NVR,
+/// whose login list covers every channel, refuses it (405).
+pub const MSG_ID_CHANNEL_ENCODE_TABLE: u32 = 730;
+/// The version info of the camera on one channel of an NVR or Home Hub:
+/// its name, model (`type`) and firmware.
+pub const MSG_ID_CHANNEL_VERSION: u32 = 318;

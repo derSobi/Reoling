@@ -90,6 +90,13 @@ pub enum DeviceUpdate {
     Snapshot { channel_id: u8, preset_id: u8, jpeg: Vec<u8> },
     /// The device's answer to a control command (siren, spotlight).
     ControlReply { msg_id: u32, code: u16 },
+    /// A channel's encoder settings (`None`: the device refused to say).
+    Encoding { channel_id: u8, encoding: Option<crate::encoding::Encoding> },
+    /// The encoder values a channel allows, asked for when the login reply's
+    /// list didn't cover it (empty: the device has none to give).
+    EncodeProfiles { channel_id: u8, profiles: Vec<crate::encoding::EncodeProfile> },
+    /// What camera sits on a channel: its own name, model and firmware.
+    ChannelVersion { channel_id: u8, name: Option<String>, model: Option<String>, firmware: Option<String> },
 }
 
 /// What the device says it is, as reported after login.
@@ -172,6 +179,8 @@ pub struct ReolinkClient {
     /// the video task's own read loop (a `'static` spawned task with no
     /// `&mut self`) can share it too.
     pending_images: Arc<std::sync::Mutex<HashMap<u16, ImageKind>>>,
+    /// The encoder values the device allows, from its login reply.
+    encode_profiles: Vec<crate::encoding::EncodeProfile>,
 }
 
 /// What a `MSG_ID_IMAGE_FILE` request (see its own doc comment) was asking
@@ -305,6 +314,42 @@ fn spotlight_xml(channel_id: u8, on: bool) -> Vec<u8> {
 /// each in-flight download answers — shared (not loop-local, unlike
 /// `image_chunks`) because the request that populates it can be sent from a
 /// completely different task than the one that ends up reading the reply.
+/// Replies to the encoder and channel-version requests (56, 730, 318).
+fn encoding_update(bc: &Bc) -> Option<DeviceUpdate> {
+    let id = bc.meta.msg_id;
+    if id != MSG_ID_GET_COMPRESSION && id != MSG_ID_CHANNEL_ENCODE_TABLE && id != MSG_ID_CHANNEL_VERSION {
+        return None;
+    }
+    let channel_id = bc.meta.channel_id;
+    // 300 is how these devices answer a complete list; 200 otherwise.
+    let ok = bc.meta.response_code == 200 || bc.meta.response_code == 300;
+    let body = match &bc.body {
+        BcBody::Modern(ModernMsg { payload: Some(p), .. }) if ok => String::from_utf8_lossy(p).into_owned(),
+        _ => String::new(),
+    };
+    if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
+        eprintln!("DEBUG encoding reply: msg={id} channel={channel_id} code={} bytes={}", bc.meta.response_code, body.len());
+    }
+    Some(match id {
+        MSG_ID_GET_COMPRESSION => {
+            let encoding = crate::encoding::Encoding::parse(&body);
+            DeviceUpdate::Encoding { channel_id: encoding.as_ref().map_or(channel_id, |e| e.channel_id), encoding }
+        }
+        MSG_ID_CHANNEL_ENCODE_TABLE => {
+            DeviceUpdate::EncodeProfiles { channel_id, profiles: crate::encoding::EncodeProfile::parse_list(&body) }
+        }
+        _ => {
+            let info = BcXml::from_bytes(body.as_bytes()).ok().and_then(|x| x.version_info);
+            DeviceUpdate::ChannelVersion {
+                channel_id: info.as_ref().and_then(|i| i.channel_id).unwrap_or(channel_id),
+                name: info.as_ref().and_then(|i| i.name.clone()),
+                model: info.as_ref().and_then(|i| i.model.clone()),
+                firmware: info.and_then(|i| i.firmware_version),
+            }
+        }
+    })
+}
+
 fn pushed_update(
     bc: &Bc,
     image_chunks: &mut HashMap<u16, Vec<u8>>,
@@ -365,8 +410,15 @@ fn pushed_update(
             _ => Some(DeviceUpdate::MonitorPointImage { channel_id: bc.meta.channel_id, jpeg }),
         };
     }
+    if let Some(update) = encoding_update(bc) {
+        return Some(update);
+    }
+    if bc.meta.msg_id == MSG_ID_SET_COMPRESSION && std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
+        eprintln!("DEBUG encoding write reply: channel={} code={}", bc.meta.channel_id, bc.meta.response_code);
+    }
     if bc.meta.msg_id == MSG_ID_PLAY_SIREN
         || bc.meta.msg_id == MSG_ID_SPOTLIGHT
+        || bc.meta.msg_id == MSG_ID_SET_COMPRESSION
         || bc.meta.msg_id == MSG_ID_PTZ
         || bc.meta.msg_id == MSG_ID_PTZ_PRESET
         || bc.meta.msg_id == MSG_ID_SET_ZOOM_FOCUS
@@ -564,6 +616,7 @@ impl ReolinkClient {
             audio_tx,
             audio_rx: Some(audio_rx),
             pending_images: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            encode_profiles: Vec::new(),
         }
     }
 
@@ -716,6 +769,11 @@ impl ReolinkClient {
         let BcBody::Modern(ModernMsg { payload: Some(payload), .. }) = reply.body else {
             return Err(Error::ProtocolError("expected a DeviceInfo reply".to_string()));
         };
+        if std::env::var("REOLING_PROBE_PUSH").is_ok() {
+            let text: String = String::from_utf8_lossy(&payload).chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+            eprintln!("PROBE login reply: {text}");
+        }
+        self.encode_profiles = crate::encoding::EncodeProfile::parse_list(&String::from_utf8_lossy(&payload));
         let device_info = BcXml::from_bytes(&payload)?.device_info.unwrap_or_default();
         Ok(DeviceInfoSummary {
             resolution_name: device_info.resolution.and_then(|r| r.name),
@@ -1171,14 +1229,32 @@ impl ReolinkClient {
         }
         // What each channel can do (58, per channel) is what decides which
         // camera controls to offer; shown here to see how the devices word it.
-        for channel_id in 0..3u8 {
+        // `REOLING_PROBE_PUSH=0,11` probes those channels; empty probes 0-2.
+        let channels: Vec<u8> = std::env::var("REOLING_PROBE_PUSH")
+            .ok()
+            .map(|v| v.split(',').filter_map(|c| c.trim().parse().ok()).collect::<Vec<u8>>())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| vec![0, 1, 2]);
+        for channel_id in channels {
             self.request_for_channel(MSG_ID_ABILITY_SUPPORT, channel_id).await;
             // The per-channel requests the official app makes at start (talk
             // ability, channel type, and others): which of the answers says
-            // what each camera can do is what this looks for.
-            for msg_id in [10u32, 318, 299, 56, 199] {
+            // what each camera can do is what this looks for. 56 is the
+            // encoder configuration, 730 its per-channel allowed values.
+            for msg_id in [10u32, 299, 56, 730, 199] {
                 self.request_for_channel(msg_id, channel_id).await;
             }
+            // The per-channel version info (the camera model on an NVR or
+            // Hub channel) is asked for with the channel type too.
+            let msg_num = self.next_msg_num();
+            let request = Bc {
+                meta: BcMeta { msg_id: 318, channel_id, stream_type: 0, msg_num, response_code: 0, class: 0x6414 },
+                body: BcBody::Modern(ModernMsg {
+                    extension_xml: Some(monitor_point_read_extension(channel_id)),
+                    payload: None,
+                }),
+            };
+            let _ = self.connection.lock().await.send_bc(&request, &self.encryption).await;
         }
         for msg_id in [192u32, 146] {
             let msg_num = self.next_msg_num();
@@ -1220,7 +1296,7 @@ impl ReolinkClient {
                 }
             }
         };
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), listen).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(8), listen).await;
     }
 
     /// Diagnostic-only, not used by `login`: sends only the modern
@@ -1275,6 +1351,11 @@ impl ReolinkClient {
         let BcBody::Modern(ModernMsg { payload: Some(payload), .. }) = reply.body else {
             return Err(Error::ProtocolError("expected a DeviceInfo reply".to_string()));
         };
+        if std::env::var("REOLING_PROBE_PUSH").is_ok() {
+            let text: String = String::from_utf8_lossy(&payload).chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+            eprintln!("PROBE login reply: {text}");
+        }
+        self.encode_profiles = crate::encoding::EncodeProfile::parse_list(&String::from_utf8_lossy(&payload));
         let device_info = BcXml::from_bytes(&payload)?.device_info.unwrap_or_default();
         Ok(DeviceInfoSummary {
             resolution_name: device_info.resolution.and_then(|r| r.name),
@@ -1516,6 +1597,46 @@ impl ReolinkClient {
         for &channel_id in channel_ids {
             self.request_for_channel(MSG_ID_OSD, channel_id).await;
         }
+    }
+
+    /// The encoder values the device allows, from its login reply.
+    pub fn encode_profiles(&self) -> Vec<crate::encoding::EncodeProfile> {
+        self.encode_profiles.clone()
+    }
+
+    /// Asks for a channel's encoder settings (`DeviceUpdate::Encoding`).
+    pub async fn query_encoding(&mut self, channel_id: u8) {
+        self.request_for_channel(MSG_ID_GET_COMPRESSION, channel_id).await;
+    }
+
+    /// Asks for the encoder values one channel allows
+    /// (`DeviceUpdate::EncodeProfiles`), for when the login list has none.
+    pub async fn query_encode_profiles(&mut self, channel_id: u8) {
+        self.request_for_channel(MSG_ID_CHANNEL_ENCODE_TABLE, channel_id).await;
+    }
+
+    /// Asks which camera sits on a channel (`DeviceUpdate::ChannelVersion`).
+    /// Like the Monitor Point read, this request names the channel type too.
+    pub async fn query_channel_version(&mut self, channel_id: u8) {
+        let msg_num = self.next_msg_num();
+        let request = Bc {
+            meta: BcMeta { msg_id: MSG_ID_CHANNEL_VERSION, channel_id, stream_type: 0, msg_num, response_code: 0, class: 0x6414 },
+            body: BcBody::Modern(ModernMsg {
+                extension_xml: Some(monitor_point_read_extension(channel_id)),
+                payload: None,
+            }),
+        };
+        let _ = self.connection.lock().await.send_bc(&request, &self.encryption).await;
+    }
+
+    /// Writes a channel's encoder settings: `body` is a 56 reply with the
+    /// changes applied (`Encoding::with_changes`). The answer arrives as a
+    /// `DeviceUpdate::ControlReply` for 57.
+    pub async fn set_encoding(&mut self, channel_id: u8, body: String) -> crate::Result<()> {
+        if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
+            eprintln!("DEBUG encoding write: channel={channel_id} body={}", body.replace('\n', " "));
+        }
+        self.send_control(MSG_ID_SET_COMPRESSION, channel_id, body.into_bytes()).await
     }
 
     /// An empty request about one channel (the channel travels in the

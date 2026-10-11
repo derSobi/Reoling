@@ -7,6 +7,7 @@ use crate::ui::sidebar::{Handlers, Sidebar, Status};
 use crate::ui::video_view::VideoView;
 use crate::ui::audio::{AudioOutput, Microphone};
 use crate::ui::remote::{self, RemoteControl};
+use crate::ui::camera_settings::{self, CameraSettings};
 use crate::ui::settings::Settings;
 use crate::ui::{dialogs, secrets};
 use gtk4::prelude::*;
@@ -64,6 +65,8 @@ pub struct MainWindow {
     spotlight: ToggleButton,
     ptz: Button,
     remote: Rc<RemoteControl>,
+    camera_settings_button: Button,
+    camera_settings: Rc<CameraSettings>,
     talk: ToggleButton,
     updating_talk: Cell<bool>,
     /// A talk was asked for and the camera has not answered yet.
@@ -399,10 +402,41 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
                 }
             }),
         });
+        // The camera's own settings (encoding…) open in a window of their own.
+        let camera_settings_button = Button::from_icon_name(icon_of(&["emblem-system-symbolic", "preferences-system-symbolic"]));
+        camera_settings_button.set_tooltip_text(Some("Camera settings"));
+        camera_settings_button.set_sensitive(false);
+        let w = weak.clone();
+        camera_settings_button.connect_clicked(move |_| {
+            if let Some(m) = w.upgrade() {
+                m.open_camera_settings();
+            }
+        });
+        let (w_reload, w_save) = (weak.clone(), weak.clone());
+        let camera_settings = CameraSettings::new(camera_settings::Handlers {
+            on_reload: Box::new(move |_channel| {
+                if let Some(m) = w_reload.upgrade() {
+                    let needs_profiles = m.camera_settings.needs_profiles();
+                    m.control(move |link, channel| {
+                        link.query_encoding(channel);
+                        link.query_channel_version(channel);
+                        if needs_profiles {
+                            link.query_encode_profiles(channel);
+                        }
+                    });
+                }
+            }),
+            on_save: Box::new(move |_channel, body| {
+                if let Some(m) = w_save.upgrade() {
+                    m.control(move |link, channel| link.set_encoding(channel, body.clone()));
+                }
+            }),
+        });
         controls.append(&talk);
         controls.append(&siren);
         controls.append(&spotlight);
         controls.append(&ptz);
+        controls.append(&camera_settings_button);
         let spacer = GtkBox::new(Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         controls.append(&spacer);
@@ -635,6 +669,8 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             spotlight,
             ptz,
             remote,
+            camera_settings_button,
+            camera_settings,
             talk,
             updating_talk: Cell::new(false),
             talk_pending: Cell::new(false),
@@ -907,6 +943,26 @@ impl MainWindow {
         if let Some(l) = self.links.borrow().get(&key) {
             send(&l.link, device.channel);
         }
+    }
+
+    fn open_camera_settings(&self) {
+        let Some(key) = self.playing_key() else { return };
+        let Some(device) = self.device(&key) else { return };
+        let channel_name = device
+            .channels
+            .iter()
+            .find(|c| c.channel_id == device.channel)
+            .map(|c| c.name.clone())
+            .filter(|n| !n.is_empty());
+        let title = match (device.multi_channel, channel_name) {
+            (true, Some(name)) => format!("{name} — {}", device.name),
+            (true, None) => format!("Channel {} — {}", device.channel + 1, device.name),
+            (false, _) => device.name.clone(),
+        };
+        // A single camera is its own model; behind an NVR or Hub the
+        // channel's camera says which model it is (asked for on open).
+        let model = if device.multi_channel { String::new() } else { device.model.clone() };
+        self.camera_settings.open(&title, device.channel, &model, &device.encode_profiles);
     }
 
     fn open_remote(&self) {
@@ -1267,6 +1323,7 @@ impl MainWindow {
         }
         self.talk.set_tooltip_text(Some(if can_talk { "Talk" } else { "This camera has no two-way audio" }));
         self.ptz.set_sensitive(self.streaming.get() && has_ptz);
+        self.camera_settings_button.set_sensitive(self.streaming.get());
         let (move_ok, zoom_ok) = abilities.map_or((false, false), |a| (a.pan || a.tilt, a.zoom));
         let (calibration_ok, monitor_point_ok) = abilities.map_or((false, false), |a| (a.calibration, a.monitor_point));
         let streaming = self.streaming.get();
@@ -1447,6 +1504,45 @@ impl MainWindow {
                     self.sidebar.set_channels(key, &d.channels, d.channel);
                 }
             }
+            DeviceEvent::ControlReply { msg_id: 57, code } => {
+                self.camera_settings.saved(code);
+                if code == 200 && self.playing_key().as_deref() == Some(key) {
+                    // The camera restarts its encoder with the new settings
+                    // (resolution or codec may have changed): rebuild the
+                    // picture from a fresh stream once it has.
+                    let weak = Rc::downgrade(self);
+                    let key = key.to_string();
+                    glib::timeout_add_local_once(Duration::from_secs(2), move || {
+                        if let Some(m) = weak.upgrade() {
+                            if m.playing_key().as_deref() == Some(key.as_str()) {
+                                m.play(&key);
+                            }
+                        }
+                    });
+                }
+            }
+            DeviceEvent::EncodeProfiles(profiles) => {
+                if let Some(d) = self.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
+                    d.encode_profiles = profiles;
+                }
+            }
+            DeviceEvent::Encoding { channel_id, encoding } => {
+                if self.playing_key().as_deref() == Some(key) && self.camera_settings.is_open_for(channel_id) {
+                    self.camera_settings.set_encoding(encoding);
+                }
+            }
+            DeviceEvent::ChannelEncodeProfiles { channel_id, profiles } => {
+                if self.playing_key().as_deref() == Some(key) && self.camera_settings.is_open_for(channel_id) && !profiles.is_empty() {
+                    self.camera_settings.set_channel_profiles(profiles);
+                }
+            }
+            DeviceEvent::ChannelVersion { channel_id, model, firmware } => {
+                if self.playing_key().as_deref() == Some(key) && self.camera_settings.is_open_for(channel_id) {
+                    if let Some(model) = model.filter(|m| !m.trim().is_empty()) {
+                        self.camera_settings.set_model(model.trim(), firmware.as_deref());
+                    }
+                }
+            }
             DeviceEvent::ControlReply { msg_id, code } => {
                 let ok = code == 200;
                 match msg_id {
@@ -1559,6 +1655,7 @@ impl MainWindow {
             }
             DeviceEvent::ControlFailed(reason) => {
                 self.notify(&format!("Command not sent: {reason}"));
+                self.camera_settings.failed(&format!("Not sent: {reason}"));
             }
             DeviceEvent::Playing => {
                 if self.playing_key().as_deref() == Some(key) {
@@ -1613,6 +1710,9 @@ impl MainWindow {
         let (name, model) = (text(&identity.name), text(&identity.model));
         let multi = looks_multi_channel(&name, &model);
         if let Some(d) = self.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
+            if !model.is_empty() {
+                d.model = model.clone();
+            }
             if !name.is_empty() {
                 d.name = name.clone();
             }

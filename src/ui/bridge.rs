@@ -35,6 +35,14 @@ pub enum DeviceEvent {
     /// The requested stream could not be started or broke off. The device
     /// itself is still connected.
     PlayFailed(String),
+    /// The encoder values the device allows (from its login reply).
+    EncodeProfiles(Vec<reoling::encoding::EncodeProfile>),
+    /// A channel's encoder settings (`None`: the device refused to say).
+    Encoding { channel_id: u8, encoding: Option<reoling::encoding::Encoding> },
+    /// The encoder values one channel allows, asked for separately.
+    ChannelEncodeProfiles { channel_id: u8, profiles: Vec<reoling::encoding::EncodeProfile> },
+    /// The camera on a channel: its name, model and firmware.
+    ChannelVersion { channel_id: u8, model: Option<String>, firmware: Option<String> },
     /// The device refused the login.
     LoginRejected,
     /// The device could not be reached, or the connection
@@ -68,6 +76,10 @@ enum Command {
     SetMonitorPointConfig { channel: u8, enabled: bool, timeout_seconds: u32 },
     SetMonitorPointHere { channel: u8, enabled: bool, timeout_seconds: u32 },
     GoToMonitorPoint { channel: u8, timeout_seconds: u32 },
+    QueryEncoding { channel: u8 },
+    QueryEncodeProfiles { channel: u8 },
+    QueryChannelVersion { channel: u8 },
+    SetEncoding { channel: u8, body: String },
     Stop,
     Shutdown,
 }
@@ -80,6 +92,28 @@ pub struct DeviceLink {
 }
 
 impl DeviceLink {
+    /// Asks for a channel's encoder settings (answered as `Encoding`).
+    pub fn query_encoding(&self, channel: u8) {
+        let _ = self.commands.send(Command::QueryEncoding { channel });
+    }
+
+    /// Asks for the encoder values one channel allows (answered as
+    /// `ChannelEncodeProfiles`).
+    pub fn query_encode_profiles(&self, channel: u8) {
+        let _ = self.commands.send(Command::QueryEncodeProfiles { channel });
+    }
+
+    /// Asks which camera sits on a channel (answered as `ChannelVersion`).
+    pub fn query_channel_version(&self, channel: u8) {
+        let _ = self.commands.send(Command::QueryChannelVersion { channel });
+    }
+
+    /// Writes a channel's encoder settings (answered as a `ControlReply`
+    /// for message 57).
+    pub fn set_encoding(&self, channel: u8, body: String) {
+        let _ = self.commands.send(Command::SetEncoding { channel, body });
+    }
+
     /// Streams the channel (replacing whatever this device was streaming).
     pub fn play(&self, channel: u8, profile: StreamProfile) {
         let _ = self.commands.send(Command::Play { channel, profile });
@@ -311,6 +345,7 @@ pub fn spawn_device(
                 client.probe_pushes(&username).await;
             }
             let _ = tx.send(DeviceEvent::Connected(identity)).await;
+            let _ = tx.send(DeviceEvent::EncodeProfiles(client.encode_profiles())).await;
 
             let mut frames: Option<tokio_stream::wrappers::ReceiverStream<reoling::Result<VideoFrame>>> =
                 None;
@@ -334,6 +369,14 @@ pub fn spawn_device(
                                 Err(e) => {
                                     let _ = tx.send(DeviceEvent::PlayFailed(e.to_string())).await;
                                 }
+                            }
+                        }
+                        Some(Command::QueryEncoding { channel }) => client.query_encoding(channel).await,
+                        Some(Command::QueryEncodeProfiles { channel }) => client.query_encode_profiles(channel).await,
+                        Some(Command::QueryChannelVersion { channel }) => client.query_channel_version(channel).await,
+                        Some(Command::SetEncoding { channel, body }) => {
+                            if let Err(e) = client.set_encoding(channel, body).await {
+                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
                             }
                         }
                         Some(Command::Siren { channel }) => {
@@ -489,6 +532,15 @@ pub fn spawn_device(
                             }
                             DeviceUpdate::ControlReply { msg_id, code } => {
                                 DeviceEvent::ControlReply { msg_id, code }
+                            }
+                            DeviceUpdate::Encoding { channel_id, encoding } => {
+                                DeviceEvent::Encoding { channel_id, encoding }
+                            }
+                            DeviceUpdate::EncodeProfiles { channel_id, profiles } => {
+                                DeviceEvent::ChannelEncodeProfiles { channel_id, profiles }
+                            }
+                            DeviceUpdate::ChannelVersion { channel_id, model, firmware, .. } => {
+                                DeviceEvent::ChannelVersion { channel_id, model, firmware }
                             }
                         };
                         if tx.send(event).await.is_err() {

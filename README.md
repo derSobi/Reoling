@@ -24,7 +24,7 @@ More on <https://reoling.eu>.
 
 ## Status
 
-Version **0.1.22**, early development. Login and live video work end to end
+Version **0.1.23**, early development. Login and live video work end to end
 against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
 only: Reoling races the device's local, NAT-mapped and relay addresses at
 the same time and uses whichever answers first, as the official client does.
@@ -60,6 +60,14 @@ the same time and uses whichever answers first, as the official client does.
   one at a time (it breaks on overlapping image requests). Calibration
   disables the panel with a spinner while it
   runs — all confirmed working against real hardware.
+- Camera settings (the gear button beside Camera control): the camera's
+  product picture, model and firmware, and its video encoding per stream.
+  Clear (main) and Fluent (sub) can be changed: resolution, frame rate,
+  bitrate and I-frame interval, offered only as the camera itself allows;
+  the live picture restarts with the new settings. Balanced (extern) is
+  shown as it is. Product pictures come from Reolink's own site and are
+  cached; until one loads, or for a model without one, a drawing of the
+  device kind (camera, NVR, Home Hub) stands in.
 - Snapshot (PNG in `~/Pictures/Reoling`) and recording (MKV in
   `~/Videos/Reoling`).
 - Settings ("Client Settings", laid out after the official app's window):
@@ -92,6 +100,10 @@ the same time and uses whichever answers first, as the official client does.
 
 **Version history**
 
+- 0.1.23 — Camera settings: the camera's picture, model and firmware, and
+  its encoding per stream (resolution, frame rate, bitrate, I-frame
+  interval), changeable within the values the camera allows — for example
+  raising the sub stream from 10 to 15 fps.
 - 0.1.22 — live video and camera control:
   - Pan/tilt keeps moving for as long as an arrow is held. A GTK timer used
     to send a stop about 0.4 s into every hold, so the camera moved in
