@@ -1,7 +1,15 @@
+use crate::ui::playback_driver::{PlaybackCommand, PlaybackDriver, PLAYBACK_TICK};
 use crate::ui::video_view::VideoSink;
-use reoling::{ChannelInfo, DeviceIdentity, DeviceUpdate, ReolinkClient, StreamProfile, VideoFrame, VideoType};
+use reoling::{
+    ChannelInfo, CivilTime, DeviceIdentity, DeviceUpdate, RecordStream, ReolinkClient, ReplaySpeed, StreamProfile,
+    VideoFrame, VideoType,
+};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio_stream::StreamExt;
+
+pub use crate::ui::playback_driver::{FileSpan, PlaybackEvent, PlayerPhase, PlayerState};
 
 /// What a device's connection tells the UI.
 pub enum DeviceEvent {
@@ -48,6 +56,8 @@ pub enum DeviceEvent {
     /// The device could not be reached, or the connection
     /// died. Nothing more will come.
     Lost(String),
+    /// Recorded-video playback (never sent for live video).
+    Playback(PlaybackEvent),
 }
 
 enum Command {
@@ -80,6 +90,7 @@ enum Command {
     QueryEncodeProfiles { channel: u8 },
     QueryChannelVersion { channel: u8 },
     SetEncoding { channel: u8, body: String },
+    Playback(PlaybackCommand),
     Stop,
     Shutdown,
 }
@@ -89,6 +100,76 @@ enum Command {
 pub struct DeviceLink {
     pub events: async_channel::Receiver<DeviceEvent>,
     commands: tokio::sync::mpsc::UnboundedSender<Command>,
+    /// Bumped by every playback command except `Month`: lets the device
+    /// thread skip the device work of commands a newer one supersedes (only
+    /// the newest opens anything; every intent is still recorded).
+    playback_gen: Arc<AtomicU64>,
+}
+
+/// Recorded-video playback. Every command first stops live video on the
+/// device; live `play` ends the playback. The answers come as
+/// `DeviceEvent::Playback`. Times are device-local, as the device lists
+/// them.
+impl DeviceLink {
+    fn next_playback_gen(&self) -> u64 {
+        self.playback_gen.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn send_playback(&self, command: PlaybackCommand) {
+        let _ = self.commands.send(Command::Playback(command));
+    }
+
+    /// Asks for the recorded days of a month (answered as `Month`).
+    pub fn playback_month(&self, channel: u8, year: u16, month: u8) {
+        self.send_playback(PlaybackCommand::Month { channel, year, month });
+    }
+
+    /// Starts a session: lists the day's files for `stream` (answered as
+    /// `Day`); nothing plays.
+    pub fn playback_day(&self, session: u64, channel: u8, day: CivilTime, stream: RecordStream) {
+        let gen = self.next_playback_gen();
+        self.send_playback(PlaybackCommand::Day { gen, session, channel, day, stream });
+    }
+
+    /// Plays from `at` (device-local). Returns the command's generation:
+    /// `PlayerState::gen` reaches it once the device thread has taken the
+    /// command up (the same for Play and Pause).
+    pub fn playback_seek(&self, at: CivilTime) -> u64 {
+        let gen = self.next_playback_gen();
+        self.send_playback(PlaybackCommand::Seek { gen, at });
+        gen
+    }
+
+    pub fn playback_play(&self) -> u64 {
+        let gen = self.next_playback_gen();
+        self.send_playback(PlaybackCommand::Play { gen });
+        gen
+    }
+
+    pub fn playback_pause(&self) -> u64 {
+        let gen = self.next_playback_gen();
+        self.send_playback(PlaybackCommand::Pause { gen });
+        gen
+    }
+
+    pub fn playback_speed(&self, speed: ReplaySpeed) {
+        let gen = self.next_playback_gen();
+        self.send_playback(PlaybackCommand::Speed { gen, speed });
+    }
+
+    /// Main or sub stream: other files, so the day is listed again (and a
+    /// `Day` for that stream follows).
+    pub fn playback_stream(&self, stream: RecordStream) {
+        let gen = self.next_playback_gen();
+        self.send_playback(PlaybackCommand::Stream { gen, stream });
+    }
+
+    /// Ends the session: closes the playback on the device, drops the sink,
+    /// gives audio back to live.
+    pub fn playback_close(&self) {
+        let gen = self.next_playback_gen();
+        self.send_playback(PlaybackCommand::Close { gen });
+    }
 }
 
 impl DeviceLink {
@@ -257,6 +338,13 @@ impl Drop for DeviceLink {
 /// comment.
 pub type SinkRequest = (VideoType, tokio::sync::oneshot::Sender<VideoSink>);
 
+/// A device thread's request for a replay `VideoSink`: as `SinkRequest`,
+/// with the playback session whose footage it is for. The window serves only
+/// the Playback page's current session; a request for any other (frames of a
+/// day, device or page left meanwhile) gets no answer, and that frame is
+/// dropped.
+pub type ReplaySinkRequest = (u64, VideoType, tokio::sync::oneshot::Sender<VideoSink>);
+
 /// How the user chose to reach the device — set by the explicit UID/IP
 /// toggle in the connect dialog, never inferred or auto-detected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,16 +376,24 @@ pub enum UidTransport {
 /// this thread asks `main_window`'s responder (via `sink_request_tx`) for a
 /// `VideoSink` once per stream, when the first frame shows its codec, then
 /// pushes every frame itself. The UI only hears `Playing`.
+///
+/// Recorded footage goes the same way to its own view, through
+/// `replay_sink_request_tx`; the playback logic runs here too, in a
+/// `PlaybackDriver`, as the replay sink must be driven from the thread
+/// that pushes its frames.
 pub fn spawn_device(
     target: ConnectTarget,
     username: String,
     password: String,
     uid_transport: UidTransport,
     sink_request_tx: tokio::sync::mpsc::Sender<SinkRequest>,
+    replay_sink_request_tx: tokio::sync::mpsc::Sender<ReplaySinkRequest>,
     audio_out: std::sync::Arc<crate::ui::audio::AudioOutput>,
 ) -> DeviceLink {
     let (tx, rx) = async_channel::unbounded();
     let (commands, mut command_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+    let playback_gen = Arc::new(AtomicU64::new(0));
+    let driver_gen = Arc::clone(&playback_gen);
 
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
@@ -353,11 +449,23 @@ pub fn spawn_device(
             let mut announced = false;
             let mut channel = 0u8;
             let mut asked_names: std::collections::HashSet<u8> = std::collections::HashSet::new();
+            let mut driver = PlaybackDriver::new(driver_gen, replay_sink_request_tx);
+            let mut playback_tick = tokio::time::interval(PLAYBACK_TICK);
+            playback_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
+                // Replay is silent for now: its audio would arrive with the
+                // footage's lead, seconds ahead of the picture.
+                let replay_active = driver.is_active();
                 tokio::select! {
                     command = command_rx.recv() => match command {
                         Some(Command::Play { channel: wanted, profile }) => {
+                            // Live and playback never share the connection.
+                            // Nothing happens here while no playback runs.
+                            driver.end(&mut client).await;
+                            if replay_active {
+                                while audio.try_recv().is_ok() {}
+                            }
                             if frames.take().is_some() {
                                 let _ = client.stop_video(channel).await;
                             }
@@ -483,6 +591,20 @@ pub fn spawn_device(
                         Some(Command::TalkStop { channel }) => {
                             let _ = client.talk_stop(channel).await;
                         }
+                        Some(Command::Playback(command)) => {
+                            // Live and playback never share the connection's
+                            // reader.
+                            if frames.take().is_some() {
+                                let _ = client.stop_video(channel).await;
+                                sink = None;
+                                announced = false;
+                            }
+                            driver.command(command, &mut client, &tx).await;
+                            if replay_active && !driver.is_active() {
+                                // The playback's last audio is not live audio.
+                                while audio.try_recv().is_ok() {}
+                            }
+                        }
                         Some(Command::Stop) => {
                             if frames.take().is_some() {
                                 let _ = client.stop_video(channel).await;
@@ -490,7 +612,11 @@ pub fn spawn_device(
                         }
                         Some(Command::Shutdown) | None => break,
                     },
-                    Some(frame) = audio.recv() => audio_out.push(&frame),
+                    Some(frame) = audio.recv() => {
+                        if !replay_active {
+                            audio_out.push(&frame);
+                        }
+                    }
                     Some(update) = channel_updates.recv() => {
                         let event = match update {
                             DeviceUpdate::Channels(channels) => {
@@ -576,6 +702,13 @@ pub fn spawn_device(
                         }
                         None => frames = None,
                     },
+                    item = async {
+                        match driver.frames() {
+                            Some(f) => f.next().await,
+                            None => std::future::pending().await,
+                        }
+                    } => driver.on_frame(item, &tx).await,
+                    _ = playback_tick.tick(), if replay_active => driver.tick(&mut client, &tx).await,
                     error = client.wait_for_pushes(), if frames.is_none() => {
                         let _ = tx.send(DeviceEvent::Lost(error.to_string())).await;
                         break;
@@ -588,5 +721,5 @@ pub fn spawn_device(
         });
     });
 
-    DeviceLink { events: rx, commands }
+    DeviceLink { events: rx, commands, playback_gen }
 }

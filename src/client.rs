@@ -16,6 +16,12 @@ use tokio_stream::wrappers::ReceiverStream;
 
 pub use crate::protocol::bcmedia::model::{VideoFrame, VideoType};
 
+mod replay;
+pub use replay::{
+    file_for_time, next_file, sort_and_dedup_files, FootageAnchor, RecordingFile, ReplayKeyframe, ReplayProgress,
+    ReplayResume, ReplaySpeed, ReplayStatus, ReplayStream,
+};
+
 #[derive(Debug, Clone, Default)]
 pub struct DeviceInfoSummary {
     pub resolution_name: Option<String>,
@@ -140,6 +146,11 @@ pub struct ChannelInfo {
     pub online: bool,
     /// The streams the channel offers, highest quality first.
     pub streams: Vec<StreamProfile>,
+    /// The camera's UID as the channel list gives it, which the recorded
+    /// video requests name the camera by. `None` when the list has none
+    /// (a stand-alone camera sends no list at all). Never log it: its
+    /// `Debug` is masked and it has no `Display`.
+    pub uid: Option<CameraUid>,
 }
 
 /// Mirrors `transport::discovery`'s established pattern of bounding every
@@ -181,6 +192,15 @@ pub struct ReolinkClient {
     pending_images: Arc<std::sync::Mutex<HashMap<u16, ImageKind>>>,
     /// The encoder values the device allows, from its login reply.
     encode_profiles: Vec<crate::encoding::EncodeProfile>,
+    /// Each channel's camera UID, from the pushed channel list (shared with
+    /// the video tasks, which see that push too). Never logged.
+    channel_uids: Arc<std::sync::Mutex<HashMap<u8, CameraUid>>>,
+    /// The running recorded-video playback, if any (see `replay`).
+    replay: Option<replay::ActiveReplay>,
+    replay_task: Option<tokio::task::JoinHandle<()>>,
+    /// Playbacks opened on this connection, for the sequence numbers.
+    replay_opens: u32,
+    last_replay_seq: Option<u32>,
 }
 
 /// What a `MSG_ID_IMAGE_FILE` request (see its own doc comment) was asking
@@ -350,10 +370,13 @@ fn encoding_update(bc: &Bc) -> Option<DeviceUpdate> {
     })
 }
 
+/// `channel_uids` keeps each channel's camera UID from the pushed channel
+/// list, for the recorded-video requests that name the camera by it.
 fn pushed_update(
     bc: &Bc,
     image_chunks: &mut HashMap<u16, Vec<u8>>,
     pending_images: &std::sync::Mutex<HashMap<u16, ImageKind>>,
+    channel_uids: &std::sync::Mutex<HashMap<u8, CameraUid>>,
 ) -> Option<DeviceUpdate> {
     if bc.meta.msg_id == MSG_ID_IMAGE_FILE || bc.meta.msg_id == MSG_ID_SNAP {
         if bc.meta.response_code == 0xffff {
@@ -486,6 +509,7 @@ fn pushed_update(
     }
     if let Some(list) = xml.channel_info_list {
         let channels = list.into_channels();
+        remember_channel_uids(channel_uids, &channels);
         if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
             eprintln!("DEBUG channel list pushed: {channels:?}");
         }
@@ -498,6 +522,41 @@ fn pushed_update(
         .and_then(|e| e.channel_id)
         .unwrap_or(bc.meta.channel_id);
     Some(DeviceUpdate::ChannelName { channel_id, name })
+}
+
+/// Stores the camera UID of every listed channel, and forgets the one of a
+/// listed channel that no longer has any.
+fn remember_channel_uids(channel_uids: &std::sync::Mutex<HashMap<u8, CameraUid>>, channels: &[ChannelInfo]) {
+    let mut uids = channel_uids.lock().expect("channel_uids mutex poisoned");
+    for channel in channels {
+        match &channel.uid {
+            Some(uid) => {
+                uids.insert(channel.channel_id, uid.clone());
+            }
+            None => {
+                uids.remove(&channel.channel_id);
+            }
+        }
+    }
+}
+
+/// `text` with the contents of every element that can hold a camera or
+/// device UID replaced, for diagnostic output: `<uid>`, `<fakeUid>`, a
+/// recording's `<Id>` and `<fileId>` (a Home Hub's ends with the camera
+/// UID).
+fn redact_identifiers(text: &str) -> String {
+    let mut out = text.to_string();
+    for tag in ["uid", "fakeUid", "UID", "Id", "fileId"] {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let mut from = 0;
+        while let Some(start) = out[from..].find(&open).map(|i| from + i + open.len()) {
+            let Some(len) = out[start..].find(&close) else { break };
+            out.replace_range(start..start + len, "<hidden>");
+            from = start + "<hidden>".len() + close.len();
+        }
+    }
+    out
 }
 
 /// The camera truncates the hex MD5 digest of `input` to 31 characters
@@ -617,7 +676,17 @@ impl ReolinkClient {
             audio_rx: Some(audio_rx),
             pending_images: Arc::new(std::sync::Mutex::new(HashMap::new())),
             encode_profiles: Vec::new(),
+            channel_uids: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            replay: None,
+            replay_task: None,
+            replay_opens: 0,
+            last_replay_seq: None,
         }
+    }
+
+    /// The camera UID the channel list gave for `channel_id`, if any.
+    pub fn channel_uid(&self, channel_id: u8) -> Option<CameraUid> {
+        self.channel_uids.lock().expect("channel_uids mutex poisoned").get(&channel_id).cloned()
     }
 
     /// The audio of the streams, as AAC (ADTS) frames. Can be taken once.
@@ -770,7 +839,7 @@ impl ReolinkClient {
             return Err(Error::ProtocolError("expected a DeviceInfo reply".to_string()));
         };
         if std::env::var("REOLING_PROBE_PUSH").is_ok() {
-            let text: String = String::from_utf8_lossy(&payload).chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+            let text: String = redact_identifiers(&String::from_utf8_lossy(&payload)).chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
             eprintln!("PROBE login reply: {text}");
         }
         self.encode_profiles = crate::encoding::EncodeProfile::parse_list(&String::from_utf8_lossy(&payload));
@@ -1178,7 +1247,7 @@ impl ReolinkClient {
                 else {
                     return;
                 };
-                if let Some(update) = pushed_update(&reply, &mut image_chunks, &self.pending_images) {
+                if let Some(update) = pushed_update(&reply, &mut image_chunks, &self.pending_images, &self.channel_uids) {
                     let _ = self.channel_updates_tx.send(update);
                     continue;
                 }
@@ -1195,6 +1264,14 @@ impl ReolinkClient {
         let (name, model) = info.map(|i| (i.name, i.model)).unwrap_or_default();
         if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
             eprintln!("DEBUG identity reply: name={name:?} model={model:?}");
+        }
+        // Diagnostic-only: a scripted recorded-video session on one channel
+        // (see `probe_replay`). Runs only when the variable is set.
+        if let Some(channel_id) = replay::probe_replay_channel() {
+            // Lines are tagged with the model (never the UID): every device
+            // the app connects to runs the probe, side by side.
+            let tag = model.as_deref().map(str::trim).filter(|m| !m.is_empty()).unwrap_or("device").to_string();
+            self.probe_replay(channel_id, &tag).await;
         }
         DeviceIdentity { name, model }
     }
@@ -1280,7 +1357,7 @@ impl ReolinkClient {
                 };
                 let text = match &bc.body {
                     BcBody::Modern(ModernMsg { payload: Some(p), .. }) => {
-                        let t = String::from_utf8_lossy(p);
+                        let t = redact_identifiers(&String::from_utf8_lossy(p));
                         t.chars().take(30000).map(|c| if c == '\n' { ' ' } else { c }).collect::<String>()
                     }
                     other => format!("{other:?}").chars().take(200).collect(),
@@ -1291,7 +1368,7 @@ impl ReolinkClient {
                 );
                 // Keep the app working while probing: the channel list is
                 // among what arrives here.
-                if let Some(update) = pushed_update(&bc, &mut image_chunks, &self.pending_images) {
+                if let Some(update) = pushed_update(&bc, &mut image_chunks, &self.pending_images, &self.channel_uids) {
                     let _ = self.channel_updates_tx.send(update);
                 }
             }
@@ -1352,7 +1429,7 @@ impl ReolinkClient {
             return Err(Error::ProtocolError("expected a DeviceInfo reply".to_string()));
         };
         if std::env::var("REOLING_PROBE_PUSH").is_ok() {
-            let text: String = String::from_utf8_lossy(&payload).chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+            let text: String = redact_identifiers(&String::from_utf8_lossy(&payload)).chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
             eprintln!("PROBE login reply: {text}");
         }
         self.encode_profiles = crate::encoding::EncodeProfile::parse_list(&String::from_utf8_lossy(&payload));
@@ -1380,6 +1457,12 @@ impl ReolinkClient {
         quality: StreamProfile,
         trace: Option<Arc<crate::media_trace::MediaTrace>>,
     ) -> crate::Result<ReceiverStream<crate::Result<VideoFrame>>> {
+        // Only one reader may consume the connection's data: a playback
+        // still running would swallow the live stream's messages. Its close
+        // is not waited for long (see `LIVE_SWITCH_CLOSE_WAIT`).
+        if self.replay.is_some() || self.replay_task.is_some() {
+            let _ = self.stop_replay_within(replay::LIVE_SWITCH_CLOSE_WAIT).await;
+        }
         let msg_num = self.next_msg_num();
         // handle/stream_type per quality. `Main`'s values (handle 0,
         // BcMeta.stream_type 0, XML streamType "mainStream") come straight
@@ -1444,13 +1527,21 @@ impl ReolinkClient {
             stream_name: stream_type_str,
             bc_stream_type: bc_meta_stream_type,
         });
-        self.connection.lock().await.send_bc(&request, &self.encryption).await?;
+        {
+            let mut connection = self.connection.lock().await;
+            // Live video's own bound on unread data from here on, even right
+            // after a playback (closed above, or earlier by the caller): this
+            // reader never pauses and drops what still trails in from it. A
+            // no-op when no playback ever ran.
+            connection.end_replay_buffering_now();
+            connection.send_bc(&request, &self.encryption).await?;
+        }
         // Pushes (channel lists, alarm events, ...) can come between our
         // request and the answer; they are not the answer.
         let mut image_chunks = HashMap::new();
         let ack = loop {
             let bc = self.connection.lock().await.recv_bc(&self.encryption).await?;
-            if let Some(update) = pushed_update(&bc, &mut image_chunks, &self.pending_images) {
+            if let Some(update) = pushed_update(&bc, &mut image_chunks, &self.pending_images, &self.channel_uids) {
                 let _ = self.channel_updates_tx.send(update);
             } else if bc.meta.msg_id == MSG_ID_VIDEO && bc.meta.msg_num == msg_num {
                 // Same message number as our request: an earlier stream's
@@ -1477,6 +1568,7 @@ impl ReolinkClient {
         let channel_updates = self.channel_updates_tx.clone();
         let audio = self.audio_tx.clone();
         let pending_images = Arc::clone(&self.pending_images);
+        let channel_uids = Arc::clone(&self.channel_uids);
         self.video_task = Some(tokio::spawn(async move {
             let mut buffer: Vec<u8> = Vec::new();
             let mut guard = MediaGuard::default();
@@ -1492,7 +1584,7 @@ impl ReolinkClient {
                         }
                     }
                 };
-                if let Some(update) = pushed_update(&bc, &mut image_chunks, &pending_images) {
+                if let Some(update) = pushed_update(&bc, &mut image_chunks, &pending_images, &channel_uids) {
                     let _ = channel_updates.send(update);
                     continue;
                 }
@@ -1672,12 +1764,17 @@ impl ReolinkClient {
     /// `take_channel_updates`. Returns only when the connection fails.
     /// Cancel-safe: partial messages are kept by the connection.
     pub async fn wait_for_pushes(&mut self) -> crate::Error {
+        // While a playback runs, its reader is the one reading (and passes
+        // the pushes on); reading here as well would take its data.
+        while self.replay_task.as_ref().is_some_and(|t| !t.is_finished()) {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
         let mut image_chunks = HashMap::new();
         loop {
             let received = self.connection.lock().await.recv_bc(&self.encryption).await;
             match received {
                 Ok(bc) => {
-                    if let Some(update) = pushed_update(&bc, &mut image_chunks, &self.pending_images) {
+                    if let Some(update) = pushed_update(&bc, &mut image_chunks, &self.pending_images, &self.channel_uids) {
                         let _ = self.channel_updates_tx.send(update);
                     }
                 }
@@ -1725,6 +1822,10 @@ impl ReolinkClient {
         if let Some(task) = self.video_task.take() {
             task.abort();
         }
+        if let Some(task) = self.replay_task.take() {
+            task.abort();
+        }
+        self.replay = None;
         self.connection.lock().await.disconnect().await;
         let _ = self.logout().await;
     }
@@ -2003,6 +2104,36 @@ mod control_tests {
     fn spotlight_commands_have_the_length_of_the_official_ones() {
         assert_eq!(spotlight_xml(0, true).len(), 177);
         assert_eq!(spotlight_xml(0, false).len(), 177);
+    }
+
+    #[test]
+    fn diagnostic_text_hides_uids_and_recording_ids() {
+        let text = "<ChannelInfo><uid>TESTCAMUID000001</uid><fakeUid>NVRUIDPLACEHOLDR_00</fakeUid></ChannelInfo>\
+                    <FileInfo><name>0120261017092107</name><Id>1-0-01260917062107-00000-TESTCAMUID000001</Id></FileInfo>\
+                    <uid>SECOND0000000002</uid><uid></uid>";
+        let shown = redact_identifiers(text);
+        assert!(!shown.contains("TESTCAMUID") && !shown.contains("NVRUID") && !shown.contains("SECOND"), "{shown}");
+        assert!(shown.contains("<name>0120261017092107</name>"));
+        assert_eq!(shown.matches("<hidden>").count(), 5);
+        // An unterminated element is left alone rather than looping.
+        assert_eq!(redact_identifiers("<uid>abc"), "<uid>abc");
+    }
+
+    #[test]
+    fn channel_uids_follow_the_latest_channel_list() {
+        let uids = std::sync::Mutex::new(HashMap::new());
+        let channel = |channel_id: u8, uid: Option<&str>| ChannelInfo {
+            channel_id,
+            name: String::new(),
+            online: true,
+            streams: vec![StreamProfile::Main],
+            uid: uid.map(CameraUid::new),
+        };
+        remember_channel_uids(&uids, &[channel(0, Some("TESTCAMUID000001")), channel(1, Some("TESTCAMUID000002"))]);
+        remember_channel_uids(&uids, &[channel(1, None)]);
+        let uids = uids.into_inner().unwrap();
+        assert_eq!(uids.get(&0).map(CameraUid::as_str), Some("TESTCAMUID000001"));
+        assert!(!uids.contains_key(&1));
     }
 
     #[test]

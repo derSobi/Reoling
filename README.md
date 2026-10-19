@@ -24,10 +24,11 @@ More on <https://reoling.eu>.
 
 ## Status
 
-Version **0.1.24**, early development. Login and live video work end to end
-against real hardware (a Home Hub, an NVR and their cameras), over UDP/P2P
-only: Reoling races the device's local, NAT-mapped and relay addresses at
-the same time and uses whichever answers first, as the official client does.
+Version **0.1.25**, early development. Login, live video and playback work
+end to end against real hardware (a Home Hub, an NVR and their cameras),
+over UDP/P2P only: Reoling races the device's local, NAT-mapped and relay
+addresses at the same time and uses whichever answers first, as the
+official client does.
 
 **What the app does today**
 
@@ -42,6 +43,15 @@ the same time and uses whichever answers first, as the official client does.
   smoothness over a poor connection.
 - Sound: the stream's audio with a volume control; Talk (microphone to the
   camera, ADPCM).
+- Playback (the tab beside Live View): recorded video per camera of a Home
+  Hub or NVR, or of a camera added on its own, picked in the sidebar. A
+  month calendar marks the days with recordings; the day timeline shows
+  them as bands and seeks with a click or the arrow keys (10 s, 60 s with
+  Shift), zooms with the wheel or `+`/`-` (Home shows the whole day again)
+  and pans with a drag. Play/pause, speeds from 0.25× to 16×, main or sub
+  stream, and playback goes on into the next recording by itself. It runs
+  over the same UDP P2P connection as live video, which pauses while the
+  tab is open and comes back as it was. Playback is silent for now.
 - Camera controls, shown per channel from what the camera reports: siren,
   spotlight, and — in a separate "Camera control" window, independent of the
   main window — pan/tilt (hold a direction to move) and zoom/focus on its
@@ -84,8 +94,8 @@ the same time and uses whichever answers first, as the official client does.
 
 **Not done yet**
 
-- Playback (the tab is a placeholder), Split View, zoom on cameras behind an
-  NVR's sub-channel numbering.
+- Split View, zoom on cameras behind an NVR's sub-channel numbering.
+- Playback: sound, events and downloading recordings.
 - PTZ calibration has no separate "finished" signal from the camera — the
   app only knows the request was accepted, matching what's documented for
   Baichuan generally, not a limitation specific to this capture.
@@ -100,6 +110,12 @@ the same time and uses whichever answers first, as the official client does.
 
 **Version history**
 
+- 0.1.25 — Playback: recorded video per camera of a Home Hub or NVR (or of
+  a camera on its own), over the same UDP P2P connection as live video. A
+  calendar marks the days with recordings; the day timeline seeks, zooms
+  and pans with the mouse or the keyboard; play/pause, speeds from 0.25×
+  to 16×, main or sub stream, and it goes on into the next recording.
+  Playback has no sound yet.
 - 0.1.24 — Camera settings: a malformed encoding reply from a device can no
   longer crash the app, and an implausible I-frame range is not offered.
 - 0.1.23 — Camera settings: the camera's picture, model and firmware, and
@@ -235,10 +251,11 @@ src/
 │                No I/O, no async runtime — a pure, testable codec.
 ├── transport/   P2P/UDP: UID resolution, NAT traversal, relay fallback,
 │                and the reliable BCUDP connection.
-├── client.rs    Client/session API: login and live video.
+├── client.rs    Client/session API: login and live video;
+│                `client/replay.rs`: recordings and playback.
 ├── talk.rs      ADPCM encoding for Talk.
 ├── ui/          GTK4 + GStreamer desktop app (main window, sidebar,
-│                dialogs, settings, video and audio).
+│                dialogs, settings, playback, video and audio).
 └── main.rs      The `reoling` binary.
 examples/        Small diagnostic tools (UID probe, media trace analysis).
 data/            Icons and the desktop entry.

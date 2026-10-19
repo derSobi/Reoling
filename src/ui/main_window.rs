@@ -1,8 +1,11 @@
-//! The application window: a device sidebar next to a live-view page, with a
-//! playback page reserved behind the header's view switcher.
+//! The application window: a device sidebar next to the Live View and
+//! Playback pages, switched in the header. While Playback is shown, live
+//! video is suspended and the sidebar picks the device to play back from;
+//! leaving the page brings live video back as it was.
 
-use crate::ui::bridge::{spawn_device, DeviceEvent, DeviceLink, SinkRequest, UidTransport};
+use crate::ui::bridge::{spawn_device, DeviceEvent, DeviceLink, ReplaySinkRequest, SinkRequest, UidTransport};
 use crate::ui::device_store::{self, Device};
+use crate::ui::playback_page::{self, PlaybackPage, Readiness};
 use crate::ui::sidebar::{Handlers, Sidebar, Status};
 use crate::ui::video_view::VideoView;
 use crate::ui::audio::{AudioOutput, Microphone};
@@ -118,6 +121,17 @@ pub struct MainWindow {
     audio: Arc<AudioOutput>,
     uid_transport: UidTransport,
     sink_request_tx: tokio::sync::mpsc::Sender<SinkRequest>,
+    /// The Playback page's picture: recorded footage only, fed by the device
+    /// threads through `replay_sink_request_tx`.
+    replay_video: Rc<VideoView>,
+    replay_sink_request_tx: tokio::sync::mpsc::Sender<ReplaySinkRequest>,
+    playback: Rc<PlaybackPage>,
+    /// The live stream the Playback page suspended (or the device picked
+    /// while it was shown): started again when the page is left.
+    resume_live: RefCell<Option<String>>,
+    /// Devices whose current connection has sent its channel list (an NVR's
+    /// or Hub's recording requests name the camera it lists).
+    channel_lists: RefCell<HashSet<String>>,
 }
 
 pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
@@ -144,6 +158,11 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             let _ = reply.send(video_for_sink.ensure_sink(video_type));
         }
     });
+
+    // The same for recorded footage, into its own view (answered once the
+    // Playback page exists, below).
+    let replay_video = Rc::new(VideoView::new_replay());
+    let (replay_sink_request_tx, mut replay_sink_request_rx) = tokio::sync::mpsc::channel::<ReplaySinkRequest>(8);
 
     let main = Rc::new_cyclic(|weak: &std::rc::Weak<MainWindow>| {
         let w = weak.clone();
@@ -503,10 +522,38 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         live.append(&bars);
         pages.add_titled(&live, Some("live"), "Live View");
 
-        let playback = Label::new(Some("Playback is not available yet"));
-        playback.add_css_class("title-2");
-        playback.add_css_class("dim-label");
-        pages.add_titled(&playback, Some("playback"), "Playback");
+        // Recorded footage. Commands only go to a connected device's link.
+        let w_link = weak.clone();
+        let playback = PlaybackPage::new(
+            Rc::clone(&replay_video),
+            playback_page::Handlers {
+                with_link: Box::new(move |key, f| {
+                    if let Some(m) = w_link.upgrade() {
+                        if let Some(l) = m.links.borrow().get(key) {
+                            f(&l.link);
+                        }
+                    }
+                }),
+            },
+        );
+        playback.sidebar_toggle().set_icon_name(sidebar_icon());
+        sidebar_toggle
+            .bind_property("active", playback.sidebar_toggle(), "active")
+            .bidirectional()
+            .sync_create()
+            .build();
+        pages.add_titled(playback.widget(), Some("playback"), "Playback");
+        let w = weak.clone();
+        pages.connect_visible_child_name_notify(move |pages| {
+            if let Some(m) = w.upgrade() {
+                let on_playback = pages.visible_child_name().as_deref() == Some("playback");
+                if on_playback && !m.playback.is_shown() {
+                    m.enter_playback();
+                } else if !on_playback && m.playback.is_shown() {
+                    m.leave_playback();
+                }
+            }
+        });
 
         let paned = Paned::new(Orientation::Horizontal);
         paned.set_start_child(Some(sidebar.widget()));
@@ -710,6 +757,27 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             audio: Arc::clone(&audio),
             uid_transport,
             sink_request_tx,
+            replay_video: Rc::clone(&replay_video),
+            replay_sink_request_tx,
+            playback,
+            resume_live: RefCell::new(None),
+            channel_lists: RefCell::new(HashSet::new()),
+        }
+    });
+
+    // Recorded footage gets a pipeline only for the Playback page's current
+    // session, and only while the page is shown: a late frame of a day,
+    // device or page left meanwhile would otherwise show on the new one, or
+    // build a pipeline nobody sees. Such a request goes unanswered and its
+    // frame is dropped. A codec change (sub to main stream) builds a new
+    // pipeline.
+    let weak = Rc::downgrade(&main);
+    glib::spawn_future_local(async move {
+        while let Some((session, video_type, reply)) = replay_sink_request_rx.recv().await {
+            let Some(m) = weak.upgrade() else { break };
+            if m.playback.shows_session(session) {
+                let _ = reply.send(m.replay_video.ensure_sink_for(video_type));
+            }
         }
     });
 
@@ -719,6 +787,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         *main.autoplay.borrow_mut() = last;
     }
     main.video.widget().set_keep_aspect_ratio(!main.settings.borrow().stretch);
+    main.replay_video.widget().set_keep_aspect_ratio(!main.settings.borrow().stretch);
     for device in devices {
         main.sidebar.add_device(&device);
         main.devices.borrow_mut().push(device);
@@ -1357,6 +1426,7 @@ impl MainWindow {
             // The volume slider lives in the main window; keep its value.
             new.volume = this.settings.borrow().volume;
             this.video.widget().set_keep_aspect_ratio(!new.stretch);
+            this.replay_video.widget().set_keep_aspect_ratio(!new.stretch);
             let decoding_changed = {
                 let old = this.settings.borrow();
                 old.decoding != new.decoding
@@ -1406,6 +1476,10 @@ impl MainWindow {
                 }
                 this.links.borrow_mut().remove(&key);
                 this.connected.borrow_mut().remove(&key);
+                this.channel_lists.borrow_mut().remove(&key);
+                // The old connection goes without a word; the Playback page
+                // waits for the new one.
+                this.playback.device_reconnecting(&key);
                 *this.autoplay.borrow_mut() = Some(key.clone());
                 this.connect(&key, true);
             },
@@ -1452,6 +1526,7 @@ impl MainWindow {
                 password,
                 this.uid_transport,
                 this.sink_request_tx.clone(),
+                this.replay_sink_request_tx.clone(),
                 Arc::clone(&this.audio),
             );
             let events = link.events.clone();
@@ -1480,13 +1555,16 @@ impl MainWindow {
                         glib::spawn_future_local(secrets::store(key.to_string(), name, password));
                     }
                 }
+                self.playback.set_readiness(key, self.playback_readiness(key));
                 if self.autoplay.borrow().as_deref() == Some(key) {
                     self.autoplay.borrow_mut().take();
                     self.play(key);
                 }
             }
             DeviceEvent::Channels(channels) => {
+                self.channel_lists.borrow_mut().insert(key.to_string());
                 self.apply_channels(key, channels);
+                self.playback.set_readiness(key, self.playback_readiness(key));
                 if self.playing_key().as_deref() == Some(key) && self.refresh_streams() {
                     self.play(key); // the stream we started is not on offer
                 }
@@ -1676,17 +1754,93 @@ impl MainWindow {
             DeviceEvent::LoginRejected => {
                 self.links.borrow_mut().remove(key);
                 self.connected.borrow_mut().remove(key);
+                self.channel_lists.borrow_mut().remove(key);
                 self.passwords.borrow_mut().remove(key);
                 glib::spawn_future_local(secrets::forget(key.to_string()));
                 self.sidebar.set_status(key, &Status::LoginNeeded("Incorrect password".into()));
                 self.lost_playing(key, "Incorrect password");
+                self.playback.device_lost(key, "Incorrect password");
             }
             DeviceEvent::Lost(reason) => {
                 self.links.borrow_mut().remove(key);
                 self.connected.borrow_mut().remove(key);
+                self.channel_lists.borrow_mut().remove(key);
                 self.sidebar.set_status(key, &Status::Failed(reason.clone()));
                 self.lost_playing(key, &reason);
+                self.playback.device_lost(key, &reason);
             }
+            DeviceEvent::Playback(event) => self.playback.on_event(key, event),
+        }
+    }
+
+    /// Whether the Playback page can ask device `key` for recordings: logged
+    /// in, and for an NVR or Hub, its channel list in on this connection.
+    fn playback_readiness(&self, key: &str) -> Readiness {
+        if !self.connected.borrow().contains(key) {
+            return Readiness::Connecting;
+        }
+        let multi = self.device(key).is_some_and(|d| d.multi_channel);
+        if multi && !self.channel_lists.borrow().contains(key) {
+            return Readiness::Channels;
+        }
+        Readiness::Ready
+    }
+
+    /// Live video makes way for the Playback page: the stream stops, but
+    /// nothing is forgotten (unlike the Stop button), and it is started
+    /// again when the page is left.
+    fn suspend_live(&self) {
+        let Some(key) = self.playing_key() else { return };
+        *self.resume_live.borrow_mut() = Some(key.clone());
+        if let Some(l) = self.links.borrow().get(&key) {
+            l.link.stop();
+        }
+        self.end_talk();
+        // Ends a recording too.
+        self.reset_video();
+        *self.playing.borrow_mut() = None;
+        self.streaming.set(false);
+        self.update_controls();
+    }
+
+    fn enter_playback(self: &Rc<Self>) {
+        self.suspend_live();
+        let key = [
+            self.resume_live.borrow().clone(),
+            self.autoplay.borrow().clone(),
+            self.stopped.borrow().clone(),
+            self.last_played.borrow().clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|k| self.device(k).is_some());
+        let Some(key) = key else {
+            self.playback.enter(None, Readiness::Connecting);
+            return;
+        };
+        let Some(device) = self.device(&key) else { return };
+        self.sidebar.select(&key);
+        self.sidebar.mark_channel(&key, device.channel);
+        self.playback.enter(Some((&key, device.channel)), self.playback_readiness(&key));
+        if !self.connected.borrow().contains(&key) {
+            self.connect(&key, true);
+        }
+    }
+
+    fn leave_playback(self: &Rc<Self>) {
+        // First: clears the page's `shown`, which `play` checks.
+        self.playback.leave();
+        let Some(key) = self.resume_live.borrow_mut().take() else { return };
+        if self.connected.borrow().contains(&key) {
+            self.play(&key);
+        } else if self.links.borrow().contains_key(&key) {
+            // Still logging in: live starts once it has.
+            self.show_message("Starting…");
+            *self.autoplay.borrow_mut() = Some(key);
+        } else {
+            // Gone while the page was shown; a click on it connects again,
+            // as after any lost connection.
+            self.show_message("Select a device");
         }
     }
 
@@ -1752,8 +1906,17 @@ impl MainWindow {
     }
 
     /// A click on a device's card: watch it (connecting first if need be).
+    /// While the Playback page is shown, play back its recordings instead.
     fn activate(self: &Rc<Self>, key: &str) {
-        if self.device(key).is_none() {
+        let Some(device) = self.device(key) else { return };
+        if self.playback.is_shown() {
+            self.sidebar.select(key);
+            self.sidebar.mark_channel(key, device.channel);
+            *self.resume_live.borrow_mut() = Some(key.to_string());
+            self.playback.select(key, device.channel, self.playback_readiness(key));
+            if !self.connected.borrow().contains(key) {
+                self.connect(key, true);
+            }
             return;
         }
         if self.connected.borrow().contains(key) {
@@ -1774,7 +1937,16 @@ impl MainWindow {
     }
 
     /// Streams the device's current channel, stopping whatever else was on.
+    /// While the Playback page is shown, only notes the device for when the
+    /// page is left.
     fn play(self: &Rc<Self>, key: &str) {
+        if self.playback.is_shown() {
+            *self.resume_live.borrow_mut() = Some(key.to_string());
+            if self.playback.device_key().as_deref() == Some(key) {
+                self.sidebar.select(key);
+            }
+            return;
+        }
         let Some(device) = self.device(key) else { return };
         let other = self.playing_key().filter(|k| k != key);
         if let Some(other) = other {
@@ -1862,8 +2034,13 @@ impl MainWindow {
         if self.stopped.borrow().as_deref() == Some(key) {
             *self.stopped.borrow_mut() = None;
         }
+        if self.resume_live.borrow().as_deref() == Some(key) {
+            *self.resume_live.borrow_mut() = None;
+        }
+        self.playback.device_removed(key);
         self.links.borrow_mut().remove(key); // dropping the link disconnects
         self.connected.borrow_mut().remove(key);
+        self.channel_lists.borrow_mut().remove(key);
         self.sidebar.remove_device(key);
         self.devices.borrow_mut().retain(|d| d.key != key);
         self.persist();

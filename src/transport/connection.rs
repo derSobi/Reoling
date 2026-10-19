@@ -92,6 +92,84 @@ const RX_CHANNEL_CAPACITY: usize = 64;
 /// buffering.
 const PENDING_QUEUE_CAP_BYTES: usize = 256 * 1024;
 
+/// The cap that replaces `PENDING_QUEUE_CAP_BYTES` while a recorded-video
+/// playback runs (`BcConnection::set_replay_buffering`). Playback data are
+/// not paced to the viewer: the device first sends a lead of several
+/// seconds of wall time and then footage at the requested speed, so the
+/// reader can be legitimately behind by a lot more than live video ever
+/// is. Sized from the leads measured on the wire: about 1–3 MB on a sub
+/// stream at 16x (one I-frame per GOP for about a minute of footage) and
+/// bursts of up to 2.2 MB/s; a main stream at 16x would send about a
+/// minute of main-stream I-frames (0.9–1.6 MB each, one per 1–2 s of
+/// footage), roughly 40–55 MB. 64 MiB covers that with some margin and is
+/// still a hard bound on memory.
+const REPLAY_PENDING_QUEUE_CAP_BYTES: usize = 64 * 1024 * 1024;
+
+/// How long the replay cap stays in force after playback buffering is
+/// switched off. Closing a playback reads everything up to the device's
+/// answer to the close, but data of the closed playback can still trail in
+/// after that answer (about 1 MB over 4 s has been seen); they must not end
+/// the connection if nobody happens to be reading for a moment. Live video
+/// started after a playback ends the linger at once
+/// (`BcConnection::end_replay_buffering_now`): its reader never pauses, so
+/// trailing playback data cannot pile up.
+const REPLAY_CAP_LINGER: Duration = Duration::from_secs(10);
+
+/// Which bound `udp_rx_task` puts on its `pending` queue, as set through
+/// `BcConnection` (stored as a `u8` shared with the task).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Buffering {
+    /// `PENDING_QUEUE_CAP_BYTES`, exactly as for live video (the default).
+    Live = 0,
+    /// A playback runs: `REPLAY_PENDING_QUEUE_CAP_BYTES`.
+    Replay = 1,
+    /// A playback was closed: the large bound lingers for
+    /// `REPLAY_CAP_LINGER` after the last data seen while it ran, then the
+    /// live one is back.
+    AfterReplay = 2,
+}
+
+impl Buffering {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Buffering::Replay,
+            2 => Buffering::AfterReplay,
+            _ => Buffering::Live,
+        }
+    }
+}
+
+/// The bound `udp_rx_task` enforces on its `pending` queue. Without
+/// playback buffering ever switched on it is always
+/// `PENDING_QUEUE_CAP_BYTES`, exactly as for live video.
+#[derive(Debug, Default)]
+struct PendingCap {
+    replay_linger_until: Option<std::time::Instant>,
+}
+
+impl PendingCap {
+    fn current(&mut self, buffering: Buffering, now: std::time::Instant) -> usize {
+        match buffering {
+            Buffering::Replay => {
+                self.replay_linger_until = Some(now + REPLAY_CAP_LINGER);
+                REPLAY_PENDING_QUEUE_CAP_BYTES
+            }
+            Buffering::AfterReplay => match self.replay_linger_until {
+                Some(until) if now < until => REPLAY_PENDING_QUEUE_CAP_BYTES,
+                _ => {
+                    self.replay_linger_until = None;
+                    PENDING_QUEUE_CAP_BYTES
+                }
+            },
+            Buffering::Live => {
+                self.replay_linger_until = None;
+                PENDING_QUEUE_CAP_BYTES
+            }
+        }
+    }
+}
+
 /// `recv_bc`'s receive loop skips discovery-channel packets it doesn't act
 /// on (see below) rather than erroring — without a bound on the whole loop,
 /// a peer that only ever sends chatter (or nothing at all) on that channel
@@ -205,6 +283,9 @@ enum Socket {
         /// doesn't stop a tokio task, it just detaches. Never polled
         /// directly.
         rx_task: tokio::task::JoinHandle<()>,
+        /// Which bound `udp_rx_task` puts on its pending queue (a
+        /// `Buffering` as `u8`; see `REPLAY_PENDING_QUEUE_CAP_BYTES`).
+        replay_buffering: Arc<std::sync::atomic::AtomicU8>,
     },
     /// Direct TCP (Baichuan's "Basic Service", typically port 9000). A
     /// plain ordered byte stream — `write_bc`'s output goes straight on
@@ -230,11 +311,56 @@ impl BcConnection {
             sent: BTreeMap::new(),
         }));
         let (tx, rx) = tokio::sync::mpsc::channel(RX_CHANNEL_CAPACITY);
-        let rx_task = tokio::spawn(udp_rx_task(socket.clone(), peer.clone(), send_state.clone(), tx));
+        let replay_buffering = Arc::new(std::sync::atomic::AtomicU8::new(Buffering::Live as u8));
+        let rx_task = tokio::spawn(udp_rx_task(
+            socket.clone(),
+            peer.clone(),
+            send_state.clone(),
+            tx,
+            replay_buffering.clone(),
+        ));
         Self {
-            socket: Socket::Udp { socket, peer, send_state, rx, rx_task },
+            socket: Socket::Udp { socket, peer, send_state, rx, rx_task, replay_buffering },
             reassembly: Vec::new(),
             bin_mode: HashSet::new(),
+        }
+    }
+
+    /// Switches the receive side between the live-video bound on unread
+    /// data (`PENDING_QUEUE_CAP_BYTES`, the default) and the much larger
+    /// one a recorded-video playback needs (`REPLAY_PENDING_QUEUE_CAP_BYTES`):
+    /// the device sends playback data ahead of real time, so the reader can
+    /// fall behind by tens of MB without anything being wrong. Acks and
+    /// their rate field are unaffected. Switched off, the large bound
+    /// lingers for `REPLAY_CAP_LINGER` (data of the closed playback can
+    /// still trail in). No-op on TCP, which has no such queue.
+    pub fn set_replay_buffering(&self, on: bool) {
+        self.set_buffering(if on { Buffering::Replay } else { Buffering::AfterReplay });
+    }
+
+    /// Puts the live-video bound (`PENDING_QUEUE_CAP_BYTES`) back at once,
+    /// without the linger `set_replay_buffering(false)` leaves: for live
+    /// video started after a playback, whose reader reads without pause and
+    /// drops what trails in from the playback. No-op when playback
+    /// buffering was never used, and on TCP.
+    pub fn end_replay_buffering_now(&self) {
+        self.set_buffering(Buffering::Live);
+    }
+
+    /// Whether the live-video bound applies right now (always on TCP).
+    #[cfg(test)]
+    pub(crate) fn has_live_buffering(&self) -> bool {
+        match &self.socket {
+            Socket::Udp { replay_buffering, .. } => {
+                Buffering::from_u8(replay_buffering.load(std::sync::atomic::Ordering::Relaxed)) == Buffering::Live
+            }
+            _ => true,
+        }
+    }
+
+    fn set_buffering(&self, buffering: Buffering) {
+        if let Socket::Udp { replay_buffering, .. } = &self.socket {
+            replay_buffering.store(buffering as u8, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -521,7 +647,9 @@ async fn udp_rx_task(
     peer: PeerHandle,
     send_state: Arc<tokio::sync::Mutex<UdpSendState>>,
     tx: tokio::sync::mpsc::Sender<crate::Result<Vec<u8>>>,
+    replay_buffering: Arc<std::sync::atomic::AtomicU8>,
 ) {
+    let mut pending_cap = PendingCap::default();
     let mut buf = [0u8; 2048];
     let mut next_expected_packet_id: u32 = 0;
     let mut out_of_order: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
@@ -597,7 +725,11 @@ async fn udp_rx_task(
                             pending_bytes += chunk.len();
                             pending.push_back(chunk);
                         }
-                        if pending_bytes > PENDING_QUEUE_CAP_BYTES {
+                        let cap = pending_cap.current(
+                            Buffering::from_u8(replay_buffering.load(std::sync::atomic::Ordering::Relaxed)),
+                            std::time::Instant::now(),
+                        );
+                        if pending_bytes > cap {
                             // The consumer is durably behind, not just
                             // momentarily — more buffering can't fix that.
                             // End the connection cleanly rather than
@@ -946,6 +1078,128 @@ mod tests {
         // channel filled. 5 leaves headroom for scheduling jitter while
         // still failing hard if the tick stalled.
         assert!(ack_count >= 5, "expected several acks despite a full rx channel, got {ack_count}");
+    }
+
+    /// Sends `count` full-size data packets from `sender` to `to`, paced so
+    /// that a loopback socket's default receive buffer never overflows (a
+    /// dropped datagram would leave a gap and stop `pending` from growing).
+    async fn flood_paced(sender: &UdpSocket, to: std::net::SocketAddr, count: u32) {
+        for i in 0..count {
+            let packet = UdpData { connection_id: 2, packet_id: i, payload: vec![b'x'; MAX_FRAGMENT_SIZE] };
+            sender.send_to(&write_bcudp(&BcUdp::Data(packet)), to).await.unwrap();
+            if i % 8 == 7 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    }
+
+    /// Counts the acks `sender` receives during `window`.
+    async fn count_acks(sender: &UdpSocket, window: Duration) -> usize {
+        let mut buf = [0u8; 4096];
+        let mut acks = 0;
+        let deadline = tokio::time::Instant::now() + window;
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Ok((n, _))) = tokio::time::timeout(Duration::from_millis(50), sender.recv_from(&mut buf)).await
+            else {
+                continue;
+            };
+            if let Ok(Some((BcUdp::Ack(_), _))) = read_bcudp(&buf[..n]) {
+                acks += 1;
+            }
+        }
+        acks
+    }
+
+    /// About 600 KB that nobody reads: more than the live cap
+    /// (`PENDING_QUEUE_CAP_BYTES` plus the channel's own slack), far less
+    /// than the playback cap.
+    const FLOOD_PACKETS: u32 = 450;
+
+    #[tokio::test]
+    async fn an_unread_backlog_over_the_live_cap_ends_the_receive_side() {
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender_addr = sender.local_addr().unwrap();
+        let socket_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr_b = socket_b.local_addr().unwrap();
+        let _conn_b = BcConnection::new(
+            socket_b,
+            PeerHandle { addr: sender_addr, local_connection_id: 2, remote_connection_id: 1, nonce: None, is_direct: false },
+        );
+        flood_paced(&sender, addr_b, FLOOD_PACKETS).await;
+        // Let the acks sent before the cap tripped arrive, then listen.
+        let _ = count_acks(&sender, Duration::from_millis(150)).await;
+        assert_eq!(count_acks(&sender, Duration::from_millis(300)).await, 0, "the receive task should have ended");
+    }
+
+    #[tokio::test]
+    async fn replay_buffering_keeps_receiving_and_acking_past_the_live_cap() {
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender_addr = sender.local_addr().unwrap();
+        let socket_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr_b = socket_b.local_addr().unwrap();
+        let conn_b = BcConnection::new(
+            socket_b,
+            PeerHandle { addr: sender_addr, local_connection_id: 2, remote_connection_id: 1, nonce: None, is_direct: false },
+        );
+        conn_b.set_replay_buffering(true);
+        flood_paced(&sender, addr_b, FLOOD_PACKETS).await;
+        let _ = count_acks(&sender, Duration::from_millis(150)).await;
+        let acks = count_acks(&sender, Duration::from_millis(300)).await;
+        assert!(acks >= 5, "expected the receive task to keep acking, got {acks}");
+    }
+
+    #[test]
+    fn pending_cap_is_the_live_one_unless_playback_buffering_was_used() {
+        let t0 = std::time::Instant::now();
+        let mut cap = PendingCap::default();
+        assert_eq!(cap.current(Buffering::Live, t0), PENDING_QUEUE_CAP_BYTES);
+        assert_eq!(cap.current(Buffering::Live, t0 + Duration::from_secs(60)), PENDING_QUEUE_CAP_BYTES);
+        // Switched off without ever having been on: nothing to linger.
+        assert_eq!(cap.current(Buffering::AfterReplay, t0), PENDING_QUEUE_CAP_BYTES);
+
+        assert_eq!(cap.current(Buffering::Replay, t0), REPLAY_PENDING_QUEUE_CAP_BYTES);
+        // Switched off: the large cap lingers for a while...
+        let t1 = t0 + Duration::from_secs(1);
+        assert_eq!(cap.current(Buffering::AfterReplay, t1), REPLAY_PENDING_QUEUE_CAP_BYTES);
+        // ...then the live cap is back for good.
+        let t2 = t0 + REPLAY_CAP_LINGER + Duration::from_secs(1);
+        assert_eq!(cap.current(Buffering::AfterReplay, t2), PENDING_QUEUE_CAP_BYTES);
+        assert_eq!(cap.current(Buffering::AfterReplay, t1), PENDING_QUEUE_CAP_BYTES);
+    }
+
+    #[test]
+    fn live_video_after_a_playback_gets_the_live_cap_at_once() {
+        let t0 = std::time::Instant::now();
+        let mut cap = PendingCap::default();
+        assert_eq!(cap.current(Buffering::Replay, t0), REPLAY_PENDING_QUEUE_CAP_BYTES);
+        assert_eq!(cap.current(Buffering::AfterReplay, t0), REPLAY_PENDING_QUEUE_CAP_BYTES);
+        // Live video starts well within the linger: no linger for it.
+        let t1 = t0 + Duration::from_millis(500);
+        assert_eq!(cap.current(Buffering::Live, t1), PENDING_QUEUE_CAP_BYTES);
+        // Nor does a later switch-off bring back the old playback's linger.
+        assert_eq!(cap.current(Buffering::AfterReplay, t1), PENDING_QUEUE_CAP_BYTES);
+        assert_eq!(Buffering::from_u8(Buffering::Replay as u8), Buffering::Replay);
+        assert_eq!(Buffering::from_u8(Buffering::AfterReplay as u8), Buffering::AfterReplay);
+        assert_eq!(Buffering::from_u8(Buffering::Live as u8), Buffering::Live);
+    }
+
+    #[tokio::test]
+    async fn the_connection_switches_the_shared_buffering_mode() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer_addr = socket.local_addr().unwrap();
+        let conn = BcConnection::new(
+            socket,
+            PeerHandle { addr: peer_addr, local_connection_id: 2, remote_connection_id: 1, nonce: None, is_direct: false },
+        );
+        let Socket::Udp { replay_buffering, .. } = &conn.socket else { panic!("a UDP connection") };
+        let mode = || Buffering::from_u8(replay_buffering.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(mode(), Buffering::Live);
+        conn.set_replay_buffering(true);
+        assert_eq!(mode(), Buffering::Replay);
+        conn.set_replay_buffering(false);
+        assert_eq!(mode(), Buffering::AfterReplay);
+        conn.end_replay_buffering_now();
+        assert_eq!(mode(), Buffering::Live);
     }
 
     /// `disconnect()` sends `C2D_DISC` on the discovery channel — see its

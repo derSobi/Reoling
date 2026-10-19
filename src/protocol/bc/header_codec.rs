@@ -1,4 +1,4 @@
-use crate::protocol::bc::model::{has_payload_offset, BcHeader, MAGIC_HEADER};
+use crate::protocol::bc::model::{header_has_payload_offset, BcHeader, MAGIC_HEADER};
 use crate::protocol::Error;
 
 /// Serializes a `BcHeader` to its 20 or 24 byte wire form (all fields
@@ -20,9 +20,27 @@ pub fn write_header(header: &BcHeader) -> Vec<u8> {
     buf
 }
 
+/// The number of bytes a message with this header (parsed as `header_len`
+/// bytes) takes on the wire: header and body, plus 4 more after a class
+/// 0xffff reply, whose device leaves 4 zero bytes that its `body_len` does
+/// not count (see `read_bc`).
+pub fn wire_len(header: &BcHeader, header_len: usize) -> usize {
+    let total = header_len + header.body_len as usize;
+    if header.class == 0xffff {
+        total + 4
+    } else {
+        total
+    }
+}
+
 /// Parses a `BcHeader` from the start of `buf`. Returns `Ok(None)` if there
 /// are not yet enough bytes (caller should read more and retry) rather than
 /// an error, since this is meant to be called on a growing network buffer.
+///
+/// The header is 24 bytes (with the payload-offset word) for classes 0x6414
+/// and 0x0000, and for recorded-media data, whose class and response code
+/// hold a playback sequence number instead (see
+/// [`crate::protocol::bc::model::replay_seq`]); 20 bytes otherwise.
 pub fn read_header(buf: &[u8]) -> crate::protocol::Result<Option<(BcHeader, usize)>> {
     if buf.len() < 20 {
         return Ok(None);
@@ -41,7 +59,7 @@ pub fn read_header(buf: &[u8]) -> crate::protocol::Result<Option<(BcHeader, usiz
     let response_code = u16::from_le_bytes(buf[16..18].try_into().unwrap());
     let class = u16::from_le_bytes(buf[18..20].try_into().unwrap());
 
-    if has_payload_offset(class) {
+    if header_has_payload_offset(msg_id, class, response_code) {
         if buf.len() < 24 {
             return Ok(None);
         }

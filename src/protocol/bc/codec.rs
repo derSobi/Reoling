@@ -1,7 +1,7 @@
-use crate::protocol::bc::header_codec::{read_header, write_header};
+use crate::protocol::bc::header_codec::{read_header, wire_len, write_header};
 use crate::protocol::bc::model::{
-    has_payload_offset, Bc, BcBody, BcHeader, BcMeta, LegacyMsg, ModernMsg, MSG_ID_IMAGE_UPLOAD, MSG_ID_LOGIN,
-    MSG_ID_TALK_DATA,
+    header_has_payload_offset, Bc, BcBody, BcHeader, BcMeta, LegacyMsg, ModernMsg, MSG_ID_COVER_PREVIEW,
+    MSG_ID_DOWNLOAD, MSG_ID_IMAGE_UPLOAD, MSG_ID_LOGIN, MSG_ID_REPLAY, MSG_ID_TALK_DATA,
 };
 use crate::protocol::bc::xml::Extension;
 use crate::protocol::crypto::EncryptionProtocol;
@@ -9,6 +9,11 @@ use crate::protocol::Error;
 use std::collections::HashSet;
 
 const BINARY_MARK: &[u8] = b"<binaryData>1</binaryData>";
+
+/// Ids whose binary payloads each carry their own `binaryData=1` Extension
+/// (see the binary-mode comment in `read_bc`). 8 is framed like playback
+/// data although it has not been seen on the wire.
+const RECORDED_MEDIA_MSG_IDS: [u32; 4] = [MSG_ID_REPLAY, 8, MSG_ID_DOWNLOAD, MSG_ID_COVER_PREVIEW];
 
 pub fn write_bc(bc: &Bc, enc: &EncryptionProtocol) -> Vec<u8> {
     // Symmetric with `read_bc`'s override: the whole login exchange (both
@@ -48,11 +53,13 @@ pub fn write_bc(bc: &Bc, enc: &EncryptionProtocol) -> Vec<u8> {
                     body.extend_from_slice(&encrypted_payload);
                 }
             }
-            // Only classes that actually carry the payload_offset word
-            // (0x6414, 0x0000) get `Some`; e.g. 0x6614 (the encrypted reply
-            // to legacy login) is a modern body with no offset word at all —
-            // giving it one here desyncs write_header/read_header.
-            let payload_offset = if has_payload_offset(bc.meta.class) {
+            // Only headers that actually carry the payload_offset word
+            // (classes 0x6414 and 0x0000, and recorded-media data with a
+            // sequence number in class/code) get `Some`; e.g. 0x6614 (the
+            // encrypted reply to legacy login) is a modern body with no
+            // offset word at all — giving it one here desyncs
+            // write_header/read_header. Same rule as `read_header`.
+            let payload_offset = if header_has_payload_offset(bc.meta.msg_id, bc.meta.class, bc.meta.response_code) {
                 Some(offset)
             } else {
                 None
@@ -97,7 +104,7 @@ pub fn read_bc(
     // read as the next message's magic (always 0 — AES/BcEncrypt never
     // produces an all-zero ciphertext from a real header) and desync the
     // whole connection's framing.
-    let consumed = if header.class == 0xffff { total_len + 4 } else { total_len };
+    let consumed = wire_len(&header, header_len);
     if buf.len() < consumed {
         return Ok(None);
     }
@@ -148,6 +155,11 @@ pub fn read_bc(
         class: header.class,
     };
 
+    // Recorded-media data (class/code = playback sequence number) arrive
+    // with a payload offset and so take the `Some` branch below, exactly
+    // like a class 0x0000 message: Extension, then binary mode per
+    // `binaryData`/`encryptLen`. `meta.class`/`meta.response_code` keep the
+    // sequence number for `BcMeta::replay_seq`.
     let bc_body = match header.payload_offset {
         None if header.class == 0x6514 => BcBody::Legacy(LegacyMsg::LoginUpgrade),
         None => {
@@ -176,7 +188,16 @@ pub fn read_bc(
             };
             let parsed_extension =
                 extension_xml.as_ref().and_then(|xml| Extension::from_bytes(xml).ok());
-            if let Some(extension) = &parsed_extension {
+            // Recorded media (playback, download, cover preview) put their
+            // own `binaryData=1` Extension on every data message, while
+            // device pushes arrive under msg_num 0 with no Extension at all.
+            // So for those ids binary mode is decided per message and never
+            // stored in `bin_mode`: a playback answered under msg_num 0 must
+            // not leave 0 marked binary and turn later pushes into
+            // undecrypted bytes. Every other id (live video included) keeps
+            // the per-msg_num rule.
+            let per_message_binary = RECORDED_MEDIA_MSG_IDS.contains(&header.msg_id);
+            if let (false, Some(extension)) = (per_message_binary, &parsed_extension) {
                 match extension.binary_data {
                     Some(1) => {
                         bin_mode.insert(header.msg_num);
@@ -187,11 +208,16 @@ pub fn read_bc(
                     _ => {}
                 }
             }
+            let is_binary = if per_message_binary {
+                parsed_extension.as_ref().is_some_and(|ext| ext.binary_data == Some(1))
+            } else {
+                bin_mode.contains(&header.msg_num)
+            };
 
             let raw_payload = &body[offset..];
             let payload = if raw_payload.is_empty() {
                 None
-            } else if bin_mode.contains(&header.msg_num) {
+            } else if is_binary {
                 // Video/audio stream message. Real hardware only
                 // AES-encrypts the leading `encryptLen` bytes of the
                 // message that starts a new BcMedia unit (the one with
@@ -551,5 +577,322 @@ mod talk_payload_tests {
         assert!(!talk.windows(ext.len()).any(|w| w == ext), "its extension is encrypted");
         let other = write_bc(&mk(3), &key);
         assert!(!other.windows(payload.len()).any(|w| w == payload), "other payloads stay encrypted");
+    }
+}
+
+#[cfg(test)]
+mod replay_framing_tests {
+    use super::*;
+    use crate::protocol::bc::model::{MSG_ID_REPLAY_CLOSE, MSG_ID_VIDEO};
+    use crate::protocol::bcmedia::model::parse_info_block;
+
+    /// Sequence number of a playback seen on the wire, and its header words.
+    const SEQ: u32 = 1_792_348_477;
+    const SEQ_CLASS: u16 = 0x6ad5;
+    const SEQ_CODE: u16 = 0x113d;
+
+    fn aes() -> EncryptionProtocol {
+        EncryptionProtocol::Aes { key: [0x5a; 16] }
+    }
+
+    fn ext_xml(fields: &str) -> Vec<u8> {
+        format!("<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<Extension version=\"1.1\">\n{fields}</Extension>\n")
+            .into_bytes()
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 7 + 3) as u8).collect()
+    }
+
+    /// One media message as a device sends it: the Extension encrypted, then
+    /// the payload with only its first `encrypted_prefix` bytes encrypted
+    /// (built by hand, since `write_bc` encrypts a payload in full).
+    #[allow(clippy::too_many_arguments)]
+    fn media_message(
+        enc: &EncryptionProtocol,
+        msg_id: u32,
+        class: u16,
+        response_code: u16,
+        msg_num: u16,
+        ext: &[u8],
+        payload: &[u8],
+        encrypted_prefix: usize,
+    ) -> Vec<u8> {
+        let ext_wire = enc.encrypt(0, ext);
+        let offset = ext_wire.len() as u32;
+        let mut body = ext_wire;
+        let n = encrypted_prefix.min(payload.len());
+        body.extend_from_slice(&enc.encrypt(offset, &payload[..n]));
+        body.extend_from_slice(&payload[n..]);
+        let header = BcHeader {
+            msg_id,
+            body_len: body.len() as u32,
+            channel_id: 0x22,
+            stream_type: 0x08,
+            msg_num,
+            response_code,
+            class,
+            payload_offset: Some(offset),
+        };
+        let mut wire = write_header(&header);
+        wire.extend_from_slice(&body);
+        wire
+    }
+
+    fn payload_of(bc: &Bc) -> &[u8] {
+        match &bc.body {
+            BcBody::Modern(ModernMsg { payload: Some(p), .. }) => p,
+            other => panic!("expected a payload, got {other:?}"),
+        }
+    }
+
+    fn info_block_payload() -> Vec<u8> {
+        let mut info = Vec::new();
+        info.extend_from_slice(b"1001");
+        info.extend_from_slice(&32u32.to_le_bytes());
+        info.extend_from_slice(&640u32.to_le_bytes());
+        info.extend_from_slice(&360u32.to_le_bytes());
+        info.extend_from_slice(&[0x01, 0x0a]);
+        info.extend_from_slice(&[0x7e, 0x0a, 0x11, 0x06, 0x15, 0x07]);
+        info.extend_from_slice(&[0x7e, 0x0a, 0x11, 0x07, 0x15, 0x05]);
+        info.extend_from_slice(&[0, 0]);
+        info
+    }
+
+    #[test]
+    fn replay_data_header_is_24_bytes_with_the_seq_in_class_and_code() {
+        let header = BcHeader {
+            msg_id: MSG_ID_REPLAY,
+            body_len: 0,
+            channel_id: 0,
+            stream_type: 0,
+            msg_num: 0,
+            response_code: SEQ_CODE,
+            class: SEQ_CLASS,
+            payload_offset: Some(0),
+        };
+        let bytes = write_header(&header);
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(&bytes[16..20], &[0x3d, 0x11, 0xd5, 0x6a]);
+        let (parsed, used) = read_header(&bytes).unwrap().unwrap();
+        assert_eq!(used, 24);
+        assert_eq!(parsed, header);
+        assert_eq!(parsed.replay_seq(), Some(SEQ));
+        // With only 20 bytes there, the reader waits for the offset word.
+        assert!(read_header(&bytes[..20]).unwrap().is_none());
+    }
+
+    #[test]
+    fn replay_data_with_encrypt_len_1024_decrypts_only_that_prefix() {
+        let enc = aes();
+        let payload = pattern(4000);
+        let ext = ext_xml("<binaryData>1</binaryData>\n<encryptLen>1024</encryptLen>\n");
+        let wire = media_message(&enc, MSG_ID_REPLAY, SEQ_CLASS, SEQ_CODE, 0, &ext, &payload, 1024);
+        let (bc, used) = read_bc(&wire, &enc, &mut HashSet::new()).unwrap().unwrap();
+        assert_eq!(used, wire.len());
+        assert_eq!(bc.meta.replay_seq(), Some(SEQ));
+        assert_eq!(payload_of(&bc), payload.as_slice());
+    }
+
+    #[test]
+    fn replay_data_with_encrypt_len_equal_to_the_whole_payload() {
+        // Audio units of 528 bytes come with encryptLen 528: all encrypted.
+        let enc = aes();
+        let payload = pattern(528);
+        let ext = ext_xml("<binaryData>1</binaryData>\n<encryptLen>528</encryptLen>\n");
+        let wire = media_message(&enc, MSG_ID_REPLAY, SEQ_CLASS, SEQ_CODE, 0, &ext, &payload, 528);
+        let (bc, used) = read_bc(&wire, &enc, &mut HashSet::new()).unwrap().unwrap();
+        assert_eq!(used, wire.len());
+        assert_eq!(payload_of(&bc), payload.as_slice());
+    }
+
+    #[test]
+    fn replay_data_with_encrypt_len_32_on_a_larger_payload() {
+        let enc = aes();
+        let payload = pattern(39_488);
+        let ext = ext_xml("<binaryData>1</binaryData>\n<encryptLen>32</encryptLen>\n");
+        let wire = media_message(&enc, MSG_ID_REPLAY, SEQ_CLASS, SEQ_CODE, 0, &ext, &payload, 32);
+        let (bc, used) = read_bc(&wire, &enc, &mut HashSet::new()).unwrap().unwrap();
+        assert_eq!(used, wire.len());
+        assert_eq!(payload_of(&bc), payload.as_slice());
+    }
+
+    #[test]
+    fn capital_e_encrypt_len_is_honoured() {
+        // Cover-preview data spell it `EncryptLen`; without reading that
+        // spelling the I-frame's first 1024 bytes would stay encrypted.
+        let enc = aes();
+        let payload = pattern(3000);
+        let ext = ext_xml("<binaryData>1</binaryData>\n<EncryptLen>1024</EncryptLen>\n");
+        let wire = media_message(&enc, MSG_ID_COVER_PREVIEW, 0x0000, 200, 0, &ext, &payload, 1024);
+        let (bc, _) = read_bc(&wire, &enc, &mut HashSet::new()).unwrap().unwrap();
+        assert_eq!(bc.meta.replay_seq(), None);
+        assert_eq!(payload_of(&bc), payload.as_slice());
+    }
+
+    #[test]
+    fn a_playback_stream_parses_back_to_back_without_losing_framing() {
+        let enc = aes();
+        let info = info_block_payload();
+        let data_a = pattern(1500);
+        let data_b = pattern(777);
+        let mut stream = Vec::new();
+        // Open-OK: class 0x0000, code 200, binaryData only, 32 bytes.
+        let open_ok = media_message(&enc, MSG_ID_REPLAY, 0x0000, 200, 0, &ext_xml("<binaryData>1</binaryData>\n"), &info, 0);
+        stream.extend_from_slice(&open_ok);
+        let a = media_message(
+            &enc,
+            MSG_ID_REPLAY,
+            SEQ_CLASS,
+            SEQ_CODE,
+            0,
+            &ext_xml("<binaryData>1</binaryData>\n<encryptLen>32</encryptLen>\n"),
+            &data_a,
+            32,
+        );
+        stream.extend_from_slice(&a);
+        // A message with binaryData only and no encryptLen is all plaintext.
+        let b = media_message(&enc, MSG_ID_REPLAY, SEQ_CLASS, SEQ_CODE, 0, &ext_xml("<binaryData>1</binaryData>\n"), &data_b, 0);
+        stream.extend_from_slice(&b);
+        // Then the empty reply to a close.
+        let close_reply = write_bc(
+            &Bc {
+                meta: BcMeta { msg_id: MSG_ID_REPLAY_CLOSE, channel_id: 0x23, stream_type: 0x08, msg_num: 0, response_code: 200, class: 0x0000 },
+                body: BcBody::Modern(ModernMsg::default()),
+            },
+            &enc,
+        );
+        stream.extend_from_slice(&close_reply);
+
+        let mut bin_mode = HashSet::new();
+        let mut pos = 0;
+        let (first, used) = read_bc(&stream[pos..], &enc, &mut bin_mode).unwrap().unwrap();
+        assert_eq!(used, open_ok.len());
+        assert_eq!((first.meta.class, first.meta.response_code, first.meta.replay_seq()), (0x0000, 200, None));
+        let block = parse_info_block(payload_of(&first)).expect("an info block");
+        assert_eq!((block.width, block.height), (640, 360));
+        pos += used;
+
+        let (second, used) = read_bc(&stream[pos..], &enc, &mut bin_mode).unwrap().unwrap();
+        assert_eq!(used, a.len());
+        assert_eq!(second.meta.replay_seq(), Some(SEQ));
+        assert_eq!(payload_of(&second), data_a.as_slice());
+        pos += used;
+
+        let (third, used) = read_bc(&stream[pos..], &enc, &mut bin_mode).unwrap().unwrap();
+        assert_eq!(used, b.len());
+        assert_eq!(third.meta.replay_seq(), Some(SEQ));
+        assert_eq!(payload_of(&third), data_b.as_slice());
+        pos += used;
+
+        let (fourth, used) = read_bc(&stream[pos..], &enc, &mut bin_mode).unwrap().unwrap();
+        assert_eq!(fourth.meta.msg_id, MSG_ID_REPLAY_CLOSE);
+        assert_eq!(fourth.meta.response_code, 200);
+        assert_eq!(pos + used, stream.len());
+    }
+
+    #[test]
+    fn playback_data_do_not_mark_msg_num_0_binary_for_later_pushes() {
+        // Pushes (channel list, alarms, ...) come under msg_num 0 with no
+        // Extension; playback data may come under msg_num 0 too.
+        let enc = aes();
+        let mut bin_mode = HashSet::new();
+        let open_ok = media_message(&enc, MSG_ID_REPLAY, 0x0000, 200, 0, &ext_xml("<binaryData>1</binaryData>\n"), &info_block_payload(), 0);
+        let data = media_message(
+            &enc,
+            MSG_ID_REPLAY,
+            SEQ_CLASS,
+            SEQ_CODE,
+            0,
+            &ext_xml("<binaryData>1</binaryData>\n<encryptLen>32</encryptLen>\n"),
+            &pattern(100),
+            32,
+        );
+        for wire in [&open_ok, &data] {
+            read_bc(wire, &enc, &mut bin_mode).unwrap().unwrap();
+        }
+        assert!(bin_mode.is_empty());
+
+        let xml = b"<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<AlarmEventList version=\"1.1\">\n</AlarmEventList>\n</body>\n".to_vec();
+        let push = Bc {
+            meta: BcMeta { msg_id: 33, channel_id: 0, stream_type: 0, msg_num: 0, response_code: 200, class: 0x0000 },
+            body: BcBody::Modern(ModernMsg { extension_xml: None, payload: Some(xml.clone()) }),
+        };
+        let (parsed, _) = read_bc(&write_bc(&push, &enc), &enc, &mut bin_mode).unwrap().unwrap();
+        assert_eq!(payload_of(&parsed), xml.as_slice(), "the push is decrypted as usual");
+    }
+
+    #[test]
+    fn a_download_reply_without_extension_is_decrypted_xml() {
+        let enc = aes();
+        let mut bin_mode = HashSet::from([0u16]);
+        let xml = b"<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n</body>\n".to_vec();
+        let reply = Bc {
+            meta: BcMeta { msg_id: MSG_ID_DOWNLOAD, channel_id: 0, stream_type: 0, msg_num: 0, response_code: 200, class: 0x0000 },
+            body: BcBody::Modern(ModernMsg { extension_xml: None, payload: Some(xml.clone()) }),
+        };
+        let (parsed, _) = read_bc(&write_bc(&reply, &enc), &enc, &mut bin_mode).unwrap().unwrap();
+        assert_eq!(payload_of(&parsed), xml.as_slice());
+    }
+
+    #[test]
+    fn live_video_headers_are_framed_as_before() {
+        // msg 3 class 0x0000 / 0x6414: 24 bytes, no seq.
+        for class in [0x0000u16, 0x6414] {
+            let header = BcHeader {
+                msg_id: MSG_ID_VIDEO,
+                body_len: 0,
+                channel_id: 0,
+                stream_type: 0,
+                msg_num: 9,
+                response_code: 0,
+                class,
+                payload_offset: Some(0),
+            };
+            let (parsed, used) = read_header(&write_header(&header)).unwrap().unwrap();
+            assert_eq!(used, 24);
+            assert_eq!(parsed.replay_seq(), None);
+        }
+        // msg 3 with a class that would be a seq on msg 5 stays 20 bytes.
+        let header = BcHeader {
+            msg_id: MSG_ID_VIDEO,
+            body_len: 0,
+            channel_id: 0,
+            stream_type: 0,
+            msg_num: 9,
+            response_code: SEQ_CODE,
+            class: SEQ_CLASS,
+            payload_offset: None,
+        };
+        let (parsed, used) = read_header(&write_header(&header)).unwrap().unwrap();
+        assert_eq!(used, 20);
+        assert_eq!(parsed.payload_offset, None);
+        assert_eq!(parsed.replay_seq(), None);
+    }
+
+    #[test]
+    fn write_bc_round_trips_a_replay_data_message() {
+        let bc = Bc {
+            meta: BcMeta {
+                msg_id: MSG_ID_REPLAY,
+                channel_id: 0,
+                stream_type: 0,
+                msg_num: 0,
+                response_code: SEQ_CODE,
+                class: SEQ_CLASS,
+            },
+            body: BcBody::Modern(ModernMsg {
+                extension_xml: Some(ext_xml("<binaryData>1</binaryData>\n")),
+                payload: Some(pattern(64)),
+            }),
+        };
+        let enc = EncryptionProtocol::Unencrypted;
+        let wire = write_bc(&bc, &enc);
+        let (header, header_len) = read_header(&wire).unwrap().unwrap();
+        assert_eq!(header_len, 24);
+        assert_eq!(header.payload_offset, Some(ext_xml("<binaryData>1</binaryData>\n").len() as u32));
+        let (parsed, used) = read_bc(&wire, &enc, &mut HashSet::new()).unwrap().unwrap();
+        assert_eq!(used, wire.len());
+        assert_eq!(parsed, bc);
     }
 }
