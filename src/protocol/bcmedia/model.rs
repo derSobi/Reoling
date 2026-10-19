@@ -1,3 +1,4 @@
+use crate::protocol::time::CivilTime;
 use crate::protocol::Error;
 
 const MAGIC_HEADER_BCMEDIA_INFO_V1: u32 = 0x31303031;
@@ -36,6 +37,55 @@ pub enum BcMediaMessage {
     Skipped,
 }
 
+/// Length of the info block: the BcMedia info unit that starts a live
+/// stream and, as the very first data, every playback, download and cover
+/// preview.
+pub const INFO_BLOCK_LEN: usize = 32;
+
+/// What the 32-byte info block says.
+///
+/// Layout (little-endian): magic `1001` (or `2001`), the unit length (32),
+/// width (u32 at 8), height (u32 at 12), two bytes whose meaning is not
+/// known, then at 18..24 the recorded file's start and at 24..30 its end,
+/// each as `year - 1900, month (1-based), day, hour, minute, second` in UTC,
+/// and two more unknown bytes. Byte 17 is not the frame rate the data
+/// arrive at, so it is not offered here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InfoBlock {
+    pub width: u32,
+    pub height: u32,
+    /// Start of the recorded file in UTC, or `None` when the six bytes are
+    /// not a valid date (live streams leave them zero).
+    pub start_utc: Option<CivilTime>,
+    /// End of the recorded file in UTC; `None` as for `start_utc`. The
+    /// device stops sending at this point without any end marker.
+    pub end_utc: Option<CivilTime>,
+}
+
+/// Reads the info block at the start of `buf` (at least
+/// [`INFO_BLOCK_LEN`] bytes, starting with the info magic). `None` for
+/// anything else. A playback's open succeeded when its first msg-5 reply
+/// (class 0x0000, code 200) carries exactly such a 32-byte payload.
+pub fn parse_info_block(buf: &[u8]) -> Option<InfoBlock> {
+    if buf.len() < INFO_BLOCK_LEN {
+        return None;
+    }
+    let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    if magic != MAGIC_HEADER_BCMEDIA_INFO_V1 && magic != MAGIC_HEADER_BCMEDIA_INFO_V2 {
+        return None;
+    }
+    let date = |b: &[u8]| {
+        let t = CivilTime::new(1900 + u16::from(b[0]), b[1], b[2], b[3], b[4], b[5]);
+        t.is_valid().then_some(t)
+    };
+    Some(InfoBlock {
+        width: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+        height: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+        start_utc: date(&buf[18..24]),
+        end_utc: date(&buf[24..30]),
+    })
+}
+
 fn pad_len(payload_len: usize) -> usize {
     (PAD_SIZE - payload_len % PAD_SIZE) % PAD_SIZE
 }
@@ -69,6 +119,25 @@ pub fn resync_offset(buf: &[u8]) -> usize {
     (1..buf.len().saturating_sub(3))
         .find(|&i| known(u32::from_le_bytes(buf[i..i + 4].try_into().unwrap())))
         .unwrap_or_else(|| buf.len().saturating_sub(3))
+}
+
+/// The device's time of the key frame unit at the start of `buf`: in
+/// recorded footage, the extra header after the fixed 24 bytes starts with
+/// the frame's time as a little-endian Unix time (UTC, whole seconds). Seen
+/// with 8, 160 and 168 bytes of extra header on a Home Hub and an NVR, for
+/// four camera models. `None` for anything but a key frame, or one whose
+/// extra header is shorter than four bytes (or not complete in `buf`). The
+/// value is not checked: the caller compares it with the file's span.
+pub fn keyframe_unix_time(buf: &[u8]) -> Option<u32> {
+    if buf.len() < 28 {
+        return None;
+    }
+    let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    if !(MAGIC_HEADER_BCMEDIA_IFRAME..=MAGIC_HEADER_BCMEDIA_IFRAME_LAST).contains(&magic) {
+        return None;
+    }
+    let additional_header_size = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+    (additional_header_size >= 4).then(|| u32::from_le_bytes(buf[24..28].try_into().unwrap()))
 }
 
 /// Parses exactly one BcMedia unit from the start of `buf`. Returns
@@ -164,7 +233,7 @@ mod tests {
         buf.extend_from_slice(&width.to_le_bytes());
         buf.extend_from_slice(&height.to_le_bytes());
         buf.push(0); // unknown
-        buf.push(30); // fps
+        buf.push(30); // unknown (not the frame rate)
         buf.extend_from_slice(&[0u8; 12]); // start/end date-time fields
         buf.extend_from_slice(&0u16.to_le_bytes()); // trailing unknown
         buf
@@ -193,6 +262,34 @@ mod tests {
     }
 
     #[test]
+    fn info_block_gives_size_and_the_files_utc_span() {
+        // Shape seen at the start of a playback: 640x360, file
+        // 2026-10-17 06:21:07 to 07:21:05 UTC.
+        let mut bytes = info_v1_bytes(640, 360);
+        bytes[16] = 0x01;
+        bytes[17] = 0x0a;
+        bytes[18..24].copy_from_slice(&[0x7e, 0x0a, 0x11, 0x06, 0x15, 0x07]);
+        bytes[24..30].copy_from_slice(&[0x7e, 0x0a, 0x11, 0x07, 0x15, 0x05]);
+        let block = parse_info_block(&bytes).unwrap();
+        assert_eq!((block.width, block.height), (640, 360));
+        assert_eq!(block.start_utc, Some(CivilTime::new(2026, 10, 17, 6, 21, 7)));
+        assert_eq!(block.end_utc, Some(CivilTime::new(2026, 10, 17, 7, 21, 5)));
+        // `parse_one` still sees the same unit as plain Info.
+        let (msg, used) = parse_one(&bytes).unwrap().unwrap();
+        assert_eq!((msg, used), (BcMediaMessage::Info { width: 640, height: 360 }, INFO_BLOCK_LEN));
+    }
+
+    #[test]
+    fn info_block_without_dates_or_with_another_magic() {
+        let block = parse_info_block(&info_v1_bytes(1920, 1080)).unwrap();
+        assert_eq!((block.start_utc, block.end_utc), (None, None));
+        assert!(parse_info_block(&info_v1_bytes(1920, 1080)[..31]).is_none());
+        let mut not_info = info_v1_bytes(1, 1);
+        not_info[0..4].copy_from_slice(&MAGIC_HEADER_BCMEDIA_IFRAME.to_le_bytes());
+        assert!(parse_info_block(&not_info).is_none());
+    }
+
+    #[test]
     fn parses_an_h264_iframe() {
         let data = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x42]; // fake NAL-ish bytes
         let bytes = iframe_bytes(&data);
@@ -203,6 +300,59 @@ mod tests {
         assert!(frame.is_keyframe);
         assert_eq!(frame.microseconds, 123);
         assert_eq!(frame.data, data);
+    }
+
+    /// A key frame (or, with `key` false, a delta frame) with `extra` as its
+    /// extra header.
+    fn frame_with_extra_header(key: bool, extra: &[u8], data: &[u8]) -> Vec<u8> {
+        let magic = if key { MAGIC_HEADER_BCMEDIA_IFRAME } else { MAGIC_HEADER_BCMEDIA_PFRAME };
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&magic.to_le_bytes());
+        buf.extend_from_slice(b"H264");
+        buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(extra.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&1_968_952_017u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(extra);
+        buf.extend_from_slice(data);
+        buf.resize(buf.len() + pad_len(data.len()), 0);
+        buf
+    }
+
+    #[test]
+    fn a_key_frame_header_gives_the_devices_time_of_the_frame() {
+        // 8 bytes (an NVR), as recorded: 2026-10-19 18:57:19 UTC.
+        let nvr = [0x0f, 0x68, 0xd6, 0x6a, 0x2a, 0x01, 0xc3, 0x00];
+        // 160 and 168 bytes (Home Hub cameras), 2026-10-19 17:18:10 UTC.
+        let mut hub = vec![0xd2, 0x50, 0xd6, 0x6a, 0x2a, 0x01, 0xc3, 0x00, 0xff, 0x8f, 0x00, 0x01];
+        for (extra, expected) in [
+            (nvr.to_vec(), 1_792_436_239u32),
+            ({ hub.resize(160, 0); hub.clone() }, 1_792_430_290),
+            ({ hub.resize(168, 0); hub.clone() }, 1_792_430_290),
+        ] {
+            let unit = frame_with_extra_header(true, &extra, &[0, 0, 0, 1, 0x65]);
+            assert_eq!(keyframe_unix_time(&unit), Some(expected), "{} bytes", extra.len());
+            // `parse_one` is unchanged: the extra header is skipped.
+            let (msg, used) = parse_one(&unit).unwrap().unwrap();
+            assert_eq!(used, unit.len());
+            let BcMediaMessage::Video(frame) = msg else { panic!("expected a video frame") };
+            assert_eq!((frame.is_keyframe, frame.microseconds, frame.data.as_slice()), (true, 1_968_952_017, &[0, 0, 0, 1, 0x65][..]));
+        }
+        assert_eq!(
+            CivilTime::from_epoch_seconds(1_792_436_239),
+            CivilTime::new(2026, 10, 19, 18, 57, 19)
+        );
+    }
+
+    #[test]
+    fn no_time_without_a_key_frame_and_four_header_bytes() {
+        let time = [0x0f, 0x68, 0xd6, 0x6a, 0x2a, 0x01, 0xc3, 0x00];
+        assert_eq!(keyframe_unix_time(&frame_with_extra_header(false, &time, &[1])), None, "a delta frame");
+        assert_eq!(keyframe_unix_time(&frame_with_extra_header(true, &[], &[1, 2, 3, 4])), None, "no extra header");
+        assert_eq!(keyframe_unix_time(&frame_with_extra_header(true, &time[..3], &[1])), None, "three bytes");
+        assert_eq!(keyframe_unix_time(&frame_with_extra_header(true, &time, &[1])[..27]), None, "cut short");
+        assert_eq!(keyframe_unix_time(&info_v1_bytes(640, 360)), None);
+        assert_eq!(keyframe_unix_time(&[]), None);
     }
 
     #[test]
