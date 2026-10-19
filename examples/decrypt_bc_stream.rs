@@ -4,8 +4,10 @@
 //! Monitor Point) — using the exact same codec Reoling uses to talk to real
 //! devices, so the decoding is as trustworthy as the app's own.
 //!
-//! Runs entirely on your own machine. The password is read from an
-//! environment variable, never printed, never sent anywhere, and this tool
+//! Runs entirely on your own machine. The password is read from the file
+//! named by REOLING_CAPTURE_PASSWORD_FILE or, failing that, from the
+//! REOLING_CAPTURE_PASSWORD environment variable; it is never printed, never
+//! sent anywhere, and this tool
 //! makes no network connection at all — it only reads the two local files
 //! you give it.
 //!
@@ -16,12 +18,18 @@
 //!
 //! ```bash
 //! python3 scripts/extract_bc_stream.py capture.pcap <device-ip> /tmp/bc-out
+//! export REOLING_CAPTURE_PASSWORD_FILE=~/.config/reoling/capture-password   # a 0600 file, or:
 //! read -s -p "Camera password: " REOLING_CAPTURE_PASSWORD; export REOLING_CAPTURE_PASSWORD; echo
 //! cargo run --example decrypt_bc_stream -- /tmp/bc-out/to_device.bin /tmp/bc-out/from_device.bin admin /tmp/bc-out/decoded.txt
 //! ```
 //!
-//! Then read (or send) `/tmp/bc-out/decoded.txt` — a UID appearing in it is
-//! blanked out, but nothing else is.
+//! For a per-message timeline of a whole .pcap (every connection, capture
+//! times, JSONL), see `examples/bc_timeline.rs` instead.
+//!
+//! Then read (or send) `/tmp/bc-out/decoded.txt` — the contents of every
+//! `uid`, `fakeUid` and `UID` element and of every recording id (`Id`,
+//! `fileId`, which on a Home Hub end with the camera's UID) are blanked
+//! out, but nothing else is.
 
 use reoling::protocol::bc::codec::read_bc;
 use reoling::protocol::bc::model::{Bc, BcBody, BcMeta, ModernMsg, MSG_ID_LOGIN};
@@ -35,13 +43,14 @@ fn main() {
     let [_, to_device, from_device, username, out_path] = args.as_slice() else {
         eprintln!(
             "usage: decrypt_bc_stream <to_device.bin> <from_device.bin> <username> <out.txt>\n\
-             (password comes from the REOLING_CAPTURE_PASSWORD environment variable)"
+             (password from the file named by REOLING_CAPTURE_PASSWORD_FILE, or from the\n\
+             REOLING_CAPTURE_PASSWORD environment variable)"
         );
         std::process::exit(1);
     };
-    let password = std::env::var("REOLING_CAPTURE_PASSWORD").unwrap_or_else(|_| {
+    let password = password_from_file().or_else(|| std::env::var("REOLING_CAPTURE_PASSWORD").ok()).unwrap_or_else(|| {
         eprintln!(
-            "REOLING_CAPTURE_PASSWORD is not set. In your own terminal, run:\n  \
+            "Neither REOLING_CAPTURE_PASSWORD_FILE nor REOLING_CAPTURE_PASSWORD is set. In your own terminal, run:\n  \
              read -s -p \"Camera password: \" REOLING_CAPTURE_PASSWORD; export REOLING_CAPTURE_PASSWORD; echo\n\
              then re-run this command in the SAME terminal."
         );
@@ -83,6 +92,23 @@ fn main() {
         std::process::exit(1);
     });
     eprintln!("wrote {out_path} ({} bytes)", out.len());
+}
+
+/// The password from the file named by REOLING_CAPTURE_PASSWORD_FILE, if
+/// that variable is set (only a trailing newline is stripped). Exits if the
+/// file can't be read rather than silently falling back.
+fn password_from_file() -> Option<String> {
+    let path = std::env::var_os("REOLING_CAPTURE_PASSWORD_FILE")?;
+    let path = std::path::PathBuf::from(path);
+    let text = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| {
+            eprintln!("could not read the password file {} as text", path.display());
+            std::process::exit(1);
+        });
+    let password = text.strip_suffix('\n').map(|t| t.strip_suffix('\r').unwrap_or(t)).unwrap_or(&text);
+    Some(password.to_string())
 }
 
 /// The nonce from the first legacy-login (`msg_id` 1) reply in `stream`.
@@ -157,14 +183,40 @@ fn text(bytes: &[u8]) -> String {
     }
 }
 
-/// Blanks out a `<uid>...</uid>` element, if present, without pulling in a
-/// regex dependency for this one-off tool.
+/// Elements whose contents can hold a camera or device UID.
+const UID_ELEMENTS: [&str; 5] = ["uid", "fakeUid", "UID", "Id", "fileId"];
+
+/// Blanks out the contents of every element named in `UID_ELEMENTS`,
+/// without pulling in a regex dependency for this one-off tool.
 fn redact(text: &str) -> String {
-    let (Some(start), Some(end)) = (text.find("<uid>"), text.find("</uid>")) else {
-        return text.to_string();
-    };
-    if end < start {
-        return text.to_string();
+    let mut out = text.to_string();
+    for tag in UID_ELEMENTS {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let mut from = 0;
+        while let Some(start) = out[from..].find(&open).map(|i| from + i + open.len()) {
+            let Some(len) = out[start..].find(&close) else { break };
+            out.replace_range(start..start + len, "…");
+            from = start + "…".len() + close.len();
+        }
     }
-    format!("{}<uid>…</uid>{}", &text[..start], &text[end + "</uid>".len()..])
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact;
+
+    #[test]
+    fn blanks_every_uid_and_recording_id() {
+        let text = "<ChannelInfo><uid>TESTCAMUID000001</uid><fakeUid>NVRUIDPLACEHOLDR_00</fakeUid></ChannelInfo>\
+                    <ChannelInfo><uid>TESTCAMUID000002</uid></ChannelInfo>\
+                    <FileInfo><name>0120261017092107</name><Id>1-0-01260917062107-00000-TESTCAMUID000003</Id></FileInfo>";
+        let out = redact(text);
+        assert!(!out.contains("TESTCAMUID") && !out.contains("NVRUID"), "{out}");
+        assert!(out.contains("<name>0120261017092107</name>"));
+        assert_eq!(out.matches("…").count(), 4);
+        // An unterminated element is left alone rather than looping.
+        assert_eq!(redact("<uid>abc"), "<uid>abc");
+    }
 }

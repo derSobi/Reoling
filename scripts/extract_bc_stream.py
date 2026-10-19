@@ -7,14 +7,16 @@ here parses TCP/UDP itself). Works on:
 
   - a direct or relay-direct TCP:9000 session (most captures of the
     official app on this network), or
-  - a direct UDP/P2P session (BcUdp `Data` packets, reordered by their
-    packet id, exactly as Reoling's own transport reassembles them).
+  - a UDP/P2P session (BcUdp `Data` packets, reordered by their packet id,
+    exactly as Reoling's own transport reassembles them; a retransmitted id
+    keeps its first copy). With several sessions to/from the IP, the one
+    with the most Data packets is taken.
 
-It does NOT work on a pure UDP-relay session: there, the login nonce never
-appears as a Baichuan message (it travels inside the P2P discovery
-handshake instead), so `decrypt_bc_stream` has nothing to find. If this
-script reports it found no session, try recapturing while on the VPN
-(direct path), or with the relay path unavailable.
+`decrypt_bc_stream` only finds the nonce in a legacy login exchange. A UDP
+session usually has none: the nonce comes from the P2P handshake
+(`D2C_CFM`'s `nc`) instead. For those, and for a per-message
+timeline of every TCP connection and UDP session in a capture, use
+`examples/bc_timeline.rs`, which reads the handshake too.
 
 Usage:
     python3 scripts/extract_bc_stream.py <capture.pcap> <device-ip> <out-dir>
@@ -30,7 +32,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-MAGIC_DATA = bytes.fromhex("f0debc0a")
+# A BcUdp `Data` packet (magic 0x2a87cf10, little-endian on the wire), as
+# `src/protocol/bcudp` defines it: magic, connection id, 0, packet id,
+# payload length, payload.
+MAGIC_UDP_DATA = bytes.fromhex("10cf872a")
 
 
 def run(args):
@@ -66,34 +71,60 @@ def try_udp(pcap: str, device_ip: str):
             "-r",
             pcap,
             "-Y",
-            f"udp && ip.addr=={device_ip}",
+            f"udp && ip.addr=={device_ip} && udp.payload[0:4] == 10:cf:87:2a",
             "-T",
             "fields",
             "-e",
             "ip.src",
             "-e",
+            "udp.srcport",
+            "-e",
+            "ip.dst",
+            "-e",
+            "udp.dstport",
+            "-e",
             "udp.payload",
         ]
     )
-    packets = {"to_device": {}, "from_device": {}}
+    # (device endpoint, other endpoint) -> direction -> connection id ->
+    # packet id -> payload.
+    sessions = {}
     for line in out.splitlines():
         parts = line.split("\t")
-        if len(parts) < 2 or not parts[1]:
+        if len(parts) < 5 or not parts[4]:
             continue
-        src, hex_payload = parts[0], parts[1].replace(":", "")
-        payload = bytes.fromhex(hex_payload)
-        if len(payload) < 20 or payload[:4] != MAGIC_DATA:
+        src, sport, dst, dport, hex_payload = parts[:5]
+        payload = bytes.fromhex(hex_payload.replace(":", ""))
+        if len(payload) < 20 or payload[:4] != MAGIC_UDP_DATA:
             continue
-        packet_id = struct.unpack("<I", payload[12:16])[0]
-        length = struct.unpack("<I", payload[16:20])[0]
+        connection_id, _, packet_id, length = struct.unpack("<iIII", payload[4:20])
         body = payload[20 : 20 + length]
-        bucket = "from_device" if src == device_ip else "to_device"
-        packets[bucket][packet_id] = body
-    if not packets["to_device"] and not packets["from_device"]:
+        from_device = src == device_ip
+        key = ((src, sport), (dst, dport)) if from_device else ((dst, dport), (src, sport))
+        direction = "from_device" if from_device else "to_device"
+        by_id = sessions.setdefault(key, {}).setdefault(direction, {}).setdefault(connection_id, {})
+        by_id.setdefault(packet_id, body)  # a retransmission keeps the first copy
+    if not sessions:
         return None
-    to_device = b"".join(packets["to_device"][i] for i in sorted(packets["to_device"]))
-    from_device = b"".join(packets["from_device"][i] for i in sorted(packets["from_device"]))
-    return to_device, from_device
+
+    def busiest(directions, direction):
+        streams = directions.get(direction, {})
+        return max(streams.values(), key=len) if streams else {}
+
+    def size(item):
+        return sum(len(busiest(item[1], d)) for d in ("to_device", "from_device"))
+
+    (device_ep, other_ep), directions = max(sessions.items(), key=size)
+    if len(sessions) > 1:
+        print(f"{len(sessions)} UDP sessions with {device_ip}; taking {device_ep[0]}:{device_ep[1]} <-> {other_ep[0]}:{other_ep[1]}")
+    result = []
+    for direction in ("to_device", "from_device"):
+        packets = busiest(directions, direction)
+        ids = sorted(packets)
+        if ids and (ids[0] != 0 or ids[-1] - ids[0] + 1 != len(ids)):
+            print(f"warning: {direction}: packet ids {ids[0]}..{ids[-1]} are not all in the capture; the stream has gaps")
+        result.append(b"".join(packets[i] for i in ids))
+    return result[0], result[1]
 
 
 def main():
