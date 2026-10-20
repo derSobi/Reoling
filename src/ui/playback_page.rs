@@ -1,7 +1,9 @@
 //! The Playback page: recorded footage of one device channel, a day at a
 //! time. The device and channel come from the sidebar; a calendar picks the
-//! day (recorded days are marked), the day timeline shows its recordings and
-//! seeks, and the controls play, pause and choose the speed and the stream.
+//! day (recorded days are marked), the day timeline shows its recordings
+//! and event windows and seeks, and the controls play, pause, jump between
+//! events (under a detection filter applied here, not on the device) and
+//! choose the speed and the stream.
 //!
 //! The page only says what it wants. The device's network thread does the
 //! work and reports back as `PlaybackEvent`s, which are dropped here unless
@@ -12,14 +14,14 @@
 
 use crate::ui::bridge::{DeviceLink, FileSpan, PlaybackEvent, PlayerPhase, PlayerState};
 use crate::ui::playback_driver::{civil_at, civil_of, seconds_of_day, timeline_of};
-use crate::ui::playback_timeline::PlaybackTimeline;
+use crate::ui::playback_timeline::{PlaybackTimeline, TimelineEvent};
 use crate::ui::video_view::VideoView;
 use gtk4::prelude::*;
 use gtk4::{
     Box as GtkBox, Button, Calendar, DropDown, Label, MenuButton, Orientation, Overlay, Popover, Spinner,
     ToggleButton,
 };
-use reoling::{CivilTime, RecordStream, ReplaySpeed};
+use reoling::{CivilTime, RecordStream, RecordedEvent, ReplaySpeed};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -47,6 +49,100 @@ const PLAYED_OUT_BELOW: Duration = Duration::from_millis(300);
 /// The stream dropdown, in the live page's order and words.
 const STREAMS: [RecordStream; 2] = [RecordStream::Main, RecordStream::Sub];
 const STREAM_LABELS: [&str; 2] = ["Main stream", "Sub stream"];
+
+/// An event jump passes over a start this close to the position: the one
+/// just played from (the device starts a little before the seek time), or
+/// a second window at the same moment.
+const EVENT_JUMP_SLACK: f64 = 2.0;
+
+/// The detection filter: which event windows the timeline marks and the
+/// event buttons jump between. Applied here; the device lists every kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventFilter {
+    All,
+    Motion,
+    Person,
+    Vehicle,
+    Animal,
+    Package,
+    Zone,
+}
+
+impl EventFilter {
+    /// In the dropdown's order.
+    pub const ALL: [EventFilter; 7] = [
+        EventFilter::All,
+        EventFilter::Motion,
+        EventFilter::Person,
+        EventFilter::Vehicle,
+        EventFilter::Animal,
+        EventFilter::Package,
+        EventFilter::Zone,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            EventFilter::All => "All events",
+            EventFilter::Motion => "Any motion",
+            EventFilter::Person => "Person",
+            EventFilter::Vehicle => "Vehicle",
+            EventFilter::Animal => "Animal",
+            EventFilter::Package => "Package",
+            EventFilter::Zone => "Line crossing / zone",
+        }
+    }
+
+    /// The kinds (as the device names them) the filter admits; `None`
+    /// admits every kind. Each is one the event search asks the device for.
+    pub fn kinds(self) -> Option<&'static [&'static str]> {
+        match self {
+            EventFilter::All => None,
+            EventFilter::Motion => Some(&["md", "pir", "other"]),
+            EventFilter::Person => Some(&["people", "face", "visitor"]),
+            EventFilter::Vehicle => Some(&["vehicle", "nonmotorveh"]),
+            EventFilter::Animal => Some(&["dog_cat"]),
+            EventFilter::Package => Some(&["package"]),
+            EventFilter::Zone => Some(&["crossline", "intrude", "loitering"]),
+        }
+    }
+
+    /// Whether the filter shows an event of these kinds.
+    pub fn admits(self, event: &RecordedEvent) -> bool {
+        match self.kinds() {
+            None => true,
+            Some(kinds) => event.kinds.iter().any(|kind| kinds.contains(&kind.as_str())),
+        }
+    }
+}
+
+/// What the user reads for a kind as the device names it: every kind the
+/// event search asks for has a name here (an unknown one is shown as the
+/// device names it).
+fn kind_label(kind: &str) -> &str {
+    match kind {
+        "md" => "Motion",
+        "pir" => "PIR motion",
+        "other" => "Other",
+        "io" => "Alarm input",
+        "people" => "Person",
+        "face" => "Face",
+        "vehicle" => "Vehicle",
+        "nonmotorveh" => "Non-motor vehicle",
+        "dog_cat" => "Animal",
+        "visitor" => "Visitor",
+        "cry" => "Crying",
+        "package" => "Package",
+        "crossline" => "Line crossing",
+        "intrude" => "Intrusion",
+        "loitering" => "Loitering",
+        "legacy" => "Legacy alarm",
+        "loss" => "Video loss",
+        "answer" => "Doorbell answered",
+        "tamper" => "Tampering",
+        "lmsg" => "Message",
+        other => other,
+    }
+}
 
 /// Whether the page's device can be asked for recordings yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +204,9 @@ pub struct PlaybackPage {
     whole_day: Button,
     speed: DropDown,
     stream: DropDown,
+    prev_event: Button,
+    next_event: Button,
+    filter: DropDown,
     handlers: Handlers,
 
     /// The page is the visible one (set and cleared by `enter`/`leave` only).
@@ -123,6 +222,12 @@ pub struct PlaybackPage {
     day: Cell<Option<CivilTime>>,
     /// The selected day's recordings: `None` while they are being listed.
     files: RefCell<Option<Result<Vec<FileSpan>, String>>>,
+    /// The selected day's event windows (every kind; the filter is applied
+    /// when they are shown): `None` while they are being listed.
+    events: RefCell<Option<Result<Vec<RecordedEvent>, String>>>,
+    /// A failed event listing was reported in this session: the next ones
+    /// (every day and stream lists anew) are not, the day plays all the same.
+    events_failed: Cell<bool>,
     /// Recorded days per (device, channel, year, month), and when they came.
     months: RefCell<HashMap<(String, u8, u16, u8), (Vec<u8>, Instant)>>,
     /// Months asked for and not answered yet (device and channel on the page).
@@ -145,6 +250,9 @@ pub struct PlaybackPage {
     last_error: RefCell<Option<String>>,
     want_speed: Cell<ReplaySpeed>,
     want_stream: Cell<RecordStream>,
+    /// The detection filter; it outlives sessions (it asks nothing of the
+    /// device).
+    want_filter: Cell<EventFilter>,
     /// Kept while the device is away.
     remembered: Cell<Option<Remembered>>,
     /// To be applied once the session's recordings are listed.
@@ -232,6 +340,14 @@ impl PlaybackPage {
         let stream = DropDown::from_strings(&STREAM_LABELS);
         stream.set_selected(stream_index(RecordStream::Sub));
         stream.set_tooltip_text(Some("Stream"));
+        let prev_event = Button::from_icon_name("media-skip-backward-symbolic");
+        prev_event.set_tooltip_text(Some("Previous event"));
+        let next_event = Button::from_icon_name("media-skip-forward-symbolic");
+        next_event.set_tooltip_text(Some("Next event"));
+        let filter_labels: Vec<&str> = EventFilter::ALL.iter().map(|f| f.label()).collect();
+        let filter = DropDown::from_strings(&filter_labels);
+        filter.set_selected(filter_index(EventFilter::All));
+        filter.set_tooltip_text(Some("Detection filter"));
         let controls = GtkBox::new(Orientation::Horizontal, 8);
         controls.set_margin_top(6);
         controls.set_margin_bottom(6);
@@ -244,6 +360,10 @@ impl PlaybackPage {
         controls.append(&gtk4::Separator::new(Orientation::Vertical));
         controls.append(&play);
         controls.append(&time);
+        controls.append(&gtk4::Separator::new(Orientation::Vertical));
+        controls.append(&prev_event);
+        controls.append(&filter);
+        controls.append(&next_event);
         let spacer = GtkBox::new(Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         controls.append(&spacer);
@@ -274,6 +394,9 @@ impl PlaybackPage {
             whole_day,
             speed,
             stream,
+            prev_event,
+            next_event,
+            filter,
             handlers,
             shown: Cell::new(false),
             device: RefCell::new(None),
@@ -282,6 +405,8 @@ impl PlaybackPage {
             session: Cell::new(0),
             day: Cell::new(None),
             files: RefCell::new(None),
+            events: RefCell::new(None),
+            events_failed: Cell::new(false),
             months: RefCell::new(HashMap::new()),
             asked: RefCell::new(HashSet::new()),
             shown_month: Cell::new(None),
@@ -295,6 +420,7 @@ impl PlaybackPage {
             last_error: RefCell::new(None),
             want_speed: Cell::new(ReplaySpeed::X1),
             want_stream: Cell::new(RecordStream::Sub),
+            want_filter: Cell::new(EventFilter::All),
             remembered: Cell::new(None),
             restore: Cell::new(None),
             timer: RefCell::new(None),
@@ -355,6 +481,28 @@ impl PlaybackPage {
                         p.stream_chosen(stream);
                     }
                 }
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.filter.connect_selected_notify(move |dropdown| {
+            if let Some(p) = weak.upgrade() {
+                if !p.updating.get() {
+                    if let Some(filter) = EventFilter::ALL.get(dropdown.selected() as usize).copied() {
+                        p.filter_chosen(filter);
+                    }
+                }
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.prev_event.connect_clicked(move |_| {
+            if let Some(p) = weak.upgrade() {
+                p.jump_event(false);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.next_event.connect_clicked(move |_| {
+            if let Some(p) = weak.upgrade() {
+                p.jump_event(true);
             }
         });
 
@@ -557,6 +705,11 @@ impl PlaybackPage {
                     self.day_answer(files);
                 }
             }
+            PlaybackEvent::Events { session, stream, events, .. } => {
+                if session == self.session.get() && stream == self.want_stream.get() {
+                    self.events_answer(events);
+                }
+            }
             PlaybackEvent::State(state) => {
                 if state.session == self.session.get() {
                     self.state_changed(state);
@@ -621,6 +774,8 @@ impl PlaybackPage {
         self.session.set(self.session.get() + 1);
         self.day.set(None);
         *self.files.borrow_mut() = None;
+        *self.events.borrow_mut() = None;
+        self.events_failed.set(false);
         *self.state.borrow_mut() = None;
         *self.last_error.borrow_mut() = None;
         *self.day_note.borrow_mut() = None;
@@ -816,6 +971,63 @@ impl PlaybackPage {
 
     fn has_files(&self) -> bool {
         matches!(&*self.files.borrow(), Some(Ok(files)) if !files.is_empty())
+    }
+
+    // ---- events ---------------------------------------------------------------
+
+    /// The day's event windows came (after its recordings): the bars show
+    /// under the filter. The ones of the stream before stay until then. A
+    /// failure is said once per session (the day plays without the bars).
+    fn events_answer(&self, events: Result<Vec<RecordedEvent>, String>) {
+        if let Err(e) = &events {
+            if !self.events_failed.replace(true) {
+                self.notify(&format!("Could not list the events: {e}"));
+            }
+        }
+        *self.events.borrow_mut() = Some(events);
+        self.show_events();
+        self.refresh();
+    }
+
+    /// The filter changed: the bars follow at once; the device is not asked.
+    fn filter_chosen(&self, filter: EventFilter) {
+        self.want_filter.set(filter);
+        self.show_events();
+        self.refresh();
+    }
+
+    /// The timeline marks the events the filter admits.
+    fn show_events(&self) {
+        let Some(day) = self.day.get() else { return };
+        let shown = match &*self.events.borrow() {
+            Some(Ok(events)) => timeline_events(events, self.want_filter.get(), day),
+            _ => Vec::new(),
+        };
+        self.timeline.set_events(&shown);
+    }
+
+    /// Whether the filter admits any of the day's events.
+    fn has_matching_events(&self) -> bool {
+        let filter = self.want_filter.get();
+        matches!(&*self.events.borrow(), Some(Ok(events)) if events.iter().any(|e| filter.admits(e)))
+    }
+
+    /// The previous or next event button: plays from the start of the
+    /// nearest event the filter admits before or after the position on
+    /// screen (with none, the day's last or first).
+    fn jump_event(&self, forward: bool) {
+        let Some(day) = self.day.get() else { return };
+        let starts = match &*self.events.borrow() {
+            Some(Ok(events)) => event_starts(events, self.want_filter.get(), day),
+            _ => Vec::new(),
+        };
+        let position = self.screen_position(day).map(|(seconds, _)| seconds);
+        let target =
+            if forward { next_event_start(&starts, position) } else { previous_event_start(&starts, position) };
+        match target {
+            Some(at) => self.seek_to(at),
+            None => self.notify(if forward { "No later event" } else { "No earlier event" }),
+        }
     }
 
     // ---- calendar -------------------------------------------------------------
@@ -1022,6 +1234,10 @@ impl PlaybackPage {
         self.play.set_sensitive(ready && has_files);
         self.speed.set_sensitive(ready);
         self.stream.set_sensitive(ready);
+        self.filter.set_sensitive(ready);
+        let can_jump = ready && has_files && self.has_matching_events();
+        self.prev_event.set_sensitive(can_jump);
+        self.next_event.set_sensitive(can_jump);
         let (icon, tip) = if self.playing.get() {
             ("media-playback-pause-symbolic", "Pause")
         } else {
@@ -1187,6 +1403,57 @@ fn spans_of(files: &[FileSpan], day: CivilTime) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// The events the filter admits, as the timeline marks them: seconds of
+/// `day`, named by their kinds.
+fn timeline_events(events: &[RecordedEvent], filter: EventFilter, day: CivilTime) -> Vec<TimelineEvent> {
+    events
+        .iter()
+        .filter(|e| filter.admits(e))
+        .map(|e| TimelineEvent {
+            start: seconds_of_day(timeline_of(e.start), day),
+            end: seconds_of_day(timeline_of(e.end), day),
+            label: event_label(&e.kinds),
+        })
+        .collect()
+}
+
+/// "Motion", "Animal, Person": an event's kinds as the user reads them,
+/// each once.
+fn event_label(kinds: &[String]) -> String {
+    let mut labels: Vec<&str> = Vec::new();
+    for kind in kinds {
+        let label = kind_label(kind);
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    labels.join(", ")
+}
+
+/// The starts of the events the filter admits, as seconds of `day`,
+/// sorted, each once.
+fn event_starts(events: &[RecordedEvent], filter: EventFilter, day: CivilTime) -> Vec<f64> {
+    let mut starts: Vec<f64> =
+        events.iter().filter(|e| filter.admits(e)).map(|e| seconds_of_day(timeline_of(e.start), day)).collect();
+    starts.sort_by(f64::total_cmp);
+    starts.dedup();
+    starts
+}
+
+/// The first of `starts` (sorted) more than `EVENT_JUMP_SLACK` after
+/// `position`; with no position, the first of all.
+fn next_event_start(starts: &[f64], position: Option<f64>) -> Option<f64> {
+    let after = position.map_or(f64::NEG_INFINITY, |p| p + EVENT_JUMP_SLACK);
+    starts.iter().copied().find(|&start| start > after)
+}
+
+/// The last of `starts` (sorted) more than `EVENT_JUMP_SLACK` before
+/// `position`; with no position, the last of all.
+fn previous_event_start(starts: &[f64], position: Option<f64>) -> Option<f64> {
+    let before = position.map_or(f64::INFINITY, |p| p - EVENT_JUMP_SLACK);
+    starts.iter().copied().rev().find(|&start| start < before)
+}
+
 /// `YYYY-MM-DD`.
 fn date_text(day: CivilTime) -> String {
     format!("{:04}-{:02}-{:02}", day.year, day.month, day.day)
@@ -1208,6 +1475,10 @@ fn speed_index(speed: ReplaySpeed) -> u32 {
 
 fn stream_index(stream: RecordStream) -> u32 {
     STREAMS.iter().position(|s| *s == stream).unwrap_or(0) as u32
+}
+
+fn filter_index(filter: EventFilter) -> u32 {
+    EventFilter::ALL.iter().position(|f| *f == filter).unwrap_or(0) as u32
 }
 
 #[cfg(test)]
@@ -1373,6 +1644,110 @@ mod tests {
         let position = timeline_of(t(19, 14, 3, 27)) + Duration::from_millis(848);
         assert_eq!(time_text(civil_of(position)), "2026-10-19 14:03:27");
         assert!((seconds_of_day(position, t(19, 0, 0, 0)) - 50_607.848).abs() < 1e-6);
+    }
+
+    fn event(start: CivilTime, seconds: i64, kinds: &[&str]) -> RecordedEvent {
+        RecordedEvent { start, end: start.add_seconds(seconds), kinds: kinds.iter().map(|k| k.to_string()).collect() }
+    }
+
+    /// A Home Hub day: two kinds at one moment, motion, an animal later.
+    fn events() -> Vec<RecordedEvent> {
+        vec![
+            event(t(19, 2, 11, 21), 34, &["dog_cat", "people"]),
+            event(t(19, 2, 11, 21), 28, &["md"]),
+            event(t(19, 3, 20, 0), 30, &["md"]),
+            event(t(19, 11, 7, 27), 30, &["dog_cat"]),
+        ]
+    }
+
+    #[test]
+    fn the_filter_admits_the_kinds_it_names_and_nothing_else() {
+        use reoling::protocol::bc::xml::{EVENT_SEARCH_ALARM_TYPES, EVENT_SEARCH_ALARM_TYPE_ITEMS};
+        let motion = event(t(19, 1, 0, 0), 10, &["md"]);
+        let both = event(t(19, 1, 0, 0), 10, &["dog_cat", "people"]);
+        let car = event(t(19, 1, 0, 0), 10, &["vehicle"]);
+        let alarm = event(t(19, 1, 0, 0), 10, &["io"]);
+        assert!(EventFilter::All.admits(&motion) && EventFilter::All.admits(&both) && EventFilter::All.admits(&alarm));
+        assert!(EventFilter::Motion.admits(&motion) && !EventFilter::Motion.admits(&both));
+        // An alarm input, a legacy alarm or a video loss is no motion: under
+        // "All events" only.
+        assert!(EventFilter::ALL.iter().all(|f| f.admits(&alarm) == (*f == EventFilter::All)));
+        assert!(EventFilter::Person.admits(&both) && EventFilter::Animal.admits(&both));
+        assert!(!EventFilter::Vehicle.admits(&both) && EventFilter::Vehicle.admits(&car));
+        for filter in [EventFilter::Package, EventFilter::Zone, EventFilter::Person, EventFilter::Animal] {
+            assert!(!filter.admits(&motion), "{filter:?}");
+        }
+        // Every kind a filter names is one the event search asks the device
+        // for (in its kind list or its item list; `package` is only in the
+        // former), and no kind is under two filters.
+        let asked: HashSet<&str> =
+            EVENT_SEARCH_ALARM_TYPES.split(',').map(str::trim).chain(EVENT_SEARCH_ALARM_TYPE_ITEMS).collect();
+        let mut seen = HashSet::new();
+        for filter in EventFilter::ALL {
+            for kind in filter.kinds().unwrap_or(&[]) {
+                assert!(asked.contains(kind), "{filter:?} names {kind}, which is not asked for");
+                assert!(seen.insert(*kind), "{kind} is under two filters");
+            }
+        }
+        // The dropdown lists them as named, "All events" first.
+        let labels: Vec<&str> = EventFilter::ALL.iter().map(|f| f.label()).collect();
+        assert_eq!(labels, ["All events", "Any motion", "Person", "Vehicle", "Animal", "Package", "Line crossing / zone"]);
+        for (index, filter) in EventFilter::ALL.iter().enumerate() {
+            assert_eq!(filter_index(*filter) as usize, index);
+        }
+    }
+
+    #[test]
+    fn events_become_bars_of_the_day_named_by_their_kinds() {
+        let day = CivilTime::start_of_day(2026, 10, 19);
+        let all = timeline_events(&events(), EventFilter::All, day);
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[0], TimelineEvent { start: 7_881.0, end: 7_915.0, label: "Animal, Person".to_string() });
+        assert_eq!((all[1].start, all[1].end, all[1].label.as_str()), (7_881.0, 7_909.0, "Motion"));
+        let animals = timeline_events(&events(), EventFilter::Animal, day);
+        assert_eq!(animals.iter().map(|e| e.start).collect::<Vec<_>>(), vec![7_881.0, 40_047.0]);
+        assert!(timeline_events(&events(), EventFilter::Vehicle, day).is_empty());
+        assert!(timeline_events(&[], EventFilter::All, day).is_empty());
+        // A repeated name is given once; a kind the page does not know is
+        // named as the device names it.
+        let kinds = |kinds: &[&str]| kinds.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+        assert_eq!(event_label(&kinds(&["tamper", "md", "pir"])), "Tampering, Motion, PIR motion");
+        assert_eq!(event_label(&kinds(&["md", "md"])), "Motion");
+        assert_eq!(event_label(&kinds(&["newkind", "loss"])), "newkind, Video loss");
+        assert_eq!(kind_label("crossline"), "Line crossing");
+        assert_eq!(kind_label("nonmotorveh"), "Non-motor vehicle");
+        // Every kind the event search asks for has a name of its own.
+        use reoling::protocol::bc::xml::{EVENT_SEARCH_ALARM_TYPES, EVENT_SEARCH_ALARM_TYPE_ITEMS};
+        for kind in EVENT_SEARCH_ALARM_TYPES.split(',').map(str::trim).chain(EVENT_SEARCH_ALARM_TYPE_ITEMS) {
+            assert_ne!(kind_label(kind), kind, "{kind} would be shown as the device names it");
+        }
+    }
+
+    #[test]
+    fn event_jumps_go_to_the_nearest_start_either_way() {
+        let day = CivilTime::start_of_day(2026, 10, 19);
+        let starts = event_starts(&events(), EventFilter::All, day);
+        assert_eq!(starts, vec![7_881.0, 12_000.0, 40_047.0], "two windows at one moment are one start");
+        assert_eq!(event_starts(&events(), EventFilter::Motion, day), vec![7_881.0, 12_000.0]);
+        assert_eq!(event_starts(&events(), EventFilter::Animal, day), vec![7_881.0, 40_047.0]);
+        assert!(event_starts(&events(), EventFilter::Vehicle, day).is_empty());
+        // Nothing on screen: the first, or the last.
+        assert_eq!(next_event_start(&starts, None), Some(7_881.0));
+        assert_eq!(previous_event_start(&starts, None), Some(40_047.0));
+        // Forward: the one just played from (the device starts a little
+        // before the seek time) is passed over.
+        assert_eq!(next_event_start(&starts, Some(0.0)), Some(7_881.0));
+        assert_eq!(next_event_start(&starts, Some(7_878.0)), Some(7_881.0));
+        assert_eq!(next_event_start(&starts, Some(7_880.0)), Some(12_000.0));
+        assert_eq!(next_event_start(&starts, Some(7_881.5)), Some(12_000.0));
+        assert_eq!(next_event_start(&starts, Some(40_047.0)), None);
+        // Back: to the start of the one playing, or to the one before.
+        assert_eq!(previous_event_start(&starts, Some(40_047.0)), Some(12_000.0));
+        assert_eq!(previous_event_start(&starts, Some(12_050.0)), Some(12_000.0));
+        assert_eq!(previous_event_start(&starts, Some(12_001.0)), Some(7_881.0));
+        assert_eq!(previous_event_start(&starts, Some(7_881.0)), None);
+        assert_eq!(next_event_start(&[], Some(0.0)), None);
+        assert_eq!(previous_event_start(&[], None), None);
     }
 
     #[test]

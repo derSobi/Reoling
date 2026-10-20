@@ -29,6 +29,14 @@ use tokio_stream::StreamExt;
 /// seconds late (up to about 8 s), so this is well above that.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long each message of an event-window search waits for its answer.
+/// The list is a decoration of the day's timeline, so a device that never
+/// answers (none seen so far) must not hold the day up for the full
+/// `REPLY_TIMEOUT` every time, but the wait stays above the late replies
+/// seen over a relay; after one unanswered start the client asks no more
+/// (see [`ReolinkClient::search_events`]).
+const EVENT_SEARCH_REPLY_WAIT: Duration = Duration::from_secs(10);
+
 /// How long starting live video waits for the device's answer to closing a
 /// playback that still runs. The answer only confirms the close; live
 /// video's own reader drops whatever of the playback still trails in (and a
@@ -43,6 +51,11 @@ const READ_SLICE: Duration = Duration::from_secs(1);
 /// is asked again while pages are full. This bounds the number of pages one
 /// day can take (a day of event recordings has been seen with 156 files).
 const MAX_SEARCH_PAGES: usize = 64;
+
+/// An event search returns 50 or 60 windows per page (NVR, Home Hub) and
+/// is asked again until a page says it is the last. This bounds the number
+/// of pages one day can take (a day has been seen with 380 windows).
+const MAX_EVENT_PAGES: usize = 200;
 
 /// How close to the file's end the footage received must come to count as
 /// "delivered to the end". At 16x the device sends I-frames only, so the
@@ -163,7 +176,7 @@ impl ReplaySpeed {
     }
 
     /// Whether the playback's audio is passed on: only at real time, the
-    /// only speed at which it can be played as it arrives.
+    /// only speed at which it is played (the device sends it up to 8x).
     pub fn plays_audio(self) -> bool {
         self == ReplaySpeed::X1
     }
@@ -222,6 +235,98 @@ impl RecordingFile {
             encrypted: listed.encrypted,
             has_audio: listed.has_audio,
         })
+    }
+}
+
+/// One event window of a day as the event search lists it: the span of a
+/// detection inside a recorded file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedEvent {
+    /// Device-local start and end (`start < end`).
+    pub start: CivilTime,
+    pub end: CivilTime,
+    /// What was detected, as the device names it (`md`, `people`,
+    /// `vehicle`, `dog_cat`, ...), each once, in the order listed. A window
+    /// the device lists under several kinds is one event with all of them.
+    pub kinds: Vec<String>,
+}
+
+/// One listed window: a span and one kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListedEvent {
+    start: CivilTime,
+    end: CivilTime,
+    kind: String,
+}
+
+/// The windows of one event-search page. An entry without a start, an end
+/// or a kind, or whose end lies before its start, is dropped; a window of
+/// no length is given one second, so that it still shows. A kind list
+/// (`md, people`) gives one window per kind.
+fn events_of_page(page: &AlarmVideoInfo) -> Vec<ListedEvent> {
+    page.entries()
+        .iter()
+        .filter_map(|entry| {
+            let (start, mut end) = (entry.start_time?, entry.end_time?);
+            if end < start {
+                return None;
+            }
+            if end == start {
+                end = start.add_seconds(1);
+            }
+            let kinds: Vec<String> = entry
+                .alarm_type
+                .as_deref()?
+                .split(',')
+                .map(str::trim)
+                .filter(|kind| !kind.is_empty())
+                .map(str::to_string)
+                .collect();
+            Some(kinds.into_iter().map(move |kind| ListedEvent { start, end, kind }))
+        })
+        .flatten()
+        .collect()
+}
+
+/// Sorts windows by start (then end) and folds those with the same span
+/// into one event that carries each of their kinds once.
+fn merge_events(mut listed: Vec<ListedEvent>) -> Vec<RecordedEvent> {
+    // A stable sort: the kinds of one window keep the order listed.
+    listed.sort_by_key(|event| (event.start, event.end));
+    let mut events: Vec<RecordedEvent> = Vec::new();
+    for ListedEvent { start, end, kind } in listed {
+        match events.last_mut() {
+            Some(last) if last.start == start && last.end == end => {
+                if !last.kinds.contains(&kind) {
+                    last.kinds.push(kind);
+                }
+            }
+            _ => events.push(RecordedEvent { start, end, kinds: vec![kind] }),
+        }
+    }
+    events
+}
+
+/// The pages of one event search, as they come in.
+#[derive(Debug, Default)]
+struct EventPages {
+    listed: Vec<ListedEvent>,
+    /// Pages taken in.
+    pages: usize,
+    /// Entries listed on them, before merging.
+    entries: usize,
+}
+
+impl EventPages {
+    /// Takes one page in. Whether another is to be asked for: not after the
+    /// page that says it is the last, nor after one that lists nothing (the
+    /// search would make no progress), nor past `MAX_EVENT_PAGES`.
+    fn take(&mut self, page: &AlarmVideoInfo) -> bool {
+        self.pages += 1;
+        let entries = page.entries().len();
+        self.entries += entries;
+        self.listed.extend(events_of_page(page));
+        !page.is_finished() && entries > 0 && self.pages < MAX_EVENT_PAGES
     }
 }
 
@@ -294,24 +399,36 @@ pub(crate) struct ActiveReplay {
 
 /// A started playback: its frames and its progress.
 ///
-/// Dropping `frames` stops the reader but does not close the playback on
+/// Dropping `units` stops the reader but does not close the playback on
 /// the device, which goes on sending the rest of the file: end it with
 /// [`ReolinkClient::stop_replay`] (a new playback, live video or a search
 /// on this client closes it too).
 pub struct ReplayStream {
-    /// Video frames in footage order, exactly as live video delivers them.
-    /// Audio goes to the client's audio channel (`take_audio`), at 1x only.
+    /// Video frames (exactly as live video delivers them) and, at 1x, the
+    /// audio units between them, in footage order: each audio unit comes
+    /// after the video frame it follows in the recording. Audio never goes
+    /// to the client's audio channel (`take_audio`), which is live only.
     /// An `Err` ends the stream (the connection failed); the end of the
     /// file does not: the device just stops sending, see
     /// [`ReplayStatus::at_end`] (and [`ReplayStatus::stalled`] for a pause
     /// short of the end).
-    pub frames: ReceiverStream<crate::Result<VideoFrame>>,
+    pub units: ReceiverStream<crate::Result<ReplayUnit>>,
     /// The info block that opened the playback (`None` if the device sent
     /// data without one): picture size and the file's span in UTC.
     pub info: Option<InfoBlock>,
     /// The sequence number this playback's data carry.
     pub seq: u32,
     pub progress: ReplayProgress,
+}
+
+/// One unit of a playback's data (see [`ReplayStream::units`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplayUnit {
+    Video(VideoFrame),
+    /// One AAC (ADTS) audio unit, after the video frame it follows. The
+    /// device sends about 16 a second (64 ms each) at 1x to 8x and none at
+    /// 16x; only at 1x are they handed on (see [`ReplaySpeed::plays_audio`]).
+    Audio(Vec<u8>),
 }
 
 /// A playback's progress, shared with the task that reads its data. Cheap
@@ -718,6 +835,12 @@ struct ReplayReader {
     /// Video frames at or before this footage time (and audio until the
     /// first video frame after it) repeat an earlier opening: dropped.
     skip_through: Option<u32>,
+    /// A video frame has been handed on. Audio before the first one is
+    /// dropped: an opening in the middle of a file can begin with a burst
+    /// of up to a few hundred audio units (24 s) ahead of its first video
+    /// frame, while its last seconds still carry their own audio, so that
+    /// burst is footage from before the picture starts.
+    seen_video: bool,
     /// The probe's device label, when the probe runs this playback.
     probe: Option<String>,
     buffer: Vec<u8>,
@@ -733,6 +856,7 @@ impl ReplayReader {
             seq,
             open_msg_num,
             skip_through,
+            seen_video: false,
             probe,
             buffer: Vec::new(),
             guard: MediaGuard::default(),
@@ -831,15 +955,27 @@ impl ReplayReader {
     /// the threshold ends the dropping. Footage times are compared as a
     /// signed difference, so across the clock's wrap too.
     fn is_repeat(&mut self, unit: &BcMediaMessage) -> bool {
-        let Some(after) = self.skip_through else {
-            return false;
+        let repeat = match self.skip_through {
+            None => false,
+            Some(after) => match unit {
+                BcMediaMessage::Video(frame) if frame.microseconds.wrapping_sub(after) as i32 > 0 => {
+                    self.skip_through = None;
+                    false
+                }
+                _ => true,
+            },
         };
+        if repeat {
+            return true;
+        }
         match unit {
-            BcMediaMessage::Video(frame) if frame.microseconds.wrapping_sub(after) as i32 > 0 => {
-                self.skip_through = None;
+            BcMediaMessage::Video(_) => {
+                self.seen_video = true;
                 false
             }
-            _ => true,
+            // Audio before the opening's first video frame (see `seen_video`).
+            BcMediaMessage::Audio(_) => !self.seen_video,
+            _ => false,
         }
     }
 
@@ -901,7 +1037,21 @@ fn expect_ok(bc: &Bc, what: &str) -> crate::Result<()> {
 }
 
 fn debug_replay() -> bool {
-    std::env::var("REOLING_DEBUG_REPLAY").is_ok() || std::env::var("REOLING_PROBE_REPLAY").is_ok()
+    std::env::var("REOLING_DEBUG_REPLAY").is_ok()
+        || std::env::var("REOLING_PROBE_REPLAY").is_ok()
+        || std::env::var("REOLING_PROBE_EVENTS").is_ok()
+}
+
+/// The channel `REOLING_PROBE_EVENTS` asks the event-search probe to run on.
+pub(super) fn probe_events_channel() -> Option<u8> {
+    let value = std::env::var("REOLING_PROBE_EVENTS").ok()?;
+    match value.trim().parse() {
+        Ok(channel_id) => Some(channel_id),
+        Err(_) => {
+            eprintln!("PROBE events: REOLING_PROBE_EVENTS must be a channel number, got {value:?}");
+            None
+        }
+    }
 }
 
 /// The channel `REOLING_PROBE_REPLAY` asks the playback probe to run on.
@@ -1141,6 +1291,121 @@ impl ReolinkClient {
         Ok(files)
     }
 
+    /// A request with its body and an Extension naming the channel (the
+    /// event search messages). Returns its `msg_num`.
+    async fn send_channel_request(&mut self, msg_id: u32, channel_id: u8, payload: Vec<u8>) -> crate::Result<u16> {
+        let msg_num = self.next_msg_num();
+        let extension = Extension { version: XML_VERSION.to_string(), channel_id: Some(channel_id), ..Default::default() };
+        let request = Bc {
+            meta: BcMeta { msg_id, channel_id, stream_type: 0, msg_num, response_code: 0, class: 0x6414 },
+            body: BcBody::Modern(ModernMsg { extension_xml: Some(extension.to_bytes()), payload: Some(payload) }),
+        };
+        self.connection.lock().await.send_bc(&request, &self.encryption).await?;
+        Ok(msg_num)
+    }
+
+    /// `send_channel_request`, then its answer, waiting up to `wait_for`.
+    async fn channel_request(
+        &mut self,
+        msg_id: u32,
+        channel_id: u8,
+        payload: Vec<u8>,
+        wait_for: Duration,
+    ) -> crate::Result<Bc> {
+        let msg_num = self.send_channel_request(msg_id, channel_id, payload).await?;
+        self.await_reply_within(msg_id, msg_num, wait_for).await
+    }
+
+    /// The event windows (motion, person, vehicle, animal and the like)
+    /// channel `channel_id` detected on the device-local day of `day` (its
+    /// time of day is ignored) for `stream`, sorted by start; a window
+    /// listed under several kinds is one event with all of them. Every kind
+    /// the device knows is asked for; filtering is the caller's. Fails while
+    /// a live stream or a playback runs on this client (a playback whose
+    /// frames were dropped is closed first). Each message waits
+    /// `EVENT_SEARCH_REPLY_WAIT` for its answer; once a device has left the
+    /// search's start unanswered, it is taken to have no event listing and
+    /// every later search on this connection lists nothing without asking.
+    pub async fn search_events(
+        &mut self,
+        channel_id: u8,
+        day: CivilTime,
+        stream: RecordStream,
+    ) -> crate::Result<Vec<RecordedEvent>> {
+        self.search_events_counting(channel_id, day, stream).await.map(|(events, _)| events)
+    }
+
+    /// `search_events`, also telling how many pages the device sent and how
+    /// many windows they listed before merging.
+    async fn search_events_counting(
+        &mut self,
+        channel_id: u8,
+        day: CivilTime,
+        stream: RecordStream,
+    ) -> crate::Result<(Vec<RecordedEvent>, (usize, usize))> {
+        if self.event_search_unanswered {
+            return Ok((Vec::new(), (0, 0)));
+        }
+        self.close_finished_replay().await;
+        self.ensure_no_stream("searching events")?;
+        if !CivilTime::start_of_day(day.year, day.month, day.day).is_valid() {
+            return Err(Error::ProtocolError("not a valid day".to_string()));
+        }
+        let uid = self.channel_uid(channel_id);
+        let start = FindAlarmVideo::whole_day(channel_id, uid, stream, day.year, day.month, day.day);
+        let reply = self
+            .channel_request(MSG_ID_EVENT_SEARCH_START, channel_id, start.to_bytes(), EVENT_SEARCH_REPLY_WAIT)
+            .await;
+        let reply = match reply {
+            Err(Error::ReplyTimeout) => {
+                self.event_search_unanswered = true;
+                return Err(Error::ReplyTimeout);
+            }
+            other => other?,
+        };
+        expect_ok(&reply, "event search")?;
+        let handle = reply_xml(&reply)?
+            .find_alarm_video
+            .and_then(|reply| reply.file_handle)
+            .ok_or_else(|| Error::ProtocolError("the event search reply has no search handle".to_string()))?;
+        let page_request = FindAlarmVideo::page(channel_id, handle).to_bytes();
+        let pages = self.event_pages(channel_id, &page_request).await;
+        // Release the search whatever happened to the pages.
+        let ended =
+            self.channel_request(MSG_ID_EVENT_SEARCH_END, channel_id, page_request, EVENT_SEARCH_REPLY_WAIT).await;
+        if let Err(e) = ended {
+            if debug_replay() {
+                eprintln!("replay: ending the event search failed: {e}");
+            }
+        }
+        let pages = pages?;
+        let counts = (pages.pages, pages.entries);
+        Ok((merge_events(pages.listed), counts))
+    }
+
+    /// Asks for pages until one says it is the last (see
+    /// [`EventPages::take`]).
+    async fn event_pages(&mut self, channel_id: u8, page_request: &[u8]) -> crate::Result<EventPages> {
+        let mut pages = EventPages::default();
+        loop {
+            let reply = self
+                .channel_request(MSG_ID_EVENT_SEARCH_NEXT, channel_id, page_request.to_vec(), EVENT_SEARCH_REPLY_WAIT)
+                .await?;
+            if reply.meta.response_code != 200 {
+                if pages.pages == 0 {
+                    expect_ok(&reply, "event search page request")?;
+                }
+                // A refusal after a page: no more pages.
+                break;
+            }
+            let page = reply_xml(&reply)?.alarm_video_info.unwrap_or_default();
+            if !pages.take(&page) {
+                break;
+            }
+        }
+        Ok(pages)
+    }
+
     fn next_replay_seq(&mut self) -> u32 {
         let seq = replay_seq_for(unix_now(), self.replay_opens, self.last_replay_seq);
         self.replay_opens = self.replay_opens.wrapping_add(1);
@@ -1223,9 +1488,9 @@ impl ReolinkClient {
         let seq = opened.seq;
         let progress = ReplayProgress::new(file, from, speed, seq, info);
         progress.on_foreign(opened.foreign);
-        let frames = self.spawn_replay_task(opened, from.after_microseconds, progress.clone(), forward_audio, probe);
+        let units = self.spawn_replay_task(opened, from.after_microseconds, progress.clone(), forward_audio, probe);
         self.replay = Some(ActiveReplay { file: file.clone(), progress: progress.clone() });
-        Ok(ReplayStream { frames, info, seq, progress })
+        Ok(ReplayStream { units, info, seq, progress })
     }
 
     /// Seek (123), then open (5) and wait for the info block. If the open
@@ -1372,10 +1637,11 @@ impl ReolinkClient {
     }
 
     /// The reader of one playback: data with its sequence number become
-    /// frames (and audio, if `forward_audio`), pushes are passed on,
-    /// everything else is dropped. Silence is normal (between GOPs, and at
-    /// the end of the file) and never ends it. Frames at or before
-    /// `skip_through` repeat an earlier opening and are dropped too.
+    /// units (video, plus audio if `forward_audio`, in order), pushes are
+    /// passed on, everything else is dropped. Silence is normal (between
+    /// GOPs, and at the end of the file) and never ends it. Frames at or
+    /// before `skip_through` repeat an earlier opening and are dropped too,
+    /// as is audio ahead of the opening's first video frame.
     fn spawn_replay_task(
         &mut self,
         opened: OpenedReplay,
@@ -1383,12 +1649,11 @@ impl ReolinkClient {
         progress: ReplayProgress,
         forward_audio: bool,
         probe: Option<&str>,
-    ) -> ReceiverStream<crate::Result<VideoFrame>> {
+    ) -> ReceiverStream<crate::Result<ReplayUnit>> {
         let (tx, rx) = channel(32);
         let connection = Arc::clone(&self.connection);
         let encryption = self.encryption.clone();
         let channel_updates = self.channel_updates_tx.clone();
-        let audio = self.audio_tx.clone();
         let pending_images = Arc::clone(&self.pending_images);
         let channel_uids = Arc::clone(&self.channel_uids);
         let mut reader = ReplayReader::new(opened.seq, opened.open_msg_num, skip_through, probe.map(str::to_string));
@@ -1442,16 +1707,20 @@ impl ReolinkClient {
                     match unit {
                         BcMediaMessage::Video(frame) => {
                             let (microseconds, keyframe) = (frame.microseconds, frame.is_keyframe);
-                            if !send_frame(&tx, frame, &progress).await {
+                            if !send_unit(&tx, ReplayUnit::Video(frame), &progress).await {
                                 progress.mark_ended();
-                                return; // the frames were dropped
+                                return; // the units were dropped
                             }
                             // Counted once handed on: what the consumer has
                             // is what a resume carries on from.
                             progress.on_frame(microseconds, keyframe);
                         }
                         BcMediaMessage::Audio(aac) if forward_audio => {
-                            let _ = audio.send(aac);
+                            // In order with the video, on the same stream.
+                            if !send_unit(&tx, ReplayUnit::Audio(aac), &progress).await {
+                                progress.mark_ended();
+                                return;
+                            }
                         }
                         _ => {}
                     }
@@ -1521,6 +1790,96 @@ impl ReolinkClient {
         self.channel_uid(channel_id).is_some()
     }
 
+    /// The latest recorded day of channel `channel_id` from the calendar of
+    /// the current month (or the one before), reported on stderr with lines
+    /// that start with `prefix`.
+    async fn probe_latest_day(&mut self, channel_id: u8, prefix: &str) -> Option<CivilTime> {
+        let now = CivilTime::from_epoch_seconds(unix_now() as i64);
+        for (year, month) in current_and_previous_month(now) {
+            match self.search_month(channel_id, year, month).await {
+                Ok(days) => {
+                    eprintln!("{prefix}: calendar {year}-{month:02}: days with recordings {days:?}");
+                    if let Some(&d) = days.last() {
+                        return Some(CivilTime::start_of_day(year, month, d));
+                    }
+                }
+                Err(e) => eprintln!("{prefix}: calendar {year}-{month:02} failed: {e}"),
+            }
+        }
+        None
+    }
+
+    /// Diagnostic-only (`REOLING_PROBE_EVENTS=<channel>`): lists the event
+    /// windows of the latest recorded day of one channel, for the sub and
+    /// the main stream, and reports on stderr with lines that start with
+    /// "PROBE events [tag]", `tag` naming the device (every device the app
+    /// connects to runs the probe): how many events and pages, how long the
+    /// search took, the span from the first start to the last end, a
+    /// histogram of the kinds, how many events lie inside a listed
+    /// recording, and the first few windows. Never prints the camera UID.
+    pub(super) async fn probe_events(&mut self, channel_id: u8, tag: &str) {
+        eprintln!("PROBE events [{tag}]: channel {channel_id}");
+        let has_uid = self.wait_for_channel_uid(channel_id, Duration::from_secs(10)).await;
+        eprintln!(
+            "PROBE events [{tag}]: camera uid for channel {channel_id}: {}",
+            if has_uid { "present (sent in the requests)" } else { "absent (requests go without <uid>)" }
+        );
+        let Some(day) = self.probe_latest_day(channel_id, &format!("PROBE events [{tag}]")).await else {
+            eprintln!("PROBE events [{tag}]: no recorded day found; done");
+            return;
+        };
+        for stream in [RecordStream::Sub, RecordStream::Main] {
+            let files = match self.search_day(channel_id, day, stream).await {
+                Ok(files) => files,
+                Err(e) => {
+                    eprintln!("PROBE events [{tag}]: {stream:?} day search failed: {e}");
+                    Vec::new()
+                }
+            };
+            let started = Instant::now();
+            let (events, (pages, entries)) = match self.search_events_counting(channel_id, day, stream).await {
+                Ok(found) => found,
+                Err(e) => {
+                    eprintln!("PROBE events [{tag}]: {stream:?} event search failed after {:.2} s: {e}", started.elapsed().as_secs_f64());
+                    continue;
+                }
+            };
+            let mut kinds: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+            for event in &events {
+                for kind in &event.kinds {
+                    *kinds.entry(kind).or_default() += 1;
+                }
+            }
+            let multi = events.iter().filter(|e| e.kinds.len() > 1).count();
+            let inside = events.iter().filter(|e| files.iter().any(|f| f.contains(e.start))).count();
+            let span = match (events.first(), events.iter().map(|e| e.end).max()) {
+                (Some(first), Some(last)) => format!("{} .. {}", civil(&first.start), civil(&last)),
+                _ => "none".to_string(),
+            };
+            eprintln!(
+                "PROBE events [{tag}]: {stream:?} on {:04}-{:02}-{:02}: {} events from {entries} listed windows in {pages} pages, {:.2} s; span {span}; {multi} windows with several kinds; {inside} of {} start inside one of the {} listed files",
+                day.year,
+                day.month,
+                day.day,
+                events.len(),
+                started.elapsed().as_secs_f64(),
+                events.len(),
+                files.len(),
+            );
+            eprintln!("PROBE events [{tag}]: {stream:?} kinds {kinds:?}");
+            for event in events.iter().take(8) {
+                eprintln!(
+                    "PROBE events [{tag}]:   {} .. {} ({} s) {}",
+                    civil(&event.start),
+                    civil(&event.end),
+                    event.end.to_epoch_seconds() - event.start.to_epoch_seconds(),
+                    event.kinds.join(",")
+                );
+            }
+        }
+        eprintln!("PROBE events [{tag}]: done");
+    }
+
     /// Diagnostic-only (`REOLING_PROBE_REPLAY=<channel>`): a scripted
     /// playback session on one channel, reported on stderr with lines that
     /// start with "PROBE replay [tag]", `tag` naming the device (every
@@ -1548,21 +1907,7 @@ impl ReolinkClient {
             "PROBE replay [{tag}]: camera uid for channel {channel_id}: {}",
             if has_uid { "present (sent in the requests)" } else { "absent (requests go without <uid>)" }
         );
-        let now = CivilTime::from_epoch_seconds(unix_now() as i64);
-        let mut day = None;
-        for (year, month) in current_and_previous_month(now) {
-            match self.search_month(channel_id, year, month).await {
-                Ok(days) => {
-                    eprintln!("PROBE replay [{tag}]: calendar {year}-{month:02}: days with recordings {days:?}");
-                    if let Some(&d) = days.last() {
-                        day = Some(CivilTime::start_of_day(year, month, d));
-                        break;
-                    }
-                }
-                Err(e) => eprintln!("PROBE replay [{tag}]: calendar {year}-{month:02} failed: {e}"),
-            }
-        }
-        let Some(day) = day else {
+        let Some(day) = self.probe_latest_day(channel_id, &format!("PROBE replay [{tag}]")).await else {
             eprintln!("PROBE replay [{tag}]: no recorded day found; done");
             return;
         };
@@ -1690,13 +2035,14 @@ impl ReolinkClient {
             }
         };
         let opened_after = opening.elapsed();
-        let ReplayStream { mut frames, progress, seq, .. } = stream;
+        let ReplayStream { mut units, progress, seq, .. } = stream;
         let (mut video_frames, mut keyframes, mut video_bytes) = (0u64, 0u64, 0u64);
         let mut first_frame_at: Option<Instant> = None;
         let counting = async {
-            while let Some(item) = frames.next().await {
+            while let Some(item) = units.next().await {
                 match item {
-                    Ok(frame) => {
+                    Ok(ReplayUnit::Audio(_)) => {}
+                    Ok(ReplayUnit::Video(frame)) => {
                         first_frame_at.get_or_insert_with(Instant::now);
                         video_frames += 1;
                         keyframes += u64::from(frame.is_keyframe);
@@ -1737,7 +2083,7 @@ impl ReolinkClient {
             status.at_end(),
             status.stalled(),
         );
-        drop(frames);
+        drop(units);
         match self.stop_replay().await {
             Ok(()) => eprintln!("PROBE replay [{tag}]: close (7) answered with code 200"),
             Err(e) => eprintln!("PROBE replay [{tag}]: close (7): {e}"),
@@ -1746,16 +2092,16 @@ impl ReolinkClient {
     }
 }
 
-/// Hands one frame to the consumer. A full channel means the consumer is
+/// Hands one unit to the consumer. A full channel means the consumer is
 /// behind (the device sends ahead of real time); the wait for it is marked
-/// so that it is not taken for device silence. `false` once the frames
+/// so that it is not taken for device silence. `false` once the units
 /// have been dropped.
-async fn send_frame(
-    tx: &tokio::sync::mpsc::Sender<crate::Result<VideoFrame>>,
-    frame: VideoFrame,
+async fn send_unit(
+    tx: &tokio::sync::mpsc::Sender<crate::Result<ReplayUnit>>,
+    unit: ReplayUnit,
     progress: &ReplayProgress,
 ) -> bool {
-    match tx.try_send(Ok(frame)) {
+    match tx.try_send(Ok(unit)) {
         Ok(()) => true,
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
         Err(tokio::sync::mpsc::error::TrySendError::Full(item)) => {
@@ -1815,6 +2161,98 @@ mod tests {
             encrypted: false,
             has_audio: true,
         }
+    }
+
+    // ---- event list ----------------------------------------------------------
+
+    fn window(start: CivilTime, end: CivilTime, kind: &str) -> AlarmVideo {
+        AlarmVideo {
+            start_time: Some(start),
+            end_time: Some(end),
+            alarm_type: Some(kind.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn page(finished: u8, entries: Vec<AlarmVideo>) -> AlarmVideoInfo {
+        AlarmVideoInfo {
+            finished: Some(finished),
+            alarm_video_list: Some(AlarmVideoList { entries }),
+            ..Default::default()
+        }
+    }
+
+    fn event(start: CivilTime, end: CivilTime, kinds: &[&str]) -> RecordedEvent {
+        RecordedEvent { start, end, kinds: kinds.iter().map(|k| k.to_string()).collect() }
+    }
+
+    #[test]
+    fn listed_windows_merge_into_events() {
+        // As a Home Hub lists them: one window under two kinds (once
+        // twice), an overlapping window, and unsorted entries.
+        let listed = events_of_page(&page(
+            0,
+            vec![
+                window(t(2, 11, 22), t(2, 11, 49), "md"),
+                window(t(2, 11, 21), t(2, 11, 55), "dog_cat"),
+                window(t(2, 11, 21), t(2, 11, 55), "people"),
+                window(t(2, 11, 21), t(2, 11, 55), "dog_cat"),
+                window(t(5, 3, 6), t(5, 3, 30), "md, people"),
+            ],
+        ));
+        assert_eq!(listed.len(), 6, "a kind list is one window per kind");
+        assert_eq!(
+            merge_events(listed),
+            vec![
+                event(t(2, 11, 21), t(2, 11, 55), &["dog_cat", "people"]),
+                event(t(2, 11, 22), t(2, 11, 49), &["md"]),
+                event(t(5, 3, 6), t(5, 3, 30), &["md", "people"]),
+            ]
+        );
+        assert!(merge_events(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn unusable_windows_are_dropped_and_empty_ones_given_a_second() {
+        let listed = events_of_page(&page(
+            1,
+            vec![
+                window(t(1, 0, 0), t(0, 59, 0), "md"),
+                window(t(1, 0, 0), t(1, 0, 0), "md"),
+                AlarmVideo { start_time: Some(t(2, 0, 0)), alarm_type: Some("md".to_string()), ..Default::default() },
+                AlarmVideo { start_time: Some(t(3, 0, 0)), end_time: Some(t(3, 0, 5)), ..Default::default() },
+                window(t(4, 0, 0), t(4, 0, 5), " , "),
+            ],
+        ));
+        assert_eq!(listed, vec![ListedEvent { start: t(1, 0, 0), end: t(1, 0, 1), kind: "md".to_string() }]);
+    }
+
+    #[test]
+    fn event_pages_are_asked_for_until_the_last_one() {
+        let full: Vec<AlarmVideo> = (0..50).map(|i| window(t(0, i, 0), t(0, i, 30), "md")).collect();
+        let mut pages = EventPages::default();
+        assert!(pages.take(&page(0, full.clone())), "not the last page: ask for the next");
+        assert!(!pages.take(&page(1, full[..30].to_vec())), "the last page");
+        assert_eq!((pages.pages, pages.entries, pages.listed.len()), (2, 80, 80));
+        // A full page that says it is the last is the last.
+        let mut pages = EventPages::default();
+        assert!(!pages.take(&page(1, full.clone())));
+        // A page listing nothing ends the search, whatever it says.
+        let mut pages = EventPages::default();
+        assert!(!pages.take(&page(0, Vec::new())));
+        assert_eq!((pages.pages, pages.entries), (1, 0));
+        // A page that does not say is not the last...
+        let mut pages = EventPages::default();
+        let unsaid = AlarmVideoInfo { alarm_video_list: Some(AlarmVideoList { entries: full.clone() }), ..Default::default() };
+        assert!(pages.take(&unsaid));
+        // ...and the page limit still ends the search.
+        let mut pages = EventPages::default();
+        for _ in 1..MAX_EVENT_PAGES {
+            assert!(pages.take(&page(0, full.clone())));
+        }
+        assert!(!pages.take(&page(0, full.clone())));
+        assert_eq!(pages.pages, MAX_EVENT_PAGES);
+        assert_eq!(merge_events(pages.listed).len(), 50, "the same windows on every page merge into one set");
     }
 
     // ---- sequence numbers --------------------------------------------------
@@ -2321,9 +2759,45 @@ mod tests {
         assert!(matches!(kept.as_slice(), [
             BcMediaMessage::Video(a), BcMediaMessage::Audio(sound), BcMediaMessage::Video(b)
         ] if a.microseconds == after.wrapping_add(100_000) && sound == &vec![0xff, 3] && b.microseconds == 49_999));
-        // Without a threshold nothing is a repeat.
+        // Without a threshold no video frame is a repeat, and audio is handed
+        // on from the first video frame.
         let mut plain = ReplayReader::new(seq, 20, None, None);
+        assert!(!plain.is_repeat(&BcMediaMessage::Video(frame_at(1))));
         assert!(!plain.is_repeat(&BcMediaMessage::Audio(vec![1])));
+    }
+
+    #[test]
+    fn audio_ahead_of_an_openings_first_video_frame_is_dropped() {
+        // An opening in the middle of a file: a burst of audio, then the
+        // first key frame and the audio that belongs to the picture.
+        let mut reader = ReplayReader::new(7, 20, None, None);
+        let dropped: Vec<bool> = [
+            BcMediaMessage::Audio(vec![1]),
+            BcMediaMessage::Audio(vec![2]),
+            BcMediaMessage::Info { width: 640, height: 360 },
+            BcMediaMessage::Audio(vec![3]),
+            BcMediaMessage::Video(frame_at(1_000_000)),
+            BcMediaMessage::Audio(vec![4]),
+            BcMediaMessage::Video(frame_at(1_100_000)),
+            BcMediaMessage::Audio(vec![5]),
+        ]
+        .iter()
+        .map(|unit| reader.is_repeat(unit))
+        .collect();
+        assert_eq!(dropped, [true, true, false, true, false, false, false, false]);
+        // The same when the opening resumes an earlier one: audio before the
+        // first new video frame is a repeat, audio before the first video
+        // frame at all is the burst.
+        let mut resumed = ReplayReader::new(7, 20, Some(500_000), None);
+        assert!(resumed.is_repeat(&BcMediaMessage::Audio(vec![1])));
+        assert!(resumed.is_repeat(&BcMediaMessage::Video(frame_at(400_000))));
+        assert!(resumed.is_repeat(&BcMediaMessage::Audio(vec![2])));
+        assert!(!resumed.is_repeat(&BcMediaMessage::Video(frame_at(600_000))));
+        assert!(!resumed.is_repeat(&BcMediaMessage::Audio(vec![3])));
+    }
+
+    fn frame_at(microseconds: u32) -> VideoFrame {
+        VideoFrame { video_type: VideoType::H264, is_keyframe: true, microseconds, data: vec![0, 0, 0, 1, 0x65] }
     }
 
     #[test]
@@ -2361,6 +2835,14 @@ mod tests {
         extra.extend_from_slice(&[0x15, 0x01, 0xc3, 0x00]);
         unit.splice(24..24, extra);
         unit
+    }
+
+    /// The next unit of a stream as a video frame (panics on anything else).
+    fn video(item: Option<crate::Result<ReplayUnit>>) -> VideoFrame {
+        match item.expect("a unit").expect("no error") {
+            ReplayUnit::Video(frame) => frame,
+            ReplayUnit::Audio(_) => panic!("a video frame was expected, not audio"),
+        }
     }
 
     fn aac_unit(bytes: &[u8]) -> Vec<u8> {
@@ -2605,9 +3087,9 @@ mod tests {
         let info = stream.info.expect("the info block");
         assert_eq!((info.width, info.height), (640, 360));
         assert_eq!(info.start_utc, Some(CivilTime::new(2026, 10, 17, 6, 21, 7)));
-        let first = stream.frames.next().await.unwrap().unwrap();
+        let first = video(stream.units.next().await);
         assert_eq!((first.microseconds, first.is_keyframe, first.data.as_slice()), (1_000_000, true, &[0, 0, 0, 1, 0x67][..]));
-        let second = stream.frames.next().await.unwrap().unwrap();
+        let second = video(stream.units.next().await);
         assert_eq!((second.microseconds, second.is_keyframe), (1_100_000, false));
         let status = stream.progress.status();
         assert_eq!((status.frames, status.footage_micros, status.position()), (2, 100_000, seek_at));
@@ -2683,7 +3165,7 @@ mod tests {
         let mut stream = client.start_replay(&file, file.start, ReplaySpeed::X1).await.unwrap();
         let info = stream.info.expect("the info block, not the earlier code-200 messages");
         assert_eq!((info.width, info.height), (640, 360));
-        let first = stream.frames.next().await.unwrap().unwrap();
+        let first = video(stream.units.next().await);
         assert_eq!(first.microseconds, 1_000_000);
         client.stop_replay().await.unwrap();
         fake.await.unwrap();
@@ -2729,9 +3211,11 @@ mod tests {
         });
 
         let mut stream = client.resume_replay(&file, from, ReplaySpeed::X1).await.unwrap();
-        let first = stream.frames.next().await.unwrap().unwrap();
+        let first = video(stream.units.next().await);
         assert_eq!((first.microseconds, first.is_keyframe, first.data.as_slice()), (1_300_000, false, &[4][..]));
-        assert_eq!(audio.recv().await, Some(vec![0xff, 2]), "the repeated audio is dropped");
+        // The repeated audio is dropped; the new one follows its frame on
+        // the same stream, never on the live audio channel.
+        assert_eq!(stream.units.next().await.unwrap().unwrap(), ReplayUnit::Audio(vec![0xff, 2]));
         let status = stream.progress.status();
         assert_eq!((status.frames, status.first_microseconds), (1, Some(1_300_000)));
         assert_eq!(status.skip_through_microseconds, Some(1_200_000));
@@ -2770,7 +3254,7 @@ mod tests {
             device.send_bc(&reply(MSG_ID_REPLAY_CLOSE, close.meta.msg_num, None), &PLAIN).await.unwrap();
         });
         let mut stream = client.start_replay(&file, file.start, ReplaySpeed::X1).await.unwrap();
-        let first = stream.frames.next().await.unwrap().unwrap();
+        let first = video(stream.units.next().await);
         assert_eq!(first.microseconds, 1_000_000);
         assert_eq!(stream.progress.status().foreign_messages, 3, "two during the seek wait, one during the open's");
         client.stop_replay().await.unwrap();
@@ -2828,6 +3312,27 @@ mod tests {
         assert!(waited >= LIVE_SWITCH_CLOSE_WAIT && waited < REPLY_TIMEOUT, "waited {waited:?}");
         assert!(client.connection.lock().await.has_live_buffering(), "no replay bound may linger into live video");
         assert!(client.replay_progress().is_none());
+        fake.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_event_search_is_given_up_within_its_own_wait_and_not_asked_again() {
+        let (mut client, mut device) = client_and_device().await;
+        let fake = tokio::spawn(async move {
+            let start = device.recv_bc(&PLAIN).await.unwrap();
+            assert_eq!(start.meta.msg_id, MSG_ID_EVENT_SEARCH_START);
+            // Never answered. Nothing more may be asked afterwards.
+            let more = tokio::time::timeout(Duration::from_millis(500), device.recv_bc(&PLAIN)).await;
+            assert!(more.is_err(), "a second event search was sent: {more:?}");
+        });
+        let started = Instant::now();
+        let first = client.search_events(0, t(0, 0, 0), RecordStream::Sub).await;
+        let waited = started.elapsed();
+        assert!(matches!(first, Err(Error::ReplyTimeout)), "{first:?}");
+        assert!(waited >= EVENT_SEARCH_REPLY_WAIT && waited < REPLY_TIMEOUT, "waited {waited:?}");
+        let started = Instant::now();
+        assert_eq!(client.search_events(0, t(0, 0, 0), RecordStream::Sub).await.unwrap(), Vec::new());
+        assert!(started.elapsed() < Duration::from_millis(200), "listed nothing without asking");
         fake.await.unwrap();
     }
 
