@@ -24,7 +24,7 @@ More on <https://reoling.eu>.
 
 ## Status
 
-Version **0.1.25**, early development. Login, live video and playback work
+Version **0.1.26**, early development. Login, live video and playback work
 end to end against real hardware (a Home Hub, an NVR and their cameras),
 over UDP/P2P only: Reoling races the device's local, NAT-mapped and relay
 addresses at the same time and uses whichever answers first, as the
@@ -49,9 +49,15 @@ official client does.
   them as bands and seeks with a click or the arrow keys (10 s, 60 s with
   Shift), zooms with the wheel or `+`/`-` (Home shows the whole day again)
   and pans with a drag. Play/pause, speeds from 0.25× to 16×, main or sub
-  stream, and playback goes on into the next recording by itself. It runs
-  over the same UDP P2P connection as live video, which pauses while the
-  tab is open and comes back as it was. Playback is silent for now.
+  stream, and playback goes on into the next recording by itself. At 1×
+  the recording's sound plays in sync with the picture, at the volume set
+  for live view; the other speeds are silent. The camera's detections
+  are drawn as event bars over the recordings on the day timeline (the
+  tooltip names them), a detection filter narrows them to any motion,
+  person, vehicle, animal, package or line crossing / zone, and
+  previous/next-event buttons jump between them. It runs over the same
+  UDP P2P connection as live video, which pauses while the tab is open
+  and comes back as it was.
 - Camera controls, shown per channel from what the camera reports: siren,
   spotlight, and — in a separate "Camera control" window, independent of the
   main window — pan/tilt (hold a direction to move) and zoom/focus on its
@@ -95,7 +101,7 @@ official client does.
 **Not done yet**
 
 - Split View, zoom on cameras behind an NVR's sub-channel numbering.
-- Playback: sound, events and downloading recordings.
+- Playback: downloading recordings.
 - PTZ calibration has no separate "finished" signal from the camera — the
   app only knows the request was accepted, matching what's documented for
   Baichuan generally, not a limitation specific to this capture.
@@ -110,6 +116,11 @@ official client does.
 
 **Version history**
 
+- 0.1.26 — Playback: sound, at 1× and in sync with the picture (the other
+  speeds are silent); the camera's detections as event bars on the day
+  timeline, a detection filter (any motion, person, vehicle, animal,
+  package, line crossing / zone) and previous/next-event buttons to jump
+  between them.
 - 0.1.25 — Playback: recorded video per camera of a Home Hub or NVR (or of
   a camera on its own), over the same UDP P2P connection as live video. A
   calendar marks the days with recordings; the day timeline seeks, zooms
@@ -252,7 +263,7 @@ src/
 ├── transport/   P2P/UDP: UID resolution, NAT traversal, relay fallback,
 │                and the reliable BCUDP connection.
 ├── client.rs    Client/session API: login and live video;
-│                `client/replay.rs`: recordings and playback.
+│                `client/replay.rs`: recordings, events and playback.
 ├── talk.rs      ADPCM encoding for Talk.
 ├── ui/          GTK4 + GStreamer desktop app (main window, sidebar,
 │                dialogs, settings, playback, video and audio).

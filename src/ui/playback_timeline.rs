@@ -1,9 +1,10 @@
 //! The day timeline of the Playback page: one selected day of recordings
-//! drawn as bands on a 24-hour track, with hour ticks, a hover line and the
-//! playback cursor. A click asks for a seek; the wheel zooms around the
-//! pointer (down to a two-minute window) and a drag, a horizontal or a
-//! Shift+wheel scroll pans. The arrow keys seek from the cursor, `+`/`-`
-//! zoom around it and Home shows the whole day again.
+//! drawn as bands on a 24-hour track, its event windows as an accent band
+//! over them, with hour ticks, a hover line and the playback cursor. A
+//! click asks for a seek; the wheel zooms around the pointer (down to a
+//! two-minute window) and a drag, a horizontal or a Shift+wheel scroll
+//! pans. The arrow keys seek from the cursor, `+`/`-` zoom around it and
+//! Home shows the whole day again.
 //!
 //! Everything is in seconds of the selected day (device-local): the widget
 //! knows no dates or zones, and leaves the meaning of a seek (which file,
@@ -43,8 +44,20 @@ const PAN_PER_NOTCH: f64 = 0.1;
 /// Where a followed cursor lands after paging, as a share of the window.
 const FOLLOW_LEAD: f64 = 0.1;
 const HEIGHT: i32 = 56;
+/// The event band takes this share of the recording band's height, from
+/// its top.
+const EVENT_BAND_SHARE: f64 = 0.45;
 /// Accent when the theme names none (the usual GNOME blue).
 const FALLBACK_ACCENT: (f64, f64, f64) = (0x35 as f64 / 255.0, 0x84 as f64 / 255.0, 0xe4 as f64 / 255.0);
+
+/// One event window of the day: half-open `[start, end)` seconds of the
+/// day, and what to call it in the tooltip ("Motion", "Person, Animal").
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimelineEvent {
+    pub start: f64,
+    pub end: f64,
+    pub label: String,
+}
 
 /// The visible window, in seconds of the day.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -149,6 +162,26 @@ fn merge_spans(spans: &[(f64, f64)]) -> Vec<(f64, f64)> {
     merged
 }
 
+/// Valid events (`start < end`, finite), sorted by start then end.
+fn sort_events(events: &[TimelineEvent]) -> Vec<TimelineEvent> {
+    let mut sorted: Vec<TimelineEvent> =
+        events.iter().filter(|e| e.start.is_finite() && e.end.is_finite() && e.start < e.end).cloned().collect();
+    sorted.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.end.total_cmp(&b.end)));
+    sorted
+}
+
+/// The labels of the events holding `t`, each once, in the events' order.
+/// `sorted` comes from [`sort_events`].
+fn labels_at(sorted: &[TimelineEvent], t: f64) -> Vec<&str> {
+    let mut labels: Vec<&str> = Vec::new();
+    for event in sorted.iter().take_while(|e| e.start <= t).filter(|e| t < e.end) {
+        if !labels.contains(&event.label.as_str()) {
+            labels.push(&event.label);
+        }
+    }
+    labels
+}
+
 /// What a seek to `t` would play, by the same rules as the client's
 /// `file_for_time`: the last span holding `t` (the later file of an overlap)
 /// from `t`; else the first span after `t` from its start; else nothing
@@ -223,6 +256,10 @@ struct State {
     spans: Vec<(f64, f64)>,
     /// The same, merged (for drawing).
     merged: Vec<(f64, f64)>,
+    /// The day's event windows, sorted (for the tooltip).
+    events: Vec<TimelineEvent>,
+    /// The same, merged (for drawing).
+    events_merged: Vec<(f64, f64)>,
     position: Option<f64>,
     view: View,
     /// Page the view along with the cursor.
@@ -240,6 +277,8 @@ impl State {
             day: None,
             spans: Vec::new(),
             merged: Vec::new(),
+            events: Vec::new(),
+            events_merged: Vec::new(),
             position: None,
             view: View::WHOLE_DAY,
             follow: true,
@@ -396,15 +435,17 @@ impl PlaybackTimeline {
         &self.area
     }
 
-    /// A new day (or none): clears files and cursor, shows the whole day.
-    /// Only whether there is a day matters here; the widget's unit is
-    /// seconds of that day.
+    /// A new day (or none): clears files, events and cursor, shows the
+    /// whole day. Only whether there is a day matters here; the widget's
+    /// unit is seconds of that day.
     pub fn set_day(&self, day: Option<(u16, u8, u8)>) {
         {
             let mut state = self.state.borrow_mut();
             state.day = day;
             state.spans.clear();
             state.merged.clear();
+            state.events.clear();
+            state.events_merged.clear();
             state.position = None;
             state.view = View::WHOLE_DAY;
             state.follow = true;
@@ -425,6 +466,23 @@ impl PlaybackTimeline {
             }
             state.merged = merge_spans(&spans);
             state.spans = spans;
+        }
+        self.area.queue_draw();
+    }
+
+    /// The day's event windows to mark, any order, overlaps allowed; they
+    /// are drawn merged over the recordings, and the tooltip names the
+    /// ones under the pointer. The caller filters.
+    pub fn set_events(&self, events: &[TimelineEvent]) {
+        let events = sort_events(events);
+        {
+            let mut state = self.state.borrow_mut();
+            if state.events == events {
+                return;
+            }
+            let spans: Vec<(f64, f64)> = events.iter().map(|e| (e.start, e.end)).collect();
+            state.events_merged = merge_spans(&spans);
+            state.events = events;
         }
         self.area.queue_draw();
     }
@@ -586,22 +644,26 @@ impl PlaybackTimeline {
         }
     }
 
-    /// The time under the pointer, and in a gap where a click would play
-    /// from.
+    /// The time under the pointer, the events there, and in a gap where a
+    /// click would play from.
     fn tooltip_text(&self, x: f64) -> Option<String> {
         let state = self.state.borrow();
         if state.day.is_none() {
             return None;
         }
         let at = x_to_time(state.view, self.width(), x);
-        let clock = format_clock(at);
+        let mut text = format_clock(at);
+        let labels = labels_at(&state.events, at);
+        if !labels.is_empty() {
+            text = format!("{text}\n{}", labels.join(", "));
+        }
         if state.spans.is_empty() {
-            return Some(clock);
+            return Some(text);
         }
         Some(match file_for_time(&state.spans, at) {
-            Some((_, from)) if from == at => clock,
-            Some((_, from)) => format!("{clock}\nNo recording · plays from {}", format_clock(from)),
-            None => format!("{clock}\nNothing after this point"),
+            Some((_, from)) if from == at => text,
+            Some((_, from)) => format!("{text}\nNo recording · plays from {}", format_clock(from)),
+            None => format!("{text}\nNothing after this point"),
         })
     }
 
@@ -666,6 +728,19 @@ impl PlaybackTimeline {
             let x0 = time_to_x(view, width, start.max(view.start));
             let x1 = time_to_x(view, width, end.min(view.end()));
             cr.rectangle(x0, band_top, (x1 - x0).max(1.0), band_height);
+        }
+        cr.fill()?;
+
+        // Events, as an accent band over the top of the recordings.
+        let event_height = (band_height * EVENT_BAND_SHARE).round().max(2.0);
+        cr.set_source_rgba(accent.0, accent.1, accent.2, 0.9);
+        for &(start, end) in &state.events_merged {
+            if end <= view.start || start >= view.end() {
+                continue;
+            }
+            let x0 = time_to_x(view, width, start.max(view.start));
+            let x1 = time_to_x(view, width, end.min(view.end()));
+            cr.rectangle(x0, band_top, (x1 - x0).max(1.0), event_height);
         }
         cr.fill()?;
 
@@ -967,6 +1042,41 @@ mod tests {
         assert_eq!(file_for_time(&midnight, 0.0), Some((0, 0.0)));
         assert_eq!(file_for_time(&midnight, 300.0), None);
         assert_eq!(file_for_time(&[], 10.0), None);
+    }
+
+    fn event(start: f64, end: f64, label: &str) -> TimelineEvent {
+        TimelineEvent { start, end, label: label.to_string() }
+    }
+
+    #[test]
+    fn events_are_sorted_merged_for_drawing_and_named_under_the_pointer() {
+        let events = sort_events(&[
+            event(hms(11, 7, 27), hms(11, 7, 57), "Animal"),
+            event(hms(2, 11, 22), hms(2, 11, 49), "Motion"),
+            event(hms(2, 11, 21), hms(2, 11, 55), "Animal, Person"),
+            event(hms(2, 11, 50), hms(2, 12, 10), "Motion"),
+            // Reversed, empty and NaN windows are dropped.
+            event(hms(3, 0, 0), hms(2, 0, 0), "Motion"),
+            event(hms(3, 0, 0), hms(3, 0, 0), "Motion"),
+            event(f64::NAN, hms(3, 0, 5), "Motion"),
+        ]);
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].start, hms(2, 11, 21));
+        assert_eq!(events[3].start, hms(11, 7, 27));
+        // Overlapping and touching windows draw as one bar.
+        let spans: Vec<(f64, f64)> = events.iter().map(|e| (e.start, e.end)).collect();
+        assert_eq!(merge_spans(&spans), vec![(hms(2, 11, 21), hms(2, 12, 10)), (hms(11, 7, 27), hms(11, 7, 57))]);
+        // The tooltip names what lies under the pointer, each label once.
+        assert_eq!(labels_at(&events, hms(2, 11, 30)), vec!["Animal, Person", "Motion"]);
+        assert_eq!(labels_at(&events, hms(2, 11, 21)), vec!["Animal, Person"]);
+        assert_eq!(labels_at(&events, hms(2, 11, 49)), vec!["Animal, Person"], "a window's end is not in it");
+        assert_eq!(labels_at(&events, hms(2, 12, 0)), vec!["Motion"]);
+        assert!(labels_at(&events, hms(2, 12, 10)).is_empty());
+        assert!(labels_at(&events, hms(10, 0, 0)).is_empty());
+        assert_eq!(labels_at(&events, hms(11, 7, 40)), vec!["Animal"]);
+        assert!(labels_at(&[], hms(11, 7, 40)).is_empty());
+        let twice = sort_events(&[event(10.0, 20.0, "Motion"), event(12.0, 30.0, "Motion")]);
+        assert_eq!(labels_at(&twice, 15.0), vec!["Motion"]);
     }
 
     #[test]

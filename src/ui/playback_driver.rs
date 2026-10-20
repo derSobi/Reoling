@@ -5,10 +5,11 @@
 //! `PlaybackDriver` of that device's thread. The driver records the intent,
 //! and unless a newer command already supersedes it, turns the sum of all
 //! intents into the client's searches, opens, resumes and closes, pushes the
-//! footage into the replay sink and reports the player's state back (only
-//! when it changed). It is the only code that calls `reset_for_open`,
-//! `chain_open`, `set_paused` and `end_of_footage` on the replay sink, as
-//! those must run on the thread that pushes the frames.
+//! footage (video and, at 1x, its audio) into the replay sink and reports
+//! the player's state back (only when it changed). It is the only code that
+//! calls `reset_for_open`, `chain_open`, `set_paused` and `end_of_footage`
+//! on the replay sink, as those must run on the thread that pushes the
+//! frames.
 //!
 //! Times: everything the page sees is device-local, exactly as the device
 //! lists it. The replay sink's timeline is the device-local time in
@@ -18,8 +19,8 @@
 use crate::ui::bridge::{DeviceEvent, ReplaySinkRequest};
 use crate::ui::video_view::{ReplaySinkStatus, VideoSink};
 use reoling::{
-    file_for_time, next_file, CivilTime, RecordStream, RecordingFile, ReolinkClient, ReplayResume, ReplaySpeed,
-    ReplayStatus, ReplayStream, VideoFrame, VideoType,
+    file_for_time, next_file, CivilTime, RecordStream, RecordedEvent, RecordingFile, ReolinkClient, ReplayResume,
+    ReplaySpeed, ReplayStatus, ReplayStream, ReplayUnit, VideoFrame, VideoType,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -121,6 +122,17 @@ pub enum PlaybackEvent {
     /// Answer to `playback_day` (and the search again after a stream
     /// change): the day's files for `stream`, sorted, each once, or why not.
     Day { session: u64, channel: u8, day: CivilTime, stream: RecordStream, files: Result<Vec<FileSpan>, String> },
+    /// The day's event windows for `stream`, listed after its `Day` (the
+    /// recordings show first, the events when they arrive): sorted by
+    /// start, each window once with all its kinds, or why not. A day
+    /// without recordings has none.
+    Events {
+        session: u64,
+        channel: u8,
+        day: CivilTime,
+        stream: RecordStream,
+        events: Result<Vec<RecordedEvent>, String>,
+    },
     /// The player changed (sent on change only).
     State(PlayerState),
     /// Something the user should read; the player stays usable.
@@ -600,15 +612,15 @@ impl PlaybackDriver {
         }
     }
 
-    /// Whether a playback session exists (the replay is then silent and the
-    /// tick runs).
+    /// Whether a playback session exists (the tick runs then).
     pub(crate) fn is_active(&self) -> bool {
         self.want.day.is_some()
     }
 
-    /// The running opening's frames, if there is one to read.
-    pub(crate) fn frames(&mut self) -> Option<&mut ReceiverStream<reoling::Result<VideoFrame>>> {
-        self.open.as_mut().filter(|open| !open.exhausted).map(|open| &mut open.stream.frames)
+    /// The running opening's units (video frames and audio), if there is one
+    /// to read.
+    pub(crate) fn units(&mut self) -> Option<&mut ReceiverStream<reoling::Result<ReplayUnit>>> {
+        self.open.as_mut().filter(|open| !open.exhausted).map(|open| &mut open.stream.units)
     }
 
     /// One command from the page.
@@ -656,14 +668,14 @@ impl PlaybackDriver {
         self.send_state(tx).await;
     }
 
-    /// One frame (or the end, or an error) from the running opening.
-    pub(crate) async fn on_frame(&mut self, item: Option<reoling::Result<VideoFrame>>, tx: &Events) {
+    /// One unit (or the end, or an error) from the running opening.
+    pub(crate) async fn on_unit(&mut self, item: Option<reoling::Result<ReplayUnit>>, tx: &Events) {
         let Some(mut open) = self.open.take() else { return };
         match item {
-            Some(Ok(frame)) => {
+            Some(Ok(unit)) => {
                 if open.session == self.want.session {
                     let was = self.phase;
-                    self.push(&mut open, frame).await;
+                    self.push_unit(&mut open, unit).await;
                     self.open = Some(open);
                     if self.phase != was {
                         self.send_state(tx).await;
@@ -869,6 +881,11 @@ impl PlaybackDriver {
                         self.phase = PlayerPhase::Paused;
                     }
                 }
+                // The recordings go to the page first, then the events are
+                // listed (a second or two more over a relay) before anything
+                // opens: the device answers searches only while nothing plays.
+                self.send_day(tx).await;
+                self.send_events(client, tx).await;
                 true
             }
             Err(e) => {
@@ -1064,14 +1081,14 @@ impl PlaybackDriver {
     }
 
     /// Closes the running opening (waiting for the device's answer) and
-    /// pushes the frames still in its stream, so the sink plays on to where
+    /// pushes the units still in its stream, so the sink plays on to where
     /// the device stopped.
     async fn close_and_drain(&mut self, client: &mut ReolinkClient) -> Option<Closed> {
         let mut open = self.open.take()?;
         let _ = client.stop_replay().await;
         if open.session == self.want.session {
-            while let Some(Ok(frame)) = open.stream.frames.next().await {
-                self.push(&mut open, frame).await;
+            while let Some(Ok(unit)) = open.stream.units.next().await {
+                self.push_unit(&mut open, unit).await;
             }
         }
         Some(Closed {
@@ -1150,6 +1167,23 @@ impl PlaybackDriver {
     }
 
     // ---- the sink ---------------------------------------------------------
+
+    /// Pushes one unit of `open` into the sink: a video frame as `push`, an
+    /// audio unit after the opening's first video frame has placed the
+    /// opening on the sink's timeline (the sink itself plays audio at 1x
+    /// only, and in time with the picture).
+    async fn push_unit(&mut self, open: &mut Open, unit: ReplayUnit) {
+        match unit {
+            ReplayUnit::Video(frame) => self.push(open, frame).await,
+            ReplayUnit::Audio(aac) => {
+                if open.first == FirstFrame::Done {
+                    if let Some((_, sink)) = &self.sink {
+                        sink.push_replay_audio(&aac);
+                    }
+                }
+            }
+        }
+    }
 
     /// Pushes one frame of `open` into the sink, asking for a sink first
     /// when there is none for its codec, and placing the opening's first
@@ -1300,6 +1334,26 @@ impl PlaybackDriver {
             stream: loaded.stream,
             files: Ok(loaded.files.iter().map(FileSpan::from).collect()),
         };
+        let _ = tx.send(DeviceEvent::Playback(event)).await;
+    }
+
+    /// Lists the loaded day's event windows and sends them as `Events`. A
+    /// day without recordings has no windows to list, so nothing is asked.
+    async fn send_events(&mut self, client: &mut ReolinkClient, tx: &Events) {
+        let Some(loaded) = self.files.as_ref() else { return };
+        let (channel, day, stream) = (loaded.channel, loaded.day, loaded.stream);
+        let events = if loaded.files.is_empty() {
+            Ok(Vec::new())
+        } else {
+            client.search_events(channel, day, stream).await.map_err(|e| e.to_string())
+        };
+        if debug_replay() {
+            match &events {
+                Ok(events) => eprintln!("playback: {} events on {} ({stream:?})", events.len(), civil_text(day)),
+                Err(e) => eprintln!("playback: listing the events of {} failed: {e}", civil_text(day)),
+            }
+        }
+        let event = PlaybackEvent::Events { session: self.want.session, channel, day, stream, events };
         let _ = tx.send(DeviceEvent::Playback(event)).await;
     }
 

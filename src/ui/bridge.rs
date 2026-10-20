@@ -164,8 +164,7 @@ impl DeviceLink {
         self.send_playback(PlaybackCommand::Stream { gen, stream });
     }
 
-    /// Ends the session: closes the playback on the device, drops the sink,
-    /// gives audio back to live.
+    /// Ends the session: closes the playback on the device, drops the sink.
     pub fn playback_close(&self) {
         let gen = self.next_playback_gen();
         self.send_playback(PlaybackCommand::Close { gen });
@@ -454,8 +453,6 @@ pub fn spawn_device(
             playback_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
-                // Replay is silent for now: its audio would arrive with the
-                // footage's lead, seconds ahead of the picture.
                 let replay_active = driver.is_active();
                 tokio::select! {
                     command = command_rx.recv() => match command {
@@ -463,9 +460,6 @@ pub fn spawn_device(
                             // Live and playback never share the connection.
                             // Nothing happens here while no playback runs.
                             driver.end(&mut client).await;
-                            if replay_active {
-                                while audio.try_recv().is_ok() {}
-                            }
                             if frames.take().is_some() {
                                 let _ = client.stop_video(channel).await;
                             }
@@ -600,10 +594,6 @@ pub fn spawn_device(
                                 announced = false;
                             }
                             driver.command(command, &mut client, &tx).await;
-                            if replay_active && !driver.is_active() {
-                                // The playback's last audio is not live audio.
-                                while audio.try_recv().is_ok() {}
-                            }
                         }
                         Some(Command::Stop) => {
                             if frames.take().is_some() {
@@ -612,11 +602,9 @@ pub fn spawn_device(
                         }
                         Some(Command::Shutdown) | None => break,
                     },
-                    Some(frame) = audio.recv() => {
-                        if !replay_active {
-                            audio_out.push(&frame);
-                        }
-                    }
+                    // Live sound only: a playback's audio travels with its
+                    // video (`driver.units()`) into the replay sink.
+                    Some(frame) = audio.recv() => audio_out.push(&frame),
                     Some(update) = channel_updates.recv() => {
                         let event = match update {
                             DeviceUpdate::Channels(channels) => {
@@ -703,11 +691,11 @@ pub fn spawn_device(
                         None => frames = None,
                     },
                     item = async {
-                        match driver.frames() {
-                            Some(f) => f.next().await,
+                        match driver.units() {
+                            Some(units) => units.next().await,
                             None => std::future::pending().await,
                         }
-                    } => driver.on_frame(item, &tx).await,
+                    } => driver.on_unit(item, &tx).await,
                     _ = playback_tick.tick(), if replay_active => driver.tick(&mut client, &tx).await,
                     error = client.wait_for_pushes(), if frames.is_none() => {
                         let _ = tx.send(DeviceEvent::Lost(error.to_string())).await;

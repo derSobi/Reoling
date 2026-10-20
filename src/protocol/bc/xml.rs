@@ -540,8 +540,7 @@ impl RecordStream {
     }
 
     /// `<streamType>` of an event-window search, which is a number there:
-    /// 1 for the sub stream, 0 for the main stream. Not used by Reoling yet
-    /// (see [`FindAlarmVideo`]).
+    /// 1 for the sub stream, 0 for the main stream (see [`FindAlarmVideo`]).
     pub fn event_stream_type(self) -> u8 {
         match self {
             RecordStream::Main => 0,
@@ -575,8 +574,9 @@ pub const FILE_SEARCH_RECORD_TYPE_ITEMS: [&str; 19] = [
 ];
 
 /// The event types a whole-day event-window search asks for, as a comma
-/// list and as the item list sent alongside it. Not used by Reoling yet
-/// (see [`FindAlarmVideo`]).
+/// list and as the item list sent alongside it (sent by
+/// `ReolinkClient::search_events`; the Playback page's `EventFilter` groups
+/// them for the user).
 pub const EVENT_SEARCH_ALARM_TYPES: &str = "md, pir, other, package, io, people, face, vehicle, dog_cat, visitor, cry, crossline, intrude, loitering, legacy, loss, answer";
 pub const EVENT_SEARCH_ALARM_TYPE_ITEMS: [&str; 19] = [
     "md", "pir", "other", "io", "people", "face", "vehicle", "dog_cat", "visitor", "cry", "crossline", "intrude",
@@ -1050,11 +1050,8 @@ impl ReplaySeek {
 /// Event-window search (`findAlarmVideo`): the start request (272, a whole
 /// day), its reply (the `file_handle`), and the next/end requests (273/274,
 /// channel and handle only). All of them go with an Extension naming the
-/// channel.
-///
-/// Not used by Reoling yet (nor are [`AlarmVideoInfo`] and its parts):
-/// groundwork for marking events on the day timeline, kept with its tests
-/// until that feature is built.
+/// channel. The pages come back as [`AlarmVideoInfo`]; the client's
+/// `search_events` runs the whole exchange.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct FindAlarmVideo {
     #[serde(rename = "@version", default)]

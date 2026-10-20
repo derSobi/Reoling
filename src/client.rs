@@ -18,8 +18,8 @@ pub use crate::protocol::bcmedia::model::{VideoFrame, VideoType};
 
 mod replay;
 pub use replay::{
-    file_for_time, next_file, sort_and_dedup_files, FootageAnchor, RecordingFile, ReplayKeyframe, ReplayProgress,
-    ReplayResume, ReplaySpeed, ReplayStatus, ReplayStream,
+    file_for_time, next_file, sort_and_dedup_files, FootageAnchor, RecordedEvent, RecordingFile, ReplayKeyframe,
+    ReplayProgress, ReplayResume, ReplaySpeed, ReplayStatus, ReplayStream, ReplayUnit,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -201,6 +201,9 @@ pub struct ReolinkClient {
     /// Playbacks opened on this connection, for the sequence numbers.
     replay_opens: u32,
     last_replay_seq: Option<u32>,
+    /// The device left the start of an event-window search unanswered: it
+    /// is not asked again on this connection (see `search_events`).
+    event_search_unanswered: bool,
 }
 
 /// What a `MSG_ID_IMAGE_FILE` request (see its own doc comment) was asking
@@ -681,6 +684,7 @@ impl ReolinkClient {
             replay_task: None,
             replay_opens: 0,
             last_replay_seq: None,
+            event_search_unanswered: false,
         }
     }
 
@@ -689,7 +693,8 @@ impl ReolinkClient {
         self.channel_uids.lock().expect("channel_uids mutex poisoned").get(&channel_id).cloned()
     }
 
-    /// The audio of the streams, as AAC (ADTS) frames. Can be taken once.
+    /// The live stream's audio, as AAC (ADTS) frames (a playback's audio
+    /// comes with its video, see `ReplayStream::units`). Can be taken once.
     pub fn take_audio(&mut self) -> Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>> {
         self.audio_rx.take()
     }
@@ -1266,12 +1271,16 @@ impl ReolinkClient {
             eprintln!("DEBUG identity reply: name={name:?} model={model:?}");
         }
         // Diagnostic-only: a scripted recorded-video session on one channel
-        // (see `probe_replay`). Runs only when the variable is set.
+        // (see `probe_replay`), or an event search (see `probe_events`).
+        // Each runs only when its variable is set. Lines are tagged with
+        // the model (never the UID): every device the app connects to runs
+        // the probe, side by side.
+        let tag = model.as_deref().map(str::trim).filter(|m| !m.is_empty()).unwrap_or("device").to_string();
         if let Some(channel_id) = replay::probe_replay_channel() {
-            // Lines are tagged with the model (never the UID): every device
-            // the app connects to runs the probe, side by side.
-            let tag = model.as_deref().map(str::trim).filter(|m| !m.is_empty()).unwrap_or("device").to_string();
             self.probe_replay(channel_id, &tag).await;
+        }
+        if let Some(channel_id) = replay::probe_events_channel() {
+            self.probe_events(channel_id, &tag).await;
         }
         DeviceIdentity { name, model }
     }

@@ -195,6 +195,10 @@ pub struct VideoView {
 
     /// Whether `ensure_sink` builds replay sinks — see `new_replay`.
     replay: bool,
+    /// The volume replay sinks play at (the window's volume setting).
+    replay_volume: std::cell::Cell<f64>,
+    /// Building a replay sink's sound failed once; said once.
+    replay_audio_unavailable: std::cell::Cell<bool>,
 }
 
 impl VideoView {
@@ -203,13 +207,26 @@ impl VideoView {
             picture: Picture::new(),
             sink: RefCell::new(None),
             replay: false,
+            replay_volume: std::cell::Cell::new(1.0),
+            replay_audio_unavailable: std::cell::Cell::new(false),
         }
     }
 
     /// A view for recorded footage: every sink it builds is a replay sink
-    /// (see `VideoSink::reset_for_open`), never a live one.
-    pub fn new_replay() -> Self {
-        Self { replay: true, ..Self::new() }
+    /// (see `VideoSink::reset_for_open`), never a live one, playing sound at
+    /// `volume` (0 to 1, see `set_volume`).
+    pub fn new_replay(volume: f64) -> Self {
+        Self { replay: true, replay_volume: std::cell::Cell::new(volume), ..Self::new() }
+    }
+
+    /// The volume of recorded footage's sound, now and for the sinks built
+    /// from here on (0 is silence). Nothing on a live view, whose sound is
+    /// `audio::AudioOutput`'s.
+    pub fn set_volume(&self, volume: f64) {
+        self.replay_volume.set(volume);
+        if let Some(sink) = self.sink.borrow().as_ref() {
+            sink.set_replay_volume(volume);
+        }
     }
 
     pub fn widget(&self) -> &Picture {
@@ -887,7 +904,11 @@ impl VideoSink {
 // - holds the whole lead in front of the decoder without ever making the
 //   producer wait;
 // - starts its timeline again on every open (seek, speed change, resume), or
-//   carries it on across the hop to the next file.
+//   carries it on across the hop to the next file;
+// - plays the footage's sound at 1x through a second source in the same
+//   pipeline, so the picture and the sound share one clock and one
+//   timeline (see `ReplayClock::stamp_audio` for how an audio unit is
+//   timed), and stays silent at every other speed.
 //
 // How the playback driver (`playback_driver.rs`, on the device's network
 // thread) drives it:
@@ -899,8 +920,8 @@ impl VideoSink {
 //   `chain_open(seek)` (the next file after an end of file, or the same
 //   file resumed after a pause, a stall or a slow-motion backlog, carrying
 //   on from what is buffered).
-// - `push_frame` for every video frame. Replay is silent for now: the
-//   bridge drops the playback's audio.
+// - `push_frame` for every video frame, `push_replay_audio` for every audio
+//   unit after it (at 1x; the sink plays nothing at any other speed).
 // - Below 1x the device still sends at 1x, so footage piles up: once
 //   `replay_status()` reports `slow_motion_backlog`, close the device's
 //   playback and open it again later (see that field).
@@ -949,6 +970,38 @@ const REPLAY_SLOW_MOTION_MAX_BUFFERED: Duration = Duration::from_secs(60);
 /// Frames remembered (pushed, not yet shown) for mapping the PTS on screen
 /// back to footage time; far more than any lead holds.
 const REPLAY_MAX_MARKS: usize = 20_000;
+
+/// An audio unit whose ADTS header cannot be read is taken to be this long:
+/// 1024 samples at 16 kHz, what these devices send (about 16 units per
+/// footage second at 1x to 8x).
+const AUDIO_UNIT_FALLBACK_US: u64 = 64_000;
+
+/// The most compressed audio a replay sink queues (minutes at the 66 kbit/s
+/// seen); past it units are left out.
+const REPLAY_AUDIO_MAX_QUEUED_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Replay audio runs on its own units' durations, one unit starting where
+/// the one before ended, so the decoder and the output see a contiguous
+/// stream (timestamps that jump by a few tens of ms at every frame make them
+/// mark discontinuities and the output resync, audibly). The picture's clock
+/// is only the anchor: the next unit is placed at the latest frame's footage
+/// time again once its own count has run this far from it (the devices'
+/// unit count stays within about 150 ms of the frames' timestamps over
+/// ten-minute openings, so this is for a hop, a lost unit or a device that
+/// counts differently; a unit or two after a frame is the normal lead).
+const AUDIO_REANCHOR_US: u64 = 250_000;
+
+/// A replay sink plays only once both its picture and its sound have
+/// something (a first unit, or the end of their stream) after an open:
+/// once this many video frames at 1x have come without a single audio unit,
+/// or `AUDIO_WAIT` has passed since the first one, the sound is told its
+/// stream ended so that the picture plays; the sound starts again should
+/// audio come after all. The devices send audio right after the frame it
+/// belongs to, one or two units per frame, so the wait is normally a frame
+/// or two; a recording without sound waits this many frames (part of the
+/// opening's first burst) or, should they trickle in, `AUDIO_WAIT`.
+const AUDIO_WAIT_FRAMES: u64 = 10;
+const AUDIO_WAIT: gstreamer::ClockTime = gstreamer::ClockTime::from_mseconds(400);
 
 /// "No frame has reached the display since the last reset."
 const NO_PTS: u64 = u64::MAX;
@@ -1035,6 +1088,11 @@ struct ReplayClock {
     last_step_us: u64,
     /// Footage since the first frame after the last reset.
     footage_us: u64,
+    /// Where the next audio unit starts on the footage's timeline (`None`:
+    /// no unit since the last reset; see `stamp_audio`).
+    audio_next_us: Option<u64>,
+    /// Audio units stamped since the last reset.
+    audio_units: u64,
     /// The current open's seek point, on the caller's timeline.
     open_seek_us: u64,
     /// `footage_us` at the current open's first frame, once it came.
@@ -1058,6 +1116,8 @@ impl ReplayClock {
             last_raw: None,
             last_step_us: 0,
             footage_us: 0,
+            audio_next_us: None,
+            audio_units: 0,
             open_seek_us: 0,
             open_footage_us: None,
             offset_us: 0,
@@ -1086,10 +1146,6 @@ impl ReplayClock {
         self.last_raw = None;
         self.open_seek_us = duration_us(seek);
         self.open_footage_us = None;
-    }
-
-    fn has_frames(&self) -> bool {
-        self.last_pts_us.is_some()
     }
 
     /// Times the next frame from its camera timestamp `raw`. `now_us` is
@@ -1142,6 +1198,27 @@ impl ReplayClock {
         Stamp { pts_us: pts, recording_us }
     }
 
+    /// Times an audio unit of `duration_us` of footage. Audio is placed on
+    /// the picture's own timeline, contiguously: the first unit after a
+    /// reset starts at the latest video frame's footage time and each one
+    /// after it where the one before ended, so the sound is one unbroken
+    /// stream for the decoder and the output. The frames stay its anchor:
+    /// once the units' own count has run `AUDIO_REANCHOR_US` from the latest
+    /// frame's footage time, the next unit starts at that time again, so the
+    /// sound follows the picture through every open, hop, stall and pause
+    /// (its PTS carry the same speed and offset as the frames'). `None`
+    /// before the first video frame since the reset: nothing to follow yet.
+    fn stamp_audio(&mut self, duration_us: u64) -> Option<u64> {
+        self.last_pts_us?;
+        let footage = match self.audio_next_us {
+            Some(next) if next.abs_diff(self.footage_us) <= AUDIO_REANCHOR_US => next,
+            _ => self.footage_us,
+        };
+        self.audio_next_us = Some(footage + duration_us);
+        self.audio_units += 1;
+        Some((footage as f64 / self.speed).round() as u64 + self.offset_us)
+    }
+
     /// Footage and timeline position (µs) of PTS `shown_us`: from the last
     /// frame at or before it, never past the next one.
     fn locate(&self, shown_us: u64) -> Option<(u64, u64)> {
@@ -1188,12 +1265,23 @@ impl ReplayClock {
     }
 }
 
+/// The sound of a replay sink: its own source in the same pipeline as the
+/// picture (`appsrc ! aacparse ! <AAC decoder> ! audioconvert !
+/// audioresample ! volume ! autoaudiosink`).
+struct ReplayAudio {
+    appsrc: AppSrc,
+    /// The volume element (`None` in tests, whose chain has none).
+    volume: Option<gstreamer::Element>,
+}
+
 /// A replay sink's own state, shared by every clone of the sink.
 struct Replay {
     state: Mutex<ReplayState>,
     probes: Arc<ReplayProbes>,
     /// The queue in front of the decoder (for `buffered_bytes`).
     queue: gstreamer::Element,
+    /// The sound, if the pipeline has it.
+    audio: Option<ReplayAudio>,
     /// The view has let go of this pipeline and takes it to NULL
     /// (`VideoView::reset`): from then on the replay controls do nothing,
     /// so the thread that pushes the frames, which may still hold a clone
@@ -1217,8 +1305,47 @@ struct ReplayState {
     /// `end_of_footage` closed the source: nothing is queued until the next
     /// `reset_for_open`.
     ended: bool,
+    /// The sound's stream was ended since the last reset (at a speed other
+    /// than 1x, after `AUDIO_WAIT_FRAMES` frames without audio, or by
+    /// `end_of_footage`); an audio unit arriving after that opens it again
+    /// (see `push_replay_audio`).
+    audio_ended: bool,
+    /// At 1x, until the first audio unit or the end of the sound's stream
+    /// after the last reset: the picture waits for one of them (see
+    /// `AUDIO_WAIT_FRAMES`).
+    audio_waiting: bool,
+    /// Counts the resets, so that a wait for audio scheduled on the clock
+    /// (see `AUDIO_WAIT`) ends the sound of its own open only.
+    reset_gen: u64,
     /// When the next `REOLING_DEBUG_LATENCY` line is due.
     next_report: Option<std::time::Instant>,
+}
+
+impl Replay {
+    /// The sound's stream is ended while the picture is waiting for it (see
+    /// `AUDIO_WAIT_FRAMES`); `audio_waiting` is cleared. Under `state`'s lock.
+    fn end_audio_wait(&self, state: &mut ReplayState) {
+        if !state.audio_waiting {
+            return;
+        }
+        state.audio_waiting = false;
+        state.audio_ended = true;
+        if let Some(audio) = &self.audio {
+            let _ = audio.appsrc.end_of_stream();
+        }
+    }
+
+    /// `AUDIO_WAIT` after the first frame of the open numbered `gen`: ends
+    /// the wait if that open is still waiting (from the clock's thread).
+    fn audio_wait_over(&self, gen: u64) {
+        if self.retired.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut state = self.state.lock().expect("replay mutex poisoned");
+        if state.reset_gen == gen {
+            self.end_audio_wait(&mut state);
+        }
+    }
 }
 
 /// What the pipeline's streaming threads report and read, lock-free.
@@ -1280,6 +1407,74 @@ fn replay_appsrc(video_type: VideoType) -> AppSrc {
     appsrc
 }
 
+/// The sound's source: as `replay_appsrc`, for AAC (ADTS) units.
+fn replay_audio_appsrc() -> AppSrc {
+    let appsrc = gstreamer::ElementFactory::make("appsrc")
+        .build()
+        .expect("appsrc element missing — install gstreamer1.0-plugins-base")
+        .downcast::<AppSrc>()
+        .expect("appsrc is always an AppSrc");
+    appsrc.set_caps(Some(
+        &gstreamer::Caps::builder("audio/mpeg").field("mpegversion", 4i32).field("stream-format", "adts").build(),
+    ));
+    appsrc.set_is_live(false);
+    appsrc.set_format(gstreamer::Format::Time);
+    appsrc.set_block(false);
+    appsrc.set_max_bytes(REPLAY_AUDIO_MAX_QUEUED_BYTES);
+    appsrc
+}
+
+/// Builds the sound's chain into `pipeline` (see `ReplayAudio`), at
+/// `volume`. `Err` names what is missing; the pipeline is then as it was.
+fn build_replay_audio(pipeline: &gstreamer::Pipeline, volume: f64) -> Result<ReplayAudio, String> {
+    let make = |name: &str| {
+        gstreamer::ElementFactory::make(name)
+            .build()
+            .map_err(|e| format!("{name} is missing: {e}"))
+    };
+    let appsrc = replay_audio_appsrc();
+    let parse = make("aacparse")?;
+    let decoder = make("avdec_aac").or_else(|_| make("faad"))?;
+    let convert = make("audioconvert")?;
+    let resample = make("audioresample")?;
+    let vol = make("volume")?;
+    vol.set_property("volume", volume);
+    let sink = make("autoaudiosink")?;
+    let elements = [appsrc.upcast_ref(), &parse, &decoder, &convert, &resample, &vol, &sink];
+    pipeline.add_many(elements).map_err(|e| e.to_string())?;
+    if let Err(e) = gstreamer::Element::link_many(elements) {
+        let _ = pipeline.remove_many(elements);
+        return Err(e.to_string());
+    }
+    Ok(ReplayAudio { appsrc, volume: Some(vol) })
+}
+
+/// How much footage an audio unit holds: the sum of its ADTS frames (1024
+/// samples each, times the raw data blocks, at the header's sample rate);
+/// `AUDIO_UNIT_FALLBACK_US` when the unit does not parse as ADTS.
+fn adts_unit_duration_us(unit: &[u8]) -> u64 {
+    const RATES: [u64; 13] = [96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000, 7_350];
+    let mut at = 0usize;
+    let mut total_us = 0u64;
+    while at < unit.len() {
+        let Some(header) = unit.get(at..at + 7) else { return AUDIO_UNIT_FALLBACK_US };
+        let sync = header[0] == 0xff && header[1] & 0xf6 == 0xf0;
+        let rate = RATES.get(usize::from((header[2] >> 2) & 0x0f)).copied();
+        let length = (usize::from(header[3] & 0x03) << 11) | (usize::from(header[4]) << 3) | usize::from(header[5] >> 5);
+        let blocks = u64::from(header[6] & 0x03) + 1;
+        let (true, Some(rate), true) = (sync, rate, length >= 7 && at + length <= unit.len()) else {
+            return AUDIO_UNIT_FALLBACK_US;
+        };
+        total_us += 1024 * blocks * 1_000_000 / rate;
+        at += length;
+    }
+    if total_us > 0 {
+        total_us
+    } else {
+        AUDIO_UNIT_FALLBACK_US
+    }
+}
+
 /// A small reserve in front of the decoder, by time and by bytes; the lead
 /// itself waits in the appsrc. 1 s of PTS is 16 s of footage at 16x: 4-16
 /// I-frames, a few MB even on main.
@@ -1322,14 +1517,21 @@ fn tune_replay_decoder(element: &gstreamer::Element) {
 ///   the next key frame always passes and decoding starts again from it.
 ///   Dropping one delta frame but keeping later ones would smear the
 ///   picture, since each refers to the one before.
+///
+/// `audio` is the sound's chain in the same pipeline, if it has one. The
+/// pipeline keeps the system clock whatever the audio output offers, so the
+/// picture runs on while the sound has nothing to play (at 2x and faster,
+/// or a recording without sound).
 fn assemble_replay_sink(
     video_type: VideoType,
     pipeline: gstreamer::Pipeline,
     appsrc: AppSrc,
     queue: &gstreamer::Element,
     display: &gstreamer::Element,
+    audio: Option<ReplayAudio>,
     decoded_frames: Arc<AtomicU64>,
 ) -> VideoSink {
+    pipeline.use_clock(Some(&gstreamer::SystemClock::obtain()));
     let probes = Arc::new(ReplayProbes {
         arrived_pts_us: AtomicU64::new(NO_PTS),
         thin_when_late: AtomicBool::new(false),
@@ -1388,10 +1590,14 @@ fn assemble_replay_sink(
                 dropped_over_cap: 0,
                 last_shown_us: None,
                 ended: false,
+                audio_ended: false,
+                audio_waiting: false,
+                reset_gen: 0,
                 next_report: None,
             }),
             probes,
             queue: queue.clone(),
+            audio,
             retired: AtomicBool::new(false),
             control: Mutex::new(()),
         })),
@@ -1422,8 +1628,9 @@ impl VideoView {
     ///   ! videoconvert          (qos off, as for live)
     ///   ! gtk4paintablesink     (late frames still shown, as for live)
     ///
-    /// No pipeline latency: nothing here is live, the clock simply starts
-    /// with the first frame shown.
+    /// plus the sound's own chain (`build_replay_audio`) in the same
+    /// pipeline, when its elements are there. No pipeline latency: nothing
+    /// here is live, the clock simply starts with the first frame shown.
     fn build_replay_sink(&self, video_type: VideoType) -> VideoSink {
         let parse_name = match video_type {
             VideoType::H264 => "h264parse",
@@ -1483,9 +1690,19 @@ impl VideoView {
         });
         pipeline.connect_deep_element_added(|_, _, element| tune_replay_decoder(element));
 
+        let audio = match build_replay_audio(&pipeline, self.replay_volume.get()) {
+            Ok(audio) => Some(audio),
+            Err(e) => {
+                if !self.replay_audio_unavailable.replace(true) {
+                    eprintln!("no sound for recordings: {e}");
+                }
+                None
+            }
+        };
+
         self.picture.set_paintable(Some(&display.property::<gtk4::gdk::Paintable>("paintable")));
 
-        let sink = assemble_replay_sink(video_type, pipeline, appsrc, &queue, &display, decoded_frames);
+        let sink = assemble_replay_sink(video_type, pipeline, appsrc, &queue, &display, audio, decoded_frames);
         sink.pipeline
             .set_state(gstreamer::State::Playing)
             .expect("failed to start GStreamer pipeline");
@@ -1501,9 +1718,9 @@ impl VideoSink {
     /// and this sink stretches the picture, so the driver must watch
     /// `ReplaySinkStatus::slow_motion_backlog` and pause the device's
     /// sending; the memory cap is no substitute, past it frames are lost).
-    /// Whatever the pipeline still holds from before is thrown away, the
-    /// next frame pushed is shown first, at PTS 0, and the pipeline plays
-    /// (also after `set_paused`).
+    /// Whatever the pipeline still holds from before (picture and sound) is
+    /// thrown away, the next frame pushed is shown first, at PTS 0, and the
+    /// pipeline plays (also after `set_paused`). Sound plays at 1x only.
     ///
     /// Call it on the thread that pushes the frames, before the new open's
     /// first frame (so nothing of the old open can follow it), and never on
@@ -1514,19 +1731,28 @@ impl VideoSink {
         if replay.retired.load(Ordering::SeqCst) {
             return;
         }
-        let flush = {
-            let state = replay.state.lock().expect("replay mutex poisoned");
-            state.clock.has_frames() || state.ended
-        };
-        if flush {
-            // Through the source, so its own queue is emptied as well as
-            // every element after it (and an earlier end of stream is
-            // undone); with `reset_time` the running time starts again from
-            // 0, where the next open's PTS start.
-            let _ = self.appsrc.send_event(gstreamer::event::FlushStart::new());
-            let _ = self.appsrc.send_event(gstreamer::event::FlushStop::new(true));
+        {
+            // Before the flush: the old open's wait for audio (see
+            // `AUDIO_WAIT`), should it fire from now on, finds its open gone
+            // and leaves the sound's source alone. Were it to end the
+            // sound's stream after the flush, nothing would undo that and
+            // the source would refuse the new open's audio. (One that fired
+            // before this is undone by the flush.)
+            let mut state = replay.state.lock().expect("replay mutex poisoned");
+            state.reset_gen += 1;
+            state.audio_waiting = false;
+        }
+        // Through the sources, so their own queues are emptied as well as
+        // every element after them (and an earlier end of stream is undone);
+        // with `reset_time` the running time starts again from 0, where the
+        // next open's PTS start, once the picture (and the sound, if it has
+        // anything) is ready to show its first frame.
+        for source in std::iter::once(&self.appsrc).chain(replay.audio.as_ref().map(|audio| &audio.appsrc)) {
+            let _ = source.send_event(gstreamer::event::FlushStart::new());
+            let _ = source.send_event(gstreamer::event::FlushStop::new(true));
         }
         let speed = sanitize_speed(speed);
+        let with_audio = replay.audio.is_some() && speed == 1.0;
         {
             // The probes too, under the same lock `replay_status` reads them
             // under, so it never mixes the old open's frames with the new.
@@ -1540,6 +1766,13 @@ impl VideoSink {
             state.dropped_over_cap = 0;
             state.last_shown_us = None;
             state.ended = false;
+            state.audio_ended = false;
+            state.audio_waiting = with_audio;
+        }
+        if let Some(audio) = replay.audio.as_ref().filter(|_| !with_audio) {
+            // No sound at this speed: the picture must not wait for any.
+            let _ = audio.appsrc.end_of_stream();
+            replay.state.lock().expect("replay mutex poisoned").audio_ended = true;
         }
         let _ = self.pipeline.set_state(gstreamer::State::Playing);
     }
@@ -1568,9 +1801,19 @@ impl VideoSink {
         if replay.retired.load(Ordering::SeqCst) {
             return;
         }
-        let was_ended = std::mem::replace(&mut replay.state.lock().expect("replay mutex poisoned").ended, true);
+        let (was_ended, audio_was_ended) = {
+            let mut state = replay.state.lock().expect("replay mutex poisoned");
+            let was = (state.ended, state.audio_ended);
+            state.ended = true;
+            state.audio_ended = true;
+            state.audio_waiting = false;
+            was
+        };
         if !was_ended {
             let _ = self.appsrc.end_of_stream();
+        }
+        if let Some(audio) = replay.audio.as_ref().filter(|_| !audio_was_ended) {
+            let _ = audio.appsrc.end_of_stream();
         }
     }
 
@@ -1595,6 +1838,53 @@ impl VideoSink {
     /// a holder should drop it and ask for a new sink. Never on a live sink.
     pub fn is_retired(&self) -> bool {
         self.replay.as_ref().is_some_and(|replay| replay.retired.load(Ordering::SeqCst))
+    }
+
+    /// The sound's volume (0 to 1). Nothing on a live sink, or without sound.
+    fn set_replay_volume(&self, volume: f64) {
+        if let Some(element) = self.replay.as_ref().and_then(|replay| replay.audio.as_ref()).and_then(|a| a.volume.as_ref()) {
+            element.set_property("volume", volume.clamp(0.0, 1.0));
+        }
+    }
+
+    /// One audio unit (AAC, ADTS) of the footage, after the video frame it
+    /// follows: timed by the replay clock like the frames (see
+    /// `ReplayClock::stamp_audio`) and queued without waiting. Nothing is
+    /// queued at a speed other than 1x, before the open's first video
+    /// frame, after `end_of_footage`, over `REPLAY_AUDIO_MAX_QUEUED_BYTES`,
+    /// or on a sink without sound. Call it on the thread that pushes the
+    /// frames, like `push_frame`.
+    pub fn push_replay_audio(&self, unit: &[u8]) {
+        let Some(replay) = &self.replay else { return };
+        let Some(audio) = &replay.audio else { return };
+        if replay.retired.load(Ordering::SeqCst) {
+            return;
+        }
+        let (pts_us, reopen) = {
+            let mut state = replay.state.lock().expect("replay mutex poisoned");
+            if state.ended || state.clock.speed != 1.0 {
+                return;
+            }
+            let Some(pts_us) = state.clock.stamp_audio(adts_unit_duration_us(unit)) else { return };
+            state.audio_waiting = false;
+            (pts_us, std::mem::replace(&mut state.audio_ended, false))
+        };
+        if reopen {
+            // The sound's stream was ended (see `audio_ended`), but here is
+            // audio after all: open it again, leaving the running time alone
+            // (the picture is playing on it).
+            let _ = audio.appsrc.send_event(gstreamer::event::FlushStart::new());
+            let _ = audio.appsrc.send_event(gstreamer::event::FlushStop::new(false));
+        }
+        if audio.appsrc.current_level_bytes().saturating_add(unit.len() as u64) > REPLAY_AUDIO_MAX_QUEUED_BYTES {
+            return;
+        }
+        let mut buffer = gstreamer::Buffer::from_slice(unit.to_vec());
+        buffer.get_mut().expect("new buffer").set_pts(gstreamer::ClockTime::from_useconds(pts_us));
+        match audio.appsrc.push_buffer(buffer) {
+            Ok(_) | Err(gstreamer::FlowError::Flushing) => {}
+            Err(err) => eprintln!("failed to push replay audio into appsrc: {err:?}"),
+        }
     }
 
     /// Where replay stands: position on screen, footage buffered ahead of
@@ -1632,7 +1922,7 @@ impl VideoSink {
 
     /// `push_frame` for a replay sink: PTS from `ReplayClock`, queued
     /// without ever waiting, up to `REPLAY_MAX_QUEUED_BYTES`.
-    fn push_replay_frame(&self, replay: &Replay, frame: &VideoFrame) {
+    fn push_replay_frame(&self, replay: &Arc<Replay>, frame: &VideoFrame) {
         if replay.retired.load(Ordering::SeqCst) {
             return;
         }
@@ -1642,6 +1932,19 @@ impl VideoSink {
             return;
         }
         let stamp = state.clock.stamp(frame.microseconds, now);
+        if state.audio_waiting {
+            if state.clock.frames >= AUDIO_WAIT_FRAMES {
+                // No sound with this many frames: the picture plays without
+                // it (see `AUDIO_WAIT_FRAMES`).
+                replay.end_audio_wait(&mut state);
+            } else if state.clock.frames == 1 {
+                // ...or without sound `AUDIO_WAIT` after its first frame.
+                let clock = gstreamer::SystemClock::obtain();
+                let (shared, gen) = (Arc::clone(replay), state.reset_gen);
+                let due = clock.time().unwrap_or(gstreamer::ClockTime::ZERO) + AUDIO_WAIT;
+                let _ = clock.new_single_shot_id(due).wait_async(move |_, _, _| shared.audio_wait_over(gen));
+            }
+        }
         let fits = self.appsrc.current_level_bytes().saturating_add(frame.data.len() as u64) <= REPLAY_MAX_QUEUED_BYTES;
         if state.overflowing {
             if frame.is_keyframe && fits {
@@ -1660,14 +1963,16 @@ impl VideoSink {
                 state.next_report = Some(now + Duration::from_secs(1));
                 let status = self.replay_status_locked(replay, &mut state);
                 eprintln!(
-                    "REPLAY {}x at {:.1} s, {:.1} s of footage buffered ({} KB); pushed {} decoded {} not shown {}",
+                    "REPLAY {}x at {:.1} s, {:.1} s of footage buffered ({} KB); pushed {} decoded {} not shown {}; audio units {}{}",
                     state.clock.speed,
                     status.position.as_secs_f64(),
                     status.buffered.as_secs_f64(),
                     status.buffered_bytes / 1024,
                     state.clock.frames,
                     self.decoded_frames.load(Ordering::Relaxed),
-                    status.dropped_frames
+                    status.dropped_frames,
+                    state.clock.audio_units,
+                    if state.audio_ended { " (sound ended)" } else { "" }
                 );
             }
         }
@@ -1763,7 +2068,7 @@ mod tests {
         pts_of(&mut c, &[0, 100_000, 200_000]);
         assert_eq!(c.position(Some(200_000)), Duration::from_millis(100_200));
         c.reset(Duration::from_secs(500), 4.0);
-        assert!(!c.has_frames());
+        assert!(c.last_pts_us.is_none());
         assert_eq!(c.position(None), Duration::from_secs(500));
         assert_eq!(c.buffered(None), Duration::ZERO);
         assert_eq!(pts_of(&mut c, &[77_000_000, 77_400_000]), [0, 100_000]);
@@ -1852,8 +2157,160 @@ mod tests {
         assert_eq!(sanitize_speed(1e9), 64.0);
     }
 
-    // ---- The replay pipeline's buffering, flush and thinning, with GStreamer
-    // core elements only (no decoder): appsrc ! queue [! identity] ! fakesink.
+    #[test]
+    fn audio_is_timed_after_the_frame_it_follows() {
+        let mut c = clock(0, 1.0);
+        // Nothing to follow before the first frame.
+        assert_eq!(c.stamp_audio(64_000), None);
+        c.stamp(1_000_000, None);
+        // The first unit starts at the frame, the ones after it where the
+        // one before ended, whatever frames came in between.
+        assert_eq!(c.stamp_audio(64_000), Some(0));
+        assert_eq!(c.stamp_audio(64_000), Some(64_000));
+        assert_eq!(c.stamp_audio(64_000), Some(128_000));
+        c.stamp(1_100_000, None);
+        assert_eq!(c.stamp_audio(64_000), Some(192_000));
+        c.stamp(1_200_000, None);
+        assert_eq!(c.stamp_audio(32_000), Some(256_000));
+        assert_eq!(c.stamp_audio(32_000), Some(288_000));
+        assert_eq!(c.audio_units, 6);
+    }
+
+    #[test]
+    fn audio_stays_contiguous_across_frames_and_follows_the_picture_from_afar() {
+        // 10 fps with one or two 64 ms units after each frame, as the
+        // devices send it: every unit starts where the one before ended,
+        // although the frames' timestamps run ahead of and behind the count.
+        let mut c = clock(0, 1.0);
+        let mut expected = 0;
+        for (i, units) in [1, 2, 1, 2, 2, 1, 2, 1, 2, 2].iter().enumerate() {
+            c.stamp(i as u32 * 100_000, None);
+            for _ in 0..*units {
+                assert_eq!(c.stamp_audio(64_000), Some(expected), "unit after frame {i}");
+                expected += 64_000;
+            }
+        }
+        assert_eq!(c.audio_units, 16);
+        // The units' count is within a unit or two of the frames: no
+        // re-anchoring in 1.6 s of this.
+        assert_eq!(expected, 1_024_000);
+
+        // The sound ran far ahead of the picture (more units than the
+        // footage holds): the next unit starts at the latest frame again.
+        let mut c = clock(0, 1.0);
+        c.stamp(0, None);
+        for i in 0..4 {
+            assert_eq!(c.stamp_audio(64_000), Some(i * 64_000));
+        }
+        c.stamp(100_000, None);
+        assert_eq!(c.stamp_audio(64_000), Some(256_000), "156 ms ahead: still contiguous");
+        assert_eq!(c.stamp_audio(64_000), Some(320_000), "220 ms ahead: still contiguous");
+        assert_eq!(c.stamp_audio(64_000), Some(100_000), "284 ms ahead: at the latest frame again");
+        assert_eq!(c.stamp_audio(64_000), Some(164_000));
+
+        // ...and far behind (no units for a while): likewise.
+        let mut c = clock(0, 1.0);
+        c.stamp(0, None);
+        assert_eq!(c.stamp_audio(64_000), Some(0));
+        for i in 1..=4 {
+            c.stamp(i * 100_000, None);
+        }
+        assert_eq!(c.stamp_audio(64_000), Some(400_000), "64 ms of sound after 400 ms of picture");
+        // Within the margin it carries on contiguously.
+        let mut c = clock(0, 1.0);
+        c.stamp(0, None);
+        assert_eq!(c.stamp_audio(64_000), Some(0));
+        for i in 1..=3 {
+            c.stamp(i * 100_000, None);
+        }
+        assert_eq!(c.stamp_audio(64_000), Some(64_000), "236 ms behind the picture: still contiguous");
+    }
+
+    #[test]
+    fn audio_keeps_the_pictures_speed_offset_and_opens() {
+        // At 2x the units are placed at half their footage time too (the
+        // sink itself plays no sound then; the clock is one and the same).
+        let mut fast = clock(0, 2.0);
+        fast.stamp(0, None);
+        fast.stamp(100_000, None);
+        assert_eq!(fast.stamp_audio(64_000), Some(50_000));
+        assert_eq!(fast.stamp_audio(64_000), Some(82_000));
+
+        // A frame after its due time moves the picture later (see `stamp`):
+        // the sound after it moves with it.
+        let mut c = clock(0, 1.0);
+        c.stamp(0, Some(0));
+        assert_eq!(c.stamp_audio(64_000), Some(0));
+        assert_eq!(c.stamp(100_000, Some(1_100_000)).pts_us, 1_100_000);
+        assert_eq!(c.stamp_audio(64_000), Some(1_064_000));
+        assert_eq!(c.stamp_audio(64_000), Some(1_128_000));
+
+        // The next file carries straight on: its first frame comes one
+        // frame interval after the last, and its audio with it, with no gap
+        // and nothing twice.
+        let mut c = clock(1_000, 1.0);
+        for (raw, units) in [(0, 2), (100_000, 2), (200_000, 1)] {
+            c.stamp(raw, None);
+            for _ in 0..units {
+                c.stamp_audio(64_000);
+            }
+        }
+        assert_eq!(c.stamp_audio(64_000), Some(320_000));
+        c.chain(Duration::from_secs(2_000));
+        assert_eq!(c.stamp_audio(64_000), Some(384_000), "audio of the old file carries on after its last frame");
+        assert_eq!(c.stamp(900_000_000, None).pts_us, 300_000);
+        assert_eq!(c.stamp_audio(64_000), Some(448_000));
+        assert_eq!(c.stamp_audio(64_000), Some(512_000));
+
+        // A new open starts the sound over with the picture.
+        c.reset(Duration::from_secs(5_000), 1.0);
+        assert_eq!(c.stamp_audio(64_000), None);
+        assert_eq!(c.audio_units, 0);
+        c.stamp(77, None);
+        assert_eq!(c.stamp_audio(64_000), Some(0));
+    }
+
+    /// One ADTS frame: `rate_index` from the ADTS table, `blocks` raw data
+    /// blocks, `payload` bytes after the 7-byte header.
+    fn adts(rate_index: u8, blocks: u8, payload: usize) -> Vec<u8> {
+        let length = 7 + payload;
+        let mut unit = vec![
+            0xff,
+            0xf1,
+            (1 << 6) | (rate_index << 2),
+            (1 << 6) | ((length >> 11) & 0x03) as u8,
+            ((length >> 3) & 0xff) as u8,
+            (((length & 0x07) << 5) as u8) | 0x1f,
+            0xfc | (blocks - 1),
+        ];
+        unit.resize(length, 0xaa);
+        unit
+    }
+
+    #[test]
+    fn an_audio_units_length_comes_from_its_adts_headers() {
+        // 1024 samples at 16 kHz, what the devices send.
+        assert_eq!(adts_unit_duration_us(&adts(8, 1, 512)), 64_000);
+        // Two frames in one unit; two raw data blocks in one frame.
+        assert_eq!(adts_unit_duration_us(&[adts(8, 1, 100), adts(8, 1, 300)].concat()), 128_000);
+        assert_eq!(adts_unit_duration_us(&adts(11, 2, 64)), 256_000);
+        assert_eq!(adts_unit_duration_us(&adts(3, 1, 64)), 21_333);
+        // Anything else is taken for the usual unit.
+        assert_eq!(adts_unit_duration_us(&[]), AUDIO_UNIT_FALLBACK_US);
+        assert_eq!(adts_unit_duration_us(&[0xff, 0x01, 0x02]), AUDIO_UNIT_FALLBACK_US);
+        assert_eq!(adts_unit_duration_us(&[0x00; 519]), AUDIO_UNIT_FALLBACK_US);
+        let mut short = adts(8, 1, 512);
+        short.truncate(100); // a frame cut off
+        assert_eq!(adts_unit_duration_us(&short), AUDIO_UNIT_FALLBACK_US);
+        let mut bad_rate = adts(8, 1, 64);
+        bad_rate[2] = 0x40 | (15 << 2);
+        assert_eq!(adts_unit_duration_us(&bad_rate), AUDIO_UNIT_FALLBACK_US);
+    }
+
+    // ---- The replay pipeline's buffering, flush, thinning and sound, with
+    // GStreamer core elements only (no decoders):
+    //   appsrc ! queue [! identity] ! fakesink   (the picture)
+    //   appsrc ! fakesink                        (the sound)
 
     fn test_sink(slow_element_us: Option<u32>) -> (VideoSink, gstreamer::Element) {
         gstreamer::init().expect("gstreamer init");
@@ -1874,7 +2331,21 @@ mod tests {
         chain.push(display.clone());
         pipeline.add_many(&chain).expect("add");
         gstreamer::Element::link_many(&chain).expect("link");
-        let sink = assemble_replay_sink(VideoType::H264, pipeline, appsrc, &queue, &display, Arc::new(AtomicU64::new(0)));
+        // The sound: its source straight into a sink that plays by the clock
+        // and takes part in the preroll, as an audio output does.
+        let audio_appsrc = replay_audio_appsrc();
+        let speaker = gstreamer::ElementFactory::make("fakesink")
+            .name("speaker")
+            .property("sync", true)
+            .property("max-lateness", -1i64)
+            .property("qos", false)
+            .build()
+            .expect("fakesink");
+        pipeline.add_many([audio_appsrc.upcast_ref(), &speaker]).expect("add");
+        audio_appsrc.link(&speaker).expect("link");
+        let audio = Some(ReplayAudio { appsrc: audio_appsrc, volume: None });
+        let sink =
+            assemble_replay_sink(VideoType::H264, pipeline, appsrc, &queue, &display, audio, Arc::new(AtomicU64::new(0)));
         sink.pipeline.set_state(gstreamer::State::Playing).expect("play");
         (sink, display)
     }
@@ -1883,8 +2354,32 @@ mod tests {
         VideoFrame { video_type: VideoType::H264, is_keyframe: key, microseconds: us, data: vec![0u8; 2_000] }
     }
 
+    /// A 64 ms audio unit, as the devices send them.
+    fn audio_unit() -> Vec<u8> {
+        adts(8, 1, 512)
+    }
+
+    /// Pushes `frames` frames of 10 fps footage from `from_us`, each followed
+    /// by its audio (one or two units a frame: 15.6 units a second).
+    fn push_with_sound(sink: &VideoSink, from_us: u32, frames: u32, key_every: u32) {
+        for i in 0..frames {
+            sink.push_frame(&frame(from_us + i * 100_000, i % key_every == 0));
+            for _ in 0..(1 + (i * 5 / 8 + 1) % 2) {
+                sink.push_replay_audio(&audio_unit());
+            }
+        }
+    }
+
     fn rendered(display: &gstreamer::Element) -> u64 {
         display.property::<gstreamer::Structure>("stats").get::<u64>("rendered").unwrap_or(0)
+    }
+
+    fn speaker(sink: &VideoSink) -> gstreamer::Element {
+        sink.pipeline.by_name("speaker").expect("the test sink's speaker")
+    }
+
+    fn audio_appsrc(sink: &VideoSink) -> &AppSrc {
+        &sink.replay.as_ref().expect("replay").audio.as_ref().expect("sound").appsrc
     }
 
     #[test]
@@ -1923,6 +2418,113 @@ mod tests {
         assert!((5..=16).contains(&shown), "0.5 s at 2x should show ~10 frames: {shown}");
         let position = sink.replay_status().expect("replay sink").position.as_secs_f64();
         assert!((5_000.5..=5_001.6).contains(&position), "position {position}");
+        let _ = sink.pipeline.set_state(gstreamer::State::Null);
+    }
+
+    #[test]
+    fn replay_sound_plays_in_time_with_the_picture_at_1x_only() {
+        let (sink, display) = test_sink(None);
+        let speaker = speaker(&sink);
+        sink.reset_for_open(Duration::from_secs(1_000), 1.0);
+        // 3 s of 1x footage with its sound, arriving all at once.
+        let started = std::time::Instant::now();
+        push_with_sound(&sink, 0, 30, 10);
+        assert!(started.elapsed() < Duration::from_millis(200), "pushing must never wait");
+        std::thread::sleep(Duration::from_millis(1_000));
+        let (shown, heard) = (rendered(&display), rendered(&speaker));
+        assert!((6..=15).contains(&shown), "1 s of 1x should show ~10 frames: {shown}");
+        assert!((10..=22).contains(&heard), "1 s of 1x should play ~16 audio units, not the whole lead: {heard}");
+        assert!(audio_appsrc(&sink).current_level_bytes() > 0, "the sound's lead waits in its source");
+
+        // A new open at 2x: the old sound is gone at once with the picture,
+        // and nothing is played at that speed, while the picture plays.
+        sink.reset_for_open(Duration::from_secs(5_000), 2.0);
+        assert_eq!(audio_appsrc(&sink).current_level_bytes(), 0);
+        let (before_shown, before_heard) = (rendered(&display), rendered(&speaker));
+        push_with_sound(&sink, 7_000_000, 40, 10);
+        assert_eq!(audio_appsrc(&sink).current_level_bytes(), 0, "no sound is queued at 2x");
+        std::thread::sleep(Duration::from_millis(500));
+        let shown = rendered(&display) - before_shown;
+        assert!((5..=16).contains(&shown), "0.5 s at 2x should show ~10 frames: {shown}");
+        assert_eq!(rendered(&speaker), before_heard, "silent at 2x");
+
+        // Back at 1x the sound comes back with the picture.
+        sink.reset_for_open(Duration::from_secs(6_000), 1.0);
+        let (before_shown, before_heard) = (rendered(&display), rendered(&speaker));
+        push_with_sound(&sink, 9_000_000, 20, 10);
+        std::thread::sleep(Duration::from_millis(500));
+        let (shown, heard) = (rendered(&display) - before_shown, rendered(&speaker) - before_heard);
+        assert!((3..=8).contains(&shown), "0.5 s at 1x should show ~5 frames: {shown}");
+        assert!((5..=12).contains(&heard), "0.5 s at 1x should play ~8 audio units: {heard}");
+        let _ = sink.pipeline.set_state(gstreamer::State::Null);
+    }
+
+    #[test]
+    fn replay_sound_holds_with_the_picture_and_goes_on_across_files() {
+        let (sink, display) = test_sink(None);
+        let speaker = speaker(&sink);
+        sink.reset_for_open(Duration::from_secs(100), 1.0);
+        push_with_sound(&sink, 0, 20, 10);
+        std::thread::sleep(Duration::from_millis(500));
+        let (shown_before, heard_before) = (rendered(&display), rendered(&speaker));
+        assert!((3..=8).contains(&shown_before) && (5..=12).contains(&heard_before), "{shown_before} {heard_before}");
+        // Pause: neither the picture nor the sound moves (a sink starts its
+        // counts over when paused).
+        sink.set_paused(true);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(rendered(&display) <= 1 && rendered(&speaker) <= 1, "paused but still playing");
+        // The next file follows on what is buffered: nothing is flushed,
+        // the sound plays on into the new file.
+        sink.set_paused(false);
+        sink.chain_open(Duration::from_secs(200));
+        push_with_sound(&sink, 500_000_000, 20, 10);
+        std::thread::sleep(Duration::from_millis(1_000));
+        let (shown, heard) = (rendered(&display), rendered(&speaker));
+        assert!((7..=14).contains(&shown), "1 s on from the pause should show ~10 frames: {shown}");
+        assert!((11..=22).contains(&heard), "1 s on from the pause should play ~16 audio units: {heard}");
+        // The last file ended: the sound ends with the picture, and a new
+        // open starts both over.
+        sink.end_of_footage();
+        sink.push_replay_audio(&audio_unit()); // ignored
+        std::thread::sleep(Duration::from_millis(2_500));
+        // (A frame may have been shown between the count and the pause.)
+        let shown_after = rendered(&display);
+        assert!((40 - shown_before - 1..=40 - shown_before).contains(&shown_after), "{shown_after} of {}", 40 - shown_before);
+        assert_eq!(audio_appsrc(&sink).current_level_bytes(), 0);
+        let heard_all = rendered(&speaker);
+        assert!((50..=70).contains(&heard_all), "all the sound played out: {heard_all}");
+        sink.reset_for_open(Duration::from_secs(300), 1.0);
+        assert_eq!(rendered(&speaker), 0, "a flushed sink starts its counts over");
+        push_with_sound(&sink, 10_000_000, 20, 10);
+        std::thread::sleep(Duration::from_millis(500));
+        let heard = rendered(&speaker);
+        assert!((5..=12).contains(&heard), "0.5 s of a new open should play ~8 audio units: {heard}");
+        let _ = sink.pipeline.set_state(gstreamer::State::Null);
+    }
+
+    #[test]
+    fn a_recording_without_sound_plays_and_sound_that_comes_late_joins_in() {
+        let (sink, display) = test_sink(None);
+        let speaker = speaker(&sink);
+        sink.reset_for_open(Duration::from_secs(100), 1.0);
+        // 1x, but no audio comes: after AUDIO_WAIT_FRAMES frames the picture
+        // stops waiting for it.
+        for i in 0..AUDIO_WAIT_FRAMES as u32 + 5 {
+            sink.push_frame(&frame(i * 100_000, i == 0));
+        }
+        std::thread::sleep(Duration::from_millis(800));
+        let shown = rendered(&display);
+        assert!((5..=12).contains(&shown), "0.8 s of a silent recording should show ~8 frames: {shown}");
+        assert_eq!(rendered(&speaker), 0);
+        // Audio after all (the next file has some): it joins in and plays
+        // on the same timeline, after the frames it follows, which are
+        // still 0.7 s ahead of the picture.
+        push_with_sound(&sink, 1_500_000, 20, 10);
+        std::thread::sleep(Duration::from_millis(1_700));
+        let heard = rendered(&speaker);
+        assert!((10..=24).contains(&heard), "1 s after sound joined in it should play ~16 units: {heard}");
+        let shown = rendered(&display);
+        assert!((20..=32).contains(&shown), "the picture played on meanwhile: {shown}");
         let _ = sink.pipeline.set_state(gstreamer::State::Null);
     }
 

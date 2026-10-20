@@ -161,7 +161,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
 
     // The same for recorded footage, into its own view (answered once the
     // Playback page exists, below).
-    let replay_video = Rc::new(VideoView::new_replay());
+    let replay_video = Rc::new(VideoView::new_replay(settings.volume));
     let (replay_sink_request_tx, mut replay_sink_request_rx) = tokio::sync::mpsc::channel::<ReplaySinkRequest>(8);
 
     let main = Rc::new_cyclic(|weak: &std::rc::Weak<MainWindow>| {
@@ -488,6 +488,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         volume.connect_value_changed(move |_, value| {
             if let Some(m) = w.upgrade() {
                 m.audio.set_volume(value);
+                m.replay_video.set_volume(value);
                 m.settings.borrow_mut().volume = value;
                 m.settings.borrow().save();
             }
