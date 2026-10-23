@@ -163,26 +163,14 @@ fn folder_row(
     let parent = parent.clone();
     let on_pick = Rc::new(on_pick);
     browse.connect_clicked(move |_| {
-        let chooser = gtk4::FileChooserNative::new(
-            Some("Choose a folder"),
-            Some(&parent),
-            gtk4::FileChooserAction::SelectFolder,
-            Some("Select"),
-            Some("Cancel"),
-        );
         let (path, shown, on_pick) = (Rc::clone(&path), shown.clone(), Rc::clone(&on_pick));
-        let keep = chooser.clone();
-        chooser.connect_response(move |_, response| {
-            if response == gtk4::ResponseType::Accept {
-                if let Some(folder) = keep.file().and_then(|f| f.path()) {
-                    let folder = folder.display().to_string();
-                    shown.set_text(&folder);
-                    *path.borrow_mut() = folder.clone();
-                    on_pick(folder);
-                }
-            }
+        let current = std::path::PathBuf::from(&*path.borrow());
+        crate::ui::dialogs::choose_folder(&parent, &current, move |folder| {
+            let folder = folder.display().to_string();
+            shown.set_text(&folder);
+            *path.borrow_mut() = folder.clone();
+            on_pick(folder);
         });
-        chooser.show();
     });
 
     let row = ListBoxRow::new();

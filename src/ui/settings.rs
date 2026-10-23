@@ -174,6 +174,18 @@ impl Settings {
     }
 }
 
+/// Where snapshots (Pictures) or recordings and downloads (Videos) go: the
+/// folder `chosen` in the settings, else `~/Pictures/Reoling` /
+/// `~/Videos/Reoling`, created on demand.
+pub fn media_dir(chosen: Option<&str>, kind: glib::UserDirectory) -> Option<PathBuf> {
+    let dir = match chosen {
+        Some(dir) => PathBuf::from(dir),
+        None => glib::user_special_dir(kind)?.join("Reoling"),
+    };
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
 // --- theme -----------------------------------------------------------------
 
 /// What the system had set when we started, to go back to on "Auto".

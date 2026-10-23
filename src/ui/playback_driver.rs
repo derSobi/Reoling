@@ -137,6 +137,9 @@ pub enum PlaybackEvent {
     State(PlayerState),
     /// Something the user should read; the player stays usable.
     Error { session: u64, message: String },
+    /// Something to read that says nothing about the player (a download
+    /// holding a command up): shown, nothing else.
+    Notice { session: u64, message: String },
 }
 
 /// The page's intents, in the order it sent them. `gen` is the link's
@@ -615,6 +618,41 @@ impl PlaybackDriver {
     /// Whether a playback session exists (the tick runs then).
     pub(crate) fn is_active(&self) -> bool {
         self.want.day.is_some()
+    }
+
+    /// The session later commands belong to.
+    pub(crate) fn session(&self) -> u64 {
+        self.want.session
+    }
+
+    /// The day's recordings as loaded for `channel`, `day` and `stream`
+    /// (`None`: not those, so a download searches them itself).
+    pub(crate) fn loaded_files(&self, channel: u8, day: CivilTime, stream: RecordStream) -> Option<Vec<RecordingFile>> {
+        self.files
+            .as_ref()
+            .filter(|f| (f.channel, f.day, f.stream) == (channel, midnight_of(day), stream))
+            .map(|f| f.files.clone())
+    }
+
+    /// A download needs the connection's reader to itself, as a search
+    /// does: the running opening is closed and held as paused, so that
+    /// Play carries on from there once the download is over. Nothing
+    /// happens on the device while nothing is open.
+    pub(crate) async fn pause_for_download(&mut self, client: &mut ReolinkClient, tx: &Events) {
+        let stale = self.open.as_ref().is_some_and(|open| open.session != self.want.session);
+        if stale {
+            self.open = None;
+            let _ = client.stop_replay_within(CLOSE_WAIT).await;
+        } else if let Some(closed) = self.close_and_drain(client).await {
+            self.hold_from(closed, HoldReason::Paused);
+        }
+        if let Some(hold) = self.hold.as_mut() {
+            hold.reason = HoldReason::Paused;
+            self.phase = PlayerPhase::Paused;
+        }
+        self.want.playing = false;
+        self.apply_paused_state();
+        self.send_state(tx).await;
     }
 
     /// The running opening's units (video frames and audio), if there is one

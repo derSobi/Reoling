@@ -525,6 +525,9 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
 
         // Recorded footage. Commands only go to a connected device's link.
         let w_link = weak.clone();
+        let w_names = weak.clone();
+        let w_dir = weak.clone();
+        let w_set_dir = weak.clone();
         let playback = PlaybackPage::new(
             Rc::clone(&replay_video),
             playback_page::Handlers {
@@ -533,6 +536,17 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
                         if let Some(l) = m.links.borrow().get(key) {
                             f(&l.link);
                         }
+                    }
+                }),
+                names: Box::new(move |key, channel| {
+                    let device = w_names.upgrade().and_then(|m| m.device(key));
+                    download_names(device.as_ref(), channel)
+                }),
+                download_dir: Box::new(move || w_dir.upgrade().and_then(|m| m.media_dir(glib::UserDirectory::Videos))),
+                set_download_dir: Box::new(move |dir| {
+                    if let Some(m) = w_set_dir.upgrade() {
+                        m.settings.borrow_mut().recording_dir = Some(dir);
+                        m.settings.borrow().save();
                     }
                 }),
             },
@@ -828,6 +842,22 @@ fn icon_of(names: &[&'static str]) -> &'static str {
     names.iter().copied().find(|n| has(n)).unwrap_or(names[names.len() - 1])
 }
 
+/// A download's file is named after the device and its camera on
+/// `channel`: the channel's name, else its number as the live recordings
+/// use it (`ch1` for channel 0).
+fn download_names(device: Option<&Device>, channel: u8) -> (String, String) {
+    let numbered = || format!("ch{}", u16::from(channel) + 1);
+    let Some(device) = device else { return ("device".to_string(), numbered()) };
+    let camera = device
+        .channels
+        .iter()
+        .find(|c| c.channel_id == channel)
+        .map(|c| c.name.trim())
+        .filter(|name| !name.is_empty())
+        .map_or_else(numbered, str::to_string);
+    (device.name.clone(), camera)
+}
+
 fn sidebar_icon() -> &'static str {
     let has = |name: &str| {
         gtk4::gdk::Display::default()
@@ -934,12 +964,7 @@ impl MainWindow {
                 _ => settings.recording_dir.clone(),
             }
         };
-        let dir = match chosen {
-            Some(dir) => std::path::PathBuf::from(dir),
-            None => glib::user_special_dir(kind)?.join("Reoling"),
-        };
-        std::fs::create_dir_all(&dir).ok()?;
-        Some(dir)
+        crate::ui::settings::media_dir(chosen.as_deref(), kind)
     }
 
     /// `<device>-<channel>-<date>-<time>.<extension>` for what is playing.
@@ -1771,6 +1796,7 @@ impl MainWindow {
                 self.playback.device_lost(key, &reason);
             }
             DeviceEvent::Playback(event) => self.playback.on_event(key, event),
+            DeviceEvent::Download(event) => self.playback.on_download(key, event),
         }
     }
 
