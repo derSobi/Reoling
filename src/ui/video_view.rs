@@ -1452,7 +1452,7 @@ fn build_replay_audio(pipeline: &gstreamer::Pipeline, volume: f64) -> Result<Rep
 /// How much footage an audio unit holds: the sum of its ADTS frames (1024
 /// samples each, times the raw data blocks, at the header's sample rate);
 /// `AUDIO_UNIT_FALLBACK_US` when the unit does not parse as ADTS.
-fn adts_unit_duration_us(unit: &[u8]) -> u64 {
+pub(crate) fn adts_unit_duration_us(unit: &[u8]) -> u64 {
     const RATES: [u64; 13] = [96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000, 7_350];
     let mut at = 0usize;
     let mut total_us = 0u64;

@@ -11,19 +11,31 @@
 //! day, device or channel change starts a new one). Every time shown is
 //! device-local, exactly as the device reports it: the host's zone is used
 //! for nothing but the calendar's first month.
+//!
+//! A Download button saves a range of the day to an MP4 file
+//! (`download_dialog` asks what, `download_job` does it on the device's
+//! thread). The page shows the download's progress under the controls
+//! and marks its range on the timeline; as everything else here, that
+//! belongs to the session it started in, and the download runs on
+//! whether or not the page still shows it.
 
-use crate::ui::bridge::{DeviceLink, FileSpan, PlaybackEvent, PlayerPhase, PlayerState};
+use crate::ui::bridge::{
+    DeviceLink, DownloadEvent, DownloadOutcome, DownloadRequest, FileSpan, PlaybackEvent, PlayerPhase, PlayerState,
+};
+use crate::ui::download_dialog::{self, Choice, Setup};
 use crate::ui::playback_driver::{civil_at, civil_of, seconds_of_day, timeline_of};
 use crate::ui::playback_timeline::{PlaybackTimeline, TimelineEvent};
+use crate::ui::recording_file::size_text;
 use crate::ui::video_view::VideoView;
 use gtk4::prelude::*;
 use gtk4::{
-    Box as GtkBox, Button, Calendar, DropDown, Label, MenuButton, Orientation, Overlay, Popover, Spinner,
+    Box as GtkBox, Button, Calendar, DropDown, Label, MenuButton, Orientation, Overlay, Popover, ProgressBar, Spinner,
     ToggleButton,
 };
 use reoling::{CivilTime, RecordStream, RecordedEvent, ReplaySpeed};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -46,9 +58,10 @@ const SEEK_HOLD: Duration = Duration::from_secs(30);
 /// has been played out.
 const PLAYED_OUT_BELOW: Duration = Duration::from_millis(300);
 
-/// The stream dropdown, in the live page's order and words.
-const STREAMS: [RecordStream; 2] = [RecordStream::Main, RecordStream::Sub];
-const STREAM_LABELS: [&str; 2] = ["Main stream", "Sub stream"];
+/// The stream dropdown, in the live page's order and words (the download
+/// dialog's too).
+pub(crate) const STREAMS: [RecordStream; 2] = [RecordStream::Main, RecordStream::Sub];
+pub(crate) const STREAM_LABELS: [&str; 2] = ["Main stream", "Sub stream"];
 
 /// An event jump passes over a start this close to the position: the one
 /// just played from (the device starts a little before the seek time), or
@@ -158,6 +171,13 @@ pub enum Readiness {
 pub struct Handlers {
     /// Runs `f` with device `key`'s link, if it has one.
     pub with_link: Box<dyn Fn(&str, &dyn Fn(&DeviceLink))>,
+    /// Device `key`'s name and the name of its camera on `channel`, for a
+    /// download's file name.
+    pub names: Box<dyn Fn(&str, u8) -> (String, String)>,
+    /// Where downloads go (the recordings folder of the settings).
+    pub download_dir: Box<dyn Fn() -> Option<PathBuf>>,
+    /// The user chose another folder for downloads: kept in the settings.
+    pub set_download_dir: Box<dyn Fn(String)>,
 }
 
 /// What the page needs to pick up where it was once a lost device is back.
@@ -185,6 +205,69 @@ struct Choosing {
     second: bool,
 }
 
+/// The download started in the current session, as the page shows it.
+#[derive(Debug, Clone, PartialEq)]
+struct Download {
+    name: String,
+    /// The file, once saved.
+    path: Option<PathBuf>,
+    bytes: u64,
+    estimate: Option<u64>,
+    /// The range asked for (device-local), once the device accepted it.
+    range: Option<(CivilTime, CivilTime)>,
+    phase: DownloadPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadPhase {
+    /// Asked for; the device has not answered yet.
+    Starting,
+    Running,
+    /// Cancel was pressed; the device has not stopped yet.
+    Cancelling,
+    Saved,
+}
+
+impl Download {
+    fn new() -> Self {
+        Download { name: String::new(), path: None, bytes: 0, estimate: None, range: None, phase: DownloadPhase::Starting }
+    }
+
+    /// Still reading from the device.
+    fn running(&self) -> bool {
+        self.phase != DownloadPhase::Saved
+    }
+
+    /// What the row under the controls says.
+    fn text(&self) -> String {
+        match self.phase {
+            DownloadPhase::Starting => "Starting the download…".to_string(),
+            DownloadPhase::Running => format!("Downloading {}", self.name),
+            DownloadPhase::Cancelling => "Cancelling the download…".to_string(),
+            DownloadPhase::Saved => format!("Saved {}", self.name),
+        }
+    }
+}
+
+/// What the bar shows at most while the download runs: the device's
+/// estimate is only that (the devices deliver up to a third more than
+/// it says), so the bar never fills before the file is saved.
+const RUNNING_FRACTION_MAX: f64 = 0.99;
+
+/// "1.2 MB of 3.4 MB · 35 %" and the fraction (at most
+/// `RUNNING_FRACTION_MAX`: a download past the device's estimate reads
+/// "99 %" until it is saved), or "1.2 MB" and none without an estimate
+/// (the bar then pulses).
+fn progress_of(bytes: u64, estimate: Option<u64>) -> (String, Option<f64>) {
+    match estimate.filter(|&e| e > 0) {
+        Some(estimate) => {
+            let fraction = (bytes as f64 / estimate as f64).min(RUNNING_FRACTION_MAX);
+            (format!("{} of {} · {:.0} %", size_text(bytes), size_text(estimate), fraction * 100.0), Some(fraction))
+        }
+        None => (size_text(bytes), None),
+    }
+}
+
 pub struct PlaybackPage {
     root: GtkBox,
     video: Rc<VideoView>,
@@ -207,6 +290,13 @@ pub struct PlaybackPage {
     prev_event: Button,
     next_event: Button,
     filter: DropDown,
+    download_button: Button,
+    download_row: GtkBox,
+    download_label: Label,
+    download_bar: ProgressBar,
+    download_cancel: Button,
+    download_open: Button,
+    download_dismiss: Button,
     handlers: Handlers,
 
     /// The page is the visible one (set and cleared by `enter`/`leave` only).
@@ -222,6 +312,8 @@ pub struct PlaybackPage {
     day: Cell<Option<CivilTime>>,
     /// The selected day's recordings: `None` while they are being listed.
     files: RefCell<Option<Result<Vec<FileSpan>, String>>>,
+    /// The stream `files` were listed for.
+    files_stream: Cell<RecordStream>,
     /// The selected day's event windows (every kind; the filter is applied
     /// when they are shown): `None` while they are being listed.
     events: RefCell<Option<Result<Vec<RecordedEvent>, String>>>,
@@ -260,6 +352,11 @@ pub struct PlaybackPage {
     timer: RefCell<Option<glib::SourceId>>,
     /// Set while code, not the user, changes a control.
     updating: Cell<bool>,
+    /// The download started in this session (see `on_download`).
+    download: RefCell<Option<Download>>,
+    /// The download dialog is open: the range it stands for shows on the
+    /// timeline.
+    dialog_open: Cell<bool>,
 }
 
 impl PlaybackPage {
@@ -348,6 +445,8 @@ impl PlaybackPage {
         let filter = DropDown::from_strings(&filter_labels);
         filter.set_selected(filter_index(EventFilter::All));
         filter.set_tooltip_text(Some("Detection filter"));
+        let download_button = Button::from_icon_name("document-save-symbolic");
+        download_button.set_tooltip_text(Some("Download a recording"));
         let controls = GtkBox::new(Orientation::Horizontal, 8);
         controls.set_margin_top(6);
         controls.set_margin_bottom(6);
@@ -369,11 +468,37 @@ impl PlaybackPage {
         controls.append(&spacer);
         controls.append(&speed);
         controls.append(&stream);
+        controls.append(&download_button);
+
+        // The download, under the controls while it runs and once it is
+        // saved: what, how far, and Cancel; then Open folder.
+        let download_label = Label::new(None);
+        download_label.set_xalign(0.0);
+        download_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        let download_bar = ProgressBar::new();
+        download_bar.set_hexpand(true);
+        download_bar.set_valign(gtk4::Align::Center);
+        download_bar.set_show_text(true);
+        let download_cancel = Button::with_label("Cancel");
+        let download_open = Button::with_label("Open folder");
+        let download_dismiss = Button::from_icon_name("window-close-symbolic");
+        download_dismiss.set_tooltip_text(Some("Dismiss"));
+        let download_row = GtkBox::new(Orientation::Horizontal, 8);
+        download_row.set_margin_bottom(6);
+        download_row.set_margin_start(8);
+        download_row.set_margin_end(8);
+        download_row.append(&download_label);
+        download_row.append(&download_bar);
+        download_row.append(&download_cancel);
+        download_row.append(&download_open);
+        download_row.append(&download_dismiss);
+        download_row.set_visible(false);
 
         let root = GtkBox::new(Orientation::Vertical, 0);
         root.append(&overlay);
         root.append(&timeline_row);
         root.append(&controls);
+        root.append(&download_row);
 
         let this = Rc::new(Self {
             root,
@@ -397,6 +522,13 @@ impl PlaybackPage {
             prev_event,
             next_event,
             filter,
+            download_button,
+            download_row,
+            download_label,
+            download_bar,
+            download_cancel,
+            download_open,
+            download_dismiss,
             handlers,
             shown: Cell::new(false),
             device: RefCell::new(None),
@@ -405,6 +537,7 @@ impl PlaybackPage {
             session: Cell::new(0),
             day: Cell::new(None),
             files: RefCell::new(None),
+            files_stream: Cell::new(RecordStream::Sub),
             events: RefCell::new(None),
             events_failed: Cell::new(false),
             months: RefCell::new(HashMap::new()),
@@ -425,6 +558,8 @@ impl PlaybackPage {
             restore: Cell::new(None),
             timer: RefCell::new(None),
             updating: Cell::new(false),
+            download: RefCell::new(None),
+            dialog_open: Cell::new(false),
         });
         this.wire();
         this.refresh();
@@ -503,6 +638,32 @@ impl PlaybackPage {
         self.next_event.connect_clicked(move |_| {
             if let Some(p) = weak.upgrade() {
                 p.jump_event(true);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.download_button.connect_clicked(move |_| {
+            if let Some(p) = weak.upgrade() {
+                p.open_download_dialog();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.download_cancel.connect_clicked(move |_| {
+            if let Some(p) = weak.upgrade() {
+                p.cancel_download();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.download_open.connect_clicked(move |_| {
+            if let Some(p) = weak.upgrade() {
+                p.open_download_folder();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.download_dismiss.connect_clicked(move |_| {
+            if let Some(p) = weak.upgrade() {
+                *p.download.borrow_mut() = None;
+                p.refresh_selection();
+                p.refresh();
             }
         });
 
@@ -735,6 +896,11 @@ impl PlaybackPage {
                     self.refresh();
                 }
             }
+            PlaybackEvent::Notice { session, message } => {
+                if session == self.session.get() {
+                    self.notify(&message);
+                }
+            }
         }
     }
 
@@ -784,6 +950,9 @@ impl PlaybackPage {
         self.pending_seek.set(None);
         self.playing.set(false);
         self.command_gen.set(0);
+        // A download under way runs on; its progress belonged to the
+        // session it started in.
+        *self.download.borrow_mut() = None;
         self.video.reset();
         self.timeline.set_day(None);
         self.date.set_label("Choose a day");
@@ -869,6 +1038,13 @@ impl PlaybackPage {
         self.command_gen.set(0);
         self.forget_marks();
         self.months.borrow_mut().retain(|(k, ..), _| k != key);
+        // A download went with the connection (its partial file is
+        // removed there); its row would wait for an end that never comes.
+        if self.download_running() {
+            self.notify("Download abandoned: connection lost");
+        }
+        *self.download.borrow_mut() = None;
+        self.refresh_selection();
         true
     }
 
@@ -931,6 +1107,7 @@ impl PlaybackPage {
         }
         let listed = files.as_ref().is_ok_and(|files| !files.is_empty());
         *self.files.borrow_mut() = Some(files);
+        self.files_stream.set(self.want_stream.get());
         if let Some(back) = self.restore.take() {
             // Back after a lost connection: where it was, as it was.
             if let (Some(at), true) = (back.position, listed) {
@@ -1179,6 +1356,7 @@ impl PlaybackPage {
 
     /// The cursor and the time label follow the picture.
     fn tick(&self) {
+        self.pulse_download();
         let Some(day) = self.day.get() else { return };
         let position = self.screen_position(day);
         self.timeline.set_position(position.map(|(seconds, _)| seconds));
@@ -1247,6 +1425,7 @@ impl PlaybackPage {
             self.play.set_icon_name(icon);
             self.play.set_tooltip_text(Some(tip));
         }
+        self.refresh_download_row(ready && has_files);
         let state = self.state.borrow().clone();
         // Not once the user has paused: a state from before the pause may
         // still say buffering.
@@ -1281,6 +1460,236 @@ impl PlaybackPage {
                 self.message.set_visible(true);
             }
             None => self.message.set_visible(false),
+        }
+    }
+
+    // ---- downloads ------------------------------------------------------------
+
+    fn download_running(&self) -> bool {
+        self.download.borrow().as_ref().is_some_and(Download::running)
+    }
+
+    /// The Download button: the dialog, offered the position on screen
+    /// (else the day's first recording), the current stream and the
+    /// settings' folder.
+    fn open_download_dialog(self: &Rc<Self>) {
+        let Some(day) = self.day.get() else { return };
+        if !self.is_ready() || !self.has_files() || self.download_running() || self.dialog_open.get() {
+            return;
+        }
+        let Some((key, channel)) = self.device.borrow().clone() else { return };
+        let Some(dir) = (self.handlers.download_dir)() else {
+            self.notify("Could not create the download folder");
+            return;
+        };
+        let (device, camera) = (self.handlers.names)(&key, channel);
+        let listed = match &*self.files.borrow() {
+            Some(Ok(files)) => Some((self.files_stream.get(), files.clone())),
+            _ => None,
+        };
+        let first = listed.as_ref().and_then(|(_, files)| files.first()).map(|f| f.start);
+        // A time of the day: a position in a file from the evening before
+        // (or running into the next day) is brought back into it.
+        let start = self.screen_position(day).map(|(_, at)| at).or(first).unwrap_or(day);
+        let start = start.clamp(day, day.add_seconds(86_399));
+        let setup = Setup { day, start, stream: self.want_stream.get(), listed, dir, device, camera };
+        let parent = self.root.root().and_then(|root| root.downcast::<gtk4::Window>().ok());
+        self.dialog_open.set(true);
+        let (w1, w2, w3, w4) = (Rc::downgrade(self), Rc::downgrade(self), Rc::downgrade(self), Rc::downgrade(self));
+        download_dialog::open(
+            parent.as_ref(),
+            setup,
+            move |range| {
+                if let Some(p) = w1.upgrade() {
+                    p.show_selection(range);
+                }
+            },
+            move |dir| {
+                if let Some(p) = w2.upgrade() {
+                    (p.handlers.set_download_dir)(dir);
+                }
+            },
+            move |choice| {
+                if let Some(p) = w3.upgrade() {
+                    p.start_download(choice);
+                }
+            },
+            move || {
+                if let Some(p) = w4.upgrade() {
+                    p.dialog_open.set(false);
+                    p.refresh_selection();
+                }
+            },
+        );
+    }
+
+    /// The dialog's choice: the playback is paused (a download needs the
+    /// device's connection to itself; Play carries on afterwards) and the
+    /// device's thread asked.
+    fn start_download(&self, choice: Choice) {
+        let Some(day) = self.day.get() else { return };
+        let Some((key, channel)) = self.device.borrow().clone() else { return };
+        if !self.is_ready() || self.download_running() {
+            return;
+        }
+        if self.playing.get() {
+            self.video.freeze();
+            self.playing.set(false);
+            self.send_player(DeviceLink::playback_pause);
+            self.notify("Playback paused for the download");
+        }
+        let (device, camera) = (self.handlers.names)(&key, channel);
+        let request = DownloadRequest {
+            session: self.session.get(),
+            channel,
+            day,
+            start: choice.start,
+            duration: choice.duration,
+            stream: choice.stream,
+            dir: choice.dir,
+            device,
+            camera,
+        };
+        *self.download.borrow_mut() = Some(Download::new());
+        self.send(|link| link.download(request.clone()));
+        self.refresh();
+    }
+
+    /// What the device's thread says about a download: dropped unless it
+    /// is the page's device's and of the current session (a day or
+    /// device left meanwhile keeps its download to itself).
+    pub fn on_download(&self, key: &str, event: DownloadEvent) {
+        if !self.shown.get() || self.device_key().as_deref() != Some(key) || event.session() != self.session.get() {
+            return;
+        }
+        match event {
+            DownloadEvent::Started { name, estimate, start, end, .. } => {
+                if let Some(d) = self.download.borrow_mut().as_mut() {
+                    d.name = name;
+                    d.estimate = estimate;
+                    d.range = Some((start, end));
+                    if d.phase == DownloadPhase::Starting {
+                        d.phase = DownloadPhase::Running;
+                    }
+                }
+            }
+            DownloadEvent::Progress { bytes, estimate, .. } => {
+                if let Some(d) = self.download.borrow_mut().as_mut() {
+                    d.bytes = bytes;
+                    d.estimate = estimate;
+                }
+            }
+            DownloadEvent::Finished { outcome, .. } => match outcome {
+                DownloadOutcome::Saved { name, path, bytes } => {
+                    {
+                        let mut download = self.download.borrow_mut();
+                        let d = download.get_or_insert_with(Download::new);
+                        d.name = name.clone();
+                        d.path = Some(path);
+                        d.bytes = bytes;
+                        d.estimate = Some(bytes);
+                        d.phase = DownloadPhase::Saved;
+                    }
+                    self.notify(&format!("Saved {name}"));
+                }
+                DownloadOutcome::Cancelled => {
+                    *self.download.borrow_mut() = None;
+                    self.notify("Download cancelled");
+                }
+                DownloadOutcome::Failed(message) => {
+                    *self.download.borrow_mut() = None;
+                    self.notify(&message);
+                }
+            },
+        }
+        self.refresh_selection();
+        self.refresh();
+    }
+
+    /// The Cancel button: the device is asked to stop; the partial file
+    /// goes.
+    fn cancel_download(&self) {
+        {
+            let mut download = self.download.borrow_mut();
+            match download.as_mut() {
+                Some(d) if matches!(d.phase, DownloadPhase::Starting | DownloadPhase::Running) => {
+                    d.phase = DownloadPhase::Cancelling;
+                }
+                _ => return,
+            }
+        }
+        self.send(|link| link.download_cancel());
+        self.refresh();
+    }
+
+    /// The saved file's folder, in the file manager.
+    fn open_download_folder(&self) {
+        let dir = self
+            .download
+            .borrow()
+            .as_ref()
+            .and_then(|d| d.path.as_ref())
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+        if let Some(uri) = dir.and_then(|dir| glib::filename_to_uri(&dir, None).ok()) {
+            let _ = gtk4::gio::AppInfo::launch_default_for_uri(&uri, None::<&gtk4::gio::AppLaunchContext>);
+        }
+    }
+
+    /// The timeline marks `range` (device-local) as the download's.
+    fn show_selection(&self, range: Option<(CivilTime, CivilTime)>) {
+        let Some(day) = self.day.get() else { return };
+        self.timeline.set_selection(
+            range.map(|(start, end)| (seconds_of_day(timeline_of(start), day), seconds_of_day(timeline_of(end), day))),
+        );
+    }
+
+    /// The running download's range, or none (while the dialog is open,
+    /// its own range shows instead).
+    fn refresh_selection(&self) {
+        if self.dialog_open.get() {
+            return;
+        }
+        let range = self.download.borrow().as_ref().filter(|d| d.running()).and_then(|d| d.range);
+        self.show_selection(range);
+    }
+
+    /// The row under the controls, and the Download button (`usable`: the
+    /// day's recordings are listed on a ready device).
+    fn refresh_download_row(&self, usable: bool) {
+        let download = self.download.borrow();
+        let running = download.as_ref().is_some_and(Download::running);
+        self.download_button.set_sensitive(usable && !running);
+        let Some(d) = download.as_ref() else {
+            self.download_row.set_visible(false);
+            return;
+        };
+        let text = d.text();
+        if self.download_label.text() != text {
+            self.download_label.set_text(&text);
+        }
+        if running {
+            let (bar_text, fraction) = progress_of(d.bytes, d.estimate);
+            if self.download_bar.text().as_deref() != Some(bar_text.as_str()) {
+                self.download_bar.set_text(Some(&bar_text));
+            }
+            if let Some(fraction) = fraction {
+                self.download_bar.set_fraction(fraction);
+            }
+        }
+        self.download_bar.set_visible(running);
+        self.download_cancel.set_visible(running);
+        self.download_cancel.set_sensitive(matches!(d.phase, DownloadPhase::Starting | DownloadPhase::Running));
+        self.download_open.set_visible(d.phase == DownloadPhase::Saved);
+        self.download_dismiss.set_visible(!running);
+        self.download_row.set_visible(true);
+    }
+
+    /// Without an estimate the bar shows activity instead of a fraction.
+    fn pulse_download(&self) {
+        let indeterminate =
+            self.download.borrow().as_ref().is_some_and(|d| d.running() && d.estimate.filter(|&e| e > 0).is_none());
+        if indeterminate {
+            self.download_bar.pulse();
         }
     }
 
@@ -1473,8 +1882,13 @@ fn speed_index(speed: ReplaySpeed) -> u32 {
     ReplaySpeed::ALL.iter().position(|s| *s == speed).unwrap_or(0) as u32
 }
 
-fn stream_index(stream: RecordStream) -> u32 {
+pub(crate) fn stream_index(stream: RecordStream) -> u32 {
     STREAMS.iter().position(|s| *s == stream).unwrap_or(0) as u32
+}
+
+/// "Main stream", "Sub stream".
+pub(crate) fn stream_label(stream: RecordStream) -> &'static str {
+    STREAM_LABELS[stream_index(stream) as usize]
 }
 
 fn filter_index(filter: EventFilter) -> u32 {
@@ -1751,6 +2165,35 @@ mod tests {
     }
 
     #[test]
+    fn the_download_row_reads_bytes_against_the_estimate() {
+        assert_eq!(progress_of(0, None), ("0 B".to_string(), None));
+        assert_eq!(progress_of(1_200_000, Some(0)), ("1.2 MB".to_string(), None), "an estimate of 0 is none");
+        let (text, fraction) = progress_of(1_200_000, Some(3_400_000));
+        assert_eq!(text, "1.2 MB of 3.4 MB · 35 %");
+        assert!((fraction.unwrap() - 1_200_000.0 / 3_400_000.0).abs() < 1e-9);
+        // Delivered beyond the estimate (it is only that): not full until
+        // the file is saved.
+        let (text, fraction) = progress_of(935_344, Some(918_014));
+        assert_eq!(text, "935.3 KB of 918.0 KB · 99 %");
+        assert_eq!(fraction, Some(0.99));
+        let (text, fraction) = progress_of(900_000, Some(918_014));
+        assert_eq!(text, "900.0 KB of 918.0 KB · 98 %");
+        assert!((fraction.unwrap() - 900_000.0 / 918_014.0).abs() < 1e-9, "below the cap, as it is");
+        let mut d = Download::new();
+        assert_eq!(d.text(), "Starting the download…");
+        assert!(d.running());
+        d.name = "clip.mp4".to_string();
+        d.phase = DownloadPhase::Running;
+        assert_eq!(d.text(), "Downloading clip.mp4");
+        d.phase = DownloadPhase::Cancelling;
+        assert_eq!(d.text(), "Cancelling the download…");
+        assert!(d.running());
+        d.phase = DownloadPhase::Saved;
+        assert_eq!(d.text(), "Saved clip.mp4");
+        assert!(!d.running());
+    }
+
+    #[test]
     fn the_dropdowns_list_every_speed_and_both_streams() {
         let labels: Vec<String> = ReplaySpeed::ALL.iter().map(|s| speed_label(*s)).collect();
         assert_eq!(labels, ["0.25×", "0.5×", "1×", "2×", "4×", "8×", "16×"]);
@@ -1762,5 +2205,6 @@ mod tests {
         // As on the live page: the main stream first, the sub stream picked.
         assert_eq!(STREAM_LABELS, ["Main stream", "Sub stream"]);
         assert_eq!(stream_index(RecordStream::Sub), 1);
+        assert_eq!((stream_label(RecordStream::Main), stream_label(RecordStream::Sub)), ("Main stream", "Sub stream"));
     }
 }

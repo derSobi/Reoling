@@ -269,6 +269,9 @@ struct State {
     /// The pointer's x while it is over the widget.
     hover_x: Option<f64>,
     drag: Option<Drag>,
+    /// The range a download asks for (or the one being chosen), seconds
+    /// of the day, start before end.
+    selection: Option<(f64, f64)>,
 }
 
 impl State {
@@ -285,6 +288,7 @@ impl State {
             moved_at: None,
             hover_x: None,
             drag: None,
+            selection: None,
         }
     }
 
@@ -451,6 +455,7 @@ impl PlaybackTimeline {
             state.follow = true;
             state.moved_at = None;
             state.drag = None;
+            state.selection = None;
         }
         self.area.queue_draw();
     }
@@ -502,6 +507,21 @@ impl PlaybackTimeline {
                 Some(position) if state.follow && quiet => state.view = follow_view(state.view, position),
                 _ => {}
             }
+        }
+        self.area.queue_draw();
+    }
+
+    /// The range a download asks for (or the one being chosen), as
+    /// seconds of the day in any order; drawn as a translucent band.
+    /// `None` clears it (a new day does too).
+    pub fn set_selection(&self, range: Option<(f64, f64)>) {
+        let range = range.map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
+        {
+            let mut state = self.state.borrow_mut();
+            if state.selection == range {
+                return;
+            }
+            state.selection = range;
         }
         self.area.queue_draw();
     }
@@ -743,6 +763,30 @@ impl PlaybackTimeline {
             cr.rectangle(x0, band_top, (x1 - x0).max(1.0), event_height);
         }
         cr.fill()?;
+
+        // The download's range (or the one being chosen): a translucent
+        // band over the whole height, with its ends marked where they
+        // are in view.
+        if let Some((start, end)) = state.selection {
+            if end > view.start && start < view.end() {
+                let x0 = time_to_x(view, width, start.max(view.start));
+                let x1 = time_to_x(view, width, end.min(view.end()));
+                cr.set_source_rgba(accent.0, accent.1, accent.2, 0.18);
+                cr.rectangle(x0, 0.0, (x1 - x0).max(1.0), height);
+                cr.fill()?;
+                cr.set_source_rgba(accent.0, accent.1, accent.2, 0.6);
+                cr.set_line_width(1.0);
+                if start >= view.start {
+                    cr.move_to(crisp(x0), 0.0);
+                    cr.line_to(crisp(x0), height);
+                }
+                if end <= view.end() {
+                    cr.move_to(crisp(x1), 0.0);
+                    cr.line_to(crisp(x1), height);
+                }
+                cr.stroke()?;
+            }
+        }
 
         // Hover line.
         if let Some(x) = state.hover_x.filter(|x| (0.0..width).contains(x)) {

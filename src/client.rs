@@ -18,8 +18,9 @@ pub use crate::protocol::bcmedia::model::{VideoFrame, VideoType};
 
 mod replay;
 pub use replay::{
-    file_for_time, next_file, sort_and_dedup_files, FootageAnchor, RecordedEvent, RecordingFile, ReplayKeyframe,
-    ReplayProgress, ReplayResume, ReplaySpeed, ReplayStatus, ReplayStream, ReplayUnit,
+    file_for_time, next_file, sort_and_dedup_files, DownloadCancel, DownloadProgress, DownloadStream, DownloadSummary,
+    DownloadUnit, FootageAnchor, RecordedEvent, RecordingFile, ReplayKeyframe, ReplayProgress, ReplayResume,
+    ReplaySpeed, ReplayStatus, ReplayStream, ReplayUnit,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -204,6 +205,10 @@ pub struct ReolinkClient {
     /// The device left the start of an event-window search unanswered: it
     /// is not asked again on this connection (see `search_events`).
     event_search_unanswered: bool,
+    /// The running download's reader and cancel handle, if any (see
+    /// `download_range`).
+    download_task: Option<tokio::task::JoinHandle<replay::DownloadSummary>>,
+    download_cancel: Option<replay::DownloadCancel>,
 }
 
 /// What a `MSG_ID_IMAGE_FILE` request (see its own doc comment) was asking
@@ -685,6 +690,8 @@ impl ReolinkClient {
             replay_opens: 0,
             last_replay_seq: None,
             event_search_unanswered: false,
+            download_task: None,
+            download_cancel: None,
         }
     }
 
@@ -1472,6 +1479,11 @@ impl ReolinkClient {
         if self.replay.is_some() || self.replay_task.is_some() {
             let _ = self.stop_replay_within(replay::LIVE_SWITCH_CLOSE_WAIT).await;
         }
+        // The same for a download: its reader is stopped (the device may go
+        // on sending for a moment; live video's reader drops that).
+        if self.download_task.is_some() {
+            let _ = self.stop_download_within(replay::LIVE_SWITCH_CLOSE_WAIT).await;
+        }
         let msg_num = self.next_msg_num();
         // handle/stream_type per quality. `Main`'s values (handle 0,
         // BcMeta.stream_type 0, XML streamType "mainStream") come straight
@@ -1775,7 +1787,7 @@ impl ReolinkClient {
     pub async fn wait_for_pushes(&mut self) -> crate::Error {
         // While a playback runs, its reader is the one reading (and passes
         // the pushes on); reading here as well would take its data.
-        while self.replay_task.as_ref().is_some_and(|t| !t.is_finished()) {
+        while self.replay_task.as_ref().is_some_and(|t| !t.is_finished()) || self.download_running() {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
         let mut image_chunks = HashMap::new();
@@ -1835,6 +1847,10 @@ impl ReolinkClient {
             task.abort();
         }
         self.replay = None;
+        if let Some(task) = self.download_task.take() {
+            task.abort();
+        }
+        self.download_cancel = None;
         self.connection.lock().await.disconnect().await;
         let _ = self.logout().await;
     }

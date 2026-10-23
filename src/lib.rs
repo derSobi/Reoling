@@ -20,8 +20,9 @@ pub mod encoding;
 pub use protocol::{login_refusal_reason, Error, Result};
 pub use client::{looks_multi_channel, ChannelAbilities, ChannelInfo, DeviceIdentity, DeviceUpdate, DeviceInfoSummary, MonitorPoint, PtzPreset, ReolinkClient, StreamProfile, VideoFrame, VideoType};
 pub use client::{
-    file_for_time, next_file, sort_and_dedup_files, FootageAnchor, RecordedEvent, RecordingFile, ReplayKeyframe,
-    ReplayProgress, ReplayResume, ReplaySpeed, ReplayStatus, ReplayStream, ReplayUnit,
+    file_for_time, next_file, sort_and_dedup_files, DownloadCancel, DownloadProgress, DownloadStream, DownloadSummary,
+    DownloadUnit, FootageAnchor, RecordedEvent, RecordingFile, ReplayKeyframe, ReplayProgress, ReplayResume,
+    ReplaySpeed, ReplayStatus, ReplayStream, ReplayUnit,
 };
 pub use protocol::bc::xml::{CameraUid, RecordStream, RecordingId};
 pub use protocol::bcmedia::model::InfoBlock;

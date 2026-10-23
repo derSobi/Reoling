@@ -1,14 +1,17 @@
+use crate::ui::download_job::DownloadJob;
 use crate::ui::playback_driver::{PlaybackCommand, PlaybackDriver, PLAYBACK_TICK};
 use crate::ui::video_view::VideoSink;
 use reoling::{
     ChannelInfo, CivilTime, DeviceIdentity, DeviceUpdate, RecordStream, ReolinkClient, ReplaySpeed, StreamProfile,
     VideoFrame, VideoType,
 };
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio_stream::StreamExt;
 
+pub use crate::ui::download_job::{DownloadEvent, DownloadOutcome, DownloadRequest};
 pub use crate::ui::playback_driver::{FileSpan, PlaybackEvent, PlayerPhase, PlayerState};
 
 /// What a device's connection tells the UI.
@@ -58,6 +61,8 @@ pub enum DeviceEvent {
     Lost(String),
     /// Recorded-video playback (never sent for live video).
     Playback(PlaybackEvent),
+    /// A recording download (see `download_job`).
+    Download(DownloadEvent),
 }
 
 enum Command {
@@ -91,8 +96,66 @@ enum Command {
     QueryChannelVersion { channel: u8 },
     SetEncoding { channel: u8, body: String },
     Playback(PlaybackCommand),
+    Download(DownloadRequest),
+    DownloadCancel,
     Stop,
     Shutdown,
+}
+
+/// What the command branch of the device loop got: a command whose turn
+/// has come after a download, or one from the link.
+enum Incoming {
+    Deferred,
+    Received(Option<Command>),
+}
+
+impl Incoming {
+    fn command(self, deferred: &mut VecDeque<Command>) -> Option<Command> {
+        match self {
+            Incoming::Deferred => deferred.pop_front(),
+            Incoming::Received(command) => command,
+        }
+    }
+}
+
+/// Tells the user why `command` waits for the download: live video says
+/// so on its page; on the Playback page a day change always says so, and
+/// the first other playback command of a download.
+async fn deferral_notice(
+    command: &Command,
+    job: &mut DownloadJob,
+    driver: &PlaybackDriver,
+    deferred: &VecDeque<Command>,
+    tx: &async_channel::Sender<DeviceEvent>,
+) {
+    match command {
+        Command::Play { .. } => {
+            let _ = tx.send(DeviceEvent::PlayFailed("Live video starts after the download".to_string())).await;
+        }
+        Command::Playback(PlaybackCommand::Close { .. }) | Command::Stop => {}
+        Command::Playback(playback) => {
+            let day = matches!(playback, PlaybackCommand::Day { .. });
+            if !day && !job.first_wait() {
+                return;
+            }
+            // The page's session: the one of the newest day change that
+            // waits, else the driver's.
+            let session = match playback {
+                PlaybackCommand::Day { session, .. } => *session,
+                _ => deferred
+                    .iter()
+                    .rev()
+                    .find_map(|c| match c {
+                        Command::Playback(PlaybackCommand::Day { session, .. }) => Some(*session),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| driver.session()),
+            };
+            let event = PlaybackEvent::Notice { session, message: "Playback continues after the download".to_string() };
+            let _ = tx.send(DeviceEvent::Playback(event)).await;
+        }
+        _ => {}
+    }
 }
 
 /// The UI's handle on one device's connection (which lives on its own
@@ -168,6 +231,19 @@ impl DeviceLink {
     pub fn playback_close(&self) {
         let gen = self.next_playback_gen();
         self.send_playback(PlaybackCommand::Close { gen });
+    }
+
+    /// Downloads a range of recordings to a file (see `download_job`):
+    /// the running playback is paused first, and playback (or live video)
+    /// asked for meanwhile waits until the download is over. Answered as
+    /// `Download` events.
+    pub fn download(&self, request: DownloadRequest) {
+        let _ = self.commands.send(Command::Download(request));
+    }
+
+    /// Stops the running download; its partial file is removed.
+    pub fn download_cancel(&self) {
+        let _ = self.commands.send(Command::DownloadCancel);
     }
 }
 
@@ -439,6 +515,11 @@ pub fn spawn_device(
             if std::env::var("REOLING_PROBE_PUSH").is_ok() {
                 client.probe_pushes(&username).await;
             }
+            // Diagnostic-only: a scripted download session (see
+            // `download_probe`), only with its variable set.
+            if let Some(channel_id) = crate::ui::download_probe::probe_channel() {
+                crate::ui::download_probe::run(&mut client, channel_id, &identity).await;
+            }
             let _ = tx.send(DeviceEvent::Connected(identity)).await;
             let _ = tx.send(DeviceEvent::EncodeProfiles(client.encode_profiles())).await;
 
@@ -451,11 +532,49 @@ pub fn spawn_device(
             let mut driver = PlaybackDriver::new(driver_gen, replay_sink_request_tx);
             let mut playback_tick = tokio::time::interval(PLAYBACK_TICK);
             playback_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // A running download, and the commands that wait for it: live
+            // video and playback need the connection's reader, which the
+            // download has (as a search would). They run, in order, once
+            // it is over.
+            let mut download: Option<DownloadJob> = None;
+            let mut deferred: VecDeque<Command> = VecDeque::new();
 
             loop {
                 let replay_active = driver.is_active();
+                let downloading = download.is_some();
+                let has_deferred = !downloading && !deferred.is_empty();
                 tokio::select! {
-                    command = command_rx.recv() => match command {
+                    incoming = async {
+                        if has_deferred { Incoming::Deferred } else { Incoming::Received(command_rx.recv().await) }
+                    } => match incoming.command(&mut deferred) {
+                        Some(command @ (Command::Play { .. } | Command::Stop | Command::Playback(_))) if downloading => {
+                            if let Some(job) = download.as_mut() {
+                                deferral_notice(&command, job, &driver, &deferred, &tx).await;
+                            }
+                            deferred.push_back(command);
+                        }
+                        Some(Command::Download(request)) => {
+                            if download.is_some() {
+                                let outcome =
+                                    DownloadOutcome::Failed("A download is already running on this device".to_string());
+                                let event = DownloadEvent::Finished { session: request.session, outcome };
+                                let _ = tx.send(DeviceEvent::Download(event)).await;
+                            } else {
+                                // Live video and a download never share
+                                // the connection's reader.
+                                if frames.take().is_some() {
+                                    let _ = client.stop_video(channel).await;
+                                    sink = None;
+                                    announced = false;
+                                }
+                                download = DownloadJob::start(request, &mut driver, &mut client, &tx).await;
+                            }
+                        }
+                        Some(Command::DownloadCancel) => {
+                            if let Some(job) = download.as_ref() {
+                                job.cancel();
+                            }
+                        }
                         Some(Command::Play { channel: wanted, profile }) => {
                             // Live and playback never share the connection.
                             // Nothing happens here while no playback runs.
@@ -696,6 +815,22 @@ pub fn spawn_device(
                             None => std::future::pending().await,
                         }
                     } => driver.on_unit(item, &tx).await,
+                    unit = async {
+                        match download.as_mut() {
+                            Some(job) => job.next_unit().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        let ended = match download.as_mut() {
+                            Some(job) => job.on_unit(unit, &tx).await,
+                            None => None,
+                        };
+                        if let Some(ended) = ended {
+                            if let Some(job) = download.take() {
+                                job.finish(ended, &mut client, &tx).await;
+                            }
+                        }
+                    },
                     _ = playback_tick.tick(), if replay_active => driver.tick(&mut client, &tx).await,
                     error = client.wait_for_pushes(), if frames.is_none() => {
                         let _ = tx.send(DeviceEvent::Lost(error.to_string())).await;
@@ -704,7 +839,11 @@ pub fn spawn_device(
                 }
             }
             // Every exit path ends the session — tell the device before
-            // this task (and the client with it) goes away.
+            // this task (and the client with it) goes away. A download
+            // under way goes with it (its partial file is removed).
+            if let Some(job) = download.take() {
+                job.abandon();
+            }
             client.disconnect().await;
         });
     });

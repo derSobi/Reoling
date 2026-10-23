@@ -431,6 +431,239 @@ pub enum ReplayUnit {
     Audio(Vec<u8>),
 }
 
+/// A download's progress is reported once this many more payload bytes
+/// have come (a few times a second at the rates seen over a relay).
+const DOWNLOAD_PROGRESS_STEP_BYTES: u64 = 256 * 1024;
+
+/// No message of the download for this long while it is being received:
+/// the device (or the path) has given up on it. A relay has been seen to
+/// pause for tens of seconds and go on, so this is well above that.
+const DOWNLOAD_STALL: Duration = Duration::from_secs(60);
+
+/// How long the device's answer to the end request is waited for once the
+/// end marker came. The answer only confirms the end; a late one is
+/// dropped by whatever reads next.
+const DOWNLOAD_END_REPLY_WAIT: Duration = Duration::from_secs(5);
+
+/// After a cancel, the reader goes on dropping the download's data until
+/// none have come for this long (once the end request was answered or the
+/// end marker came, or `DOWNLOAD_END_REPLY_WAIT` passed without either).
+/// The devices probed stop within about half a second of the request;
+/// this leaves room for a relay's pauses...
+const DOWNLOAD_DRAIN_QUIET: Duration = Duration::from_secs(2);
+
+/// ...and for at most this long in all, should a device go on sending.
+const DOWNLOAD_DRAIN_MAX: Duration = Duration::from_secs(60);
+
+/// How many download data messages the probe describes.
+const PROBE_LOGGED_DOWNLOAD_MESSAGES: usize = 12;
+
+/// One unit of a download's data (see [`DownloadStream::units`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DownloadUnit {
+    /// The info block that opens the data: picture size and the span of
+    /// the file it comes from, in UTC. The first unit of every download,
+    /// and one more at each file boundary the range crosses: the device
+    /// marks the boundary with a code-331 message that carries the next
+    /// file's info block, and the footage clock may jump there (a Home
+    /// Hub Pro and an RLN36 NVR both do this).
+    Info(InfoBlock),
+    /// A video frame, exactly as a playback delivers it.
+    Video(VideoFrame),
+    /// One AAC (ADTS) audio unit, after the video frame it follows. Audio
+    /// ahead of the download's first video frame is dropped, as in a
+    /// playback.
+    Audio(Vec<u8>),
+    /// How much has come, every `DOWNLOAD_PROGRESS_STEP_BYTES` or so, and
+    /// once more at the end of the data.
+    Progress(DownloadProgress),
+    /// The last unit of the stream: the device's end marker came
+    /// (`complete`), or the download was cancelled.
+    Done(DownloadSummary),
+}
+
+/// How far a download has come.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadProgress {
+    /// Payload bytes received (the BcMedia stream, before parsing).
+    pub bytes: u64,
+    /// The device's size estimate from its answer to the request, if it
+    /// gave one. Only an estimate: a complete download of a range inside
+    /// one file came to up to a tenth more than it, one across a file
+    /// boundary to up to a third more (both devices); a range the device
+    /// rounds up to whole blocks ends below it.
+    pub estimate: Option<u64>,
+}
+
+impl DownloadProgress {
+    /// `bytes` against the estimate, from 0 to 1 (no more, however far
+    /// the download runs past the estimate); `None` without an estimate.
+    pub fn fraction(&self) -> Option<f64> {
+        let estimate = self.estimate.filter(|&e| e > 0)?;
+        Some((self.bytes as f64 / estimate as f64).min(1.0))
+    }
+}
+
+/// What a download delivered, as its last unit says (and as
+/// [`ReolinkClient::stop_download`] returns).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DownloadSummary {
+    /// The device sent its end marker and nothing was cancelled: every
+    /// byte of the range was handed on.
+    pub complete: bool,
+    /// The download was cancelled (by its handle, by dropping its units,
+    /// or by the stall limit) before the end marker.
+    pub cancelled: bool,
+    /// The device sent its end marker (after a cancel included).
+    pub end_marker: bool,
+    /// Payload bytes and data messages received, after a cancel included.
+    pub bytes: u64,
+    pub chunks: u64,
+    /// Files the range ran through: one, plus one per next-file message
+    /// (each of which carries a further info block).
+    pub files: u64,
+    /// Units handed on.
+    pub info_blocks: u64,
+    pub video_frames: u64,
+    pub keyframes: u64,
+    pub audio_units: u64,
+    /// Data messages (and their bytes) that still came after the end
+    /// request of a cancel was sent.
+    pub chunks_after_cancel: u64,
+    pub bytes_after_cancel: u64,
+    /// Codes other than 200 (data) and 300 (the end marker) seen on the
+    /// download's messages, each once, in order of first appearance.
+    pub other_codes: Vec<u16>,
+    /// The device's answer to the end request, if it came in time.
+    pub end_reply: Option<u16>,
+}
+
+/// A started download: its units, the device's estimate and a handle to
+/// cancel it.
+///
+/// Dropping `units` cancels the download as [`DownloadCancel::cancel`]
+/// does: the reader sends the end request and drops what the device still
+/// sends, so that the connection stays usable; wait for that with
+/// [`ReolinkClient::stop_download`] before the next request.
+pub struct DownloadStream {
+    /// Info block, video frames, audio units and progress, in the order
+    /// received, ending with [`DownloadUnit::Done`]. An `Err` ends the
+    /// stream instead when the connection failed or the device fell
+    /// silent for `DOWNLOAD_STALL`.
+    pub units: ReceiverStream<crate::Result<DownloadUnit>>,
+    /// The device's size estimate (`sizeH:sizeL`), see
+    /// [`DownloadProgress::estimate`]: the download may end up to a
+    /// third above it, or below it.
+    pub estimate: Option<u64>,
+    /// How many files the range touches, as the device says.
+    pub file_count: Option<u32>,
+    pub cancel: DownloadCancel,
+}
+
+/// Cancels a running download from anywhere (cheap to clone).
+#[derive(Clone, Default)]
+pub struct DownloadCancel(Arc<std::sync::atomic::AtomicBool>);
+
+impl DownloadCancel {
+    /// Asks the download to stop. Its reader sends the end request within
+    /// a read slice, hands on nothing more (the stream ends with
+    /// [`DownloadUnit::Done`], `cancelled`) and drops the data the device
+    /// still sends until they stop, so that the connection stays usable.
+    /// [`ReolinkClient::stop_download`] waits for that. A Home Hub Pro and
+    /// an RLN36 NVR both stop at the early end request: they answer it
+    /// within a quarter of a second, what was in flight still arrives
+    /// (up to about 600 KB over a relay), then nothing more, and no end
+    /// marker follows.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Reports progress every `step` bytes (and whenever asked to flush).
+struct ProgressReporter {
+    step: u64,
+    reported: u64,
+}
+
+impl ProgressReporter {
+    fn new(step: u64) -> Self {
+        ProgressReporter { step, reported: 0 }
+    }
+
+    /// Whether `bytes` is a step or more past the last report (which it
+    /// then becomes).
+    fn due(&mut self, bytes: u64) -> bool {
+        if bytes.saturating_sub(self.reported) < self.step {
+            return false;
+        }
+        self.reported = bytes;
+        true
+    }
+
+    /// Whether `bytes` differs from the last report (which it then
+    /// becomes): for one last report at the end.
+    fn flush(&mut self, bytes: u64) -> bool {
+        if bytes == self.reported {
+            return false;
+        }
+        self.reported = bytes;
+        true
+    }
+}
+
+/// What a message is to a running download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadMessage {
+    /// Not a download message at all.
+    NotOurs,
+    /// The XML answer to the request (code 200 without binary data).
+    Reply,
+    /// A data message (code 200 with binary data, or a sequence-numbered
+    /// one).
+    Data,
+    /// The header-only end marker (code 300).
+    EndMarker,
+    /// The next file's info block (code 331, binary data) where the range
+    /// crosses a file boundary.
+    NextFile,
+    /// A download message with any other code.
+    Other(u16),
+}
+
+/// Whether the message's Extension marks its payload as binary data.
+fn carries_binary_data(bc: &Bc) -> bool {
+    match &bc.body {
+        BcBody::Modern(ModernMsg { extension_xml: Some(xml), .. }) => {
+            Extension::from_bytes(xml).ok().and_then(|e| e.binary_data) == Some(1)
+        }
+        _ => false,
+    }
+}
+
+/// Sorts a message of the download's id by its code and Extension: the
+/// data come with code 200 and binary data, the next file's info block
+/// with code 331 and binary data, the end is a header-only code 300, and
+/// the XML answer is a code 200 without binary data.
+fn download_message(bc: &Bc) -> DownloadMessage {
+    if bc.meta.msg_id != MSG_ID_DOWNLOAD {
+        return DownloadMessage::NotOurs;
+    }
+    if bc.meta.replay_seq().is_some() {
+        return DownloadMessage::Data;
+    }
+    match bc.meta.response_code {
+        200 if carries_binary_data(bc) => DownloadMessage::Data,
+        200 => DownloadMessage::Reply,
+        RESPONSE_CODE_TRANSFER_DONE => DownloadMessage::EndMarker,
+        RESPONSE_CODE_NEXT_FILE if carries_binary_data(bc) => DownloadMessage::NextFile,
+        other => DownloadMessage::Other(other),
+    }
+}
+
 /// A playback's progress, shared with the task that reads its data. Cheap
 /// to clone; [`ReplayProgress::status`] takes a snapshot.
 #[derive(Clone)]
@@ -827,6 +1060,108 @@ struct OpenedReplay {
     foreign: u64,
 }
 
+/// One BcMedia unit as [`MediaAssembler`] hands it on.
+enum MediaUnit {
+    Info(InfoBlock),
+    /// A video frame, a key frame with the time its header carries (see
+    /// `keyframe_unix_time`).
+    Video(VideoFrame, Option<u32>),
+    Audio(Vec<u8>),
+}
+
+/// Turns the payloads of recorded-media data messages into BcMedia units:
+/// the camera's self-check, the unit buffer and the resync after a damaged
+/// unit (the synchronous steps a playback and a download share).
+#[derive(Default)]
+struct MediaAssembler {
+    buffer: Vec<u8>,
+    guard: MediaGuard,
+}
+
+impl MediaAssembler {
+    /// The units completed by `bc`. `on_keyframe` sees the bytes of every
+    /// key frame unit before it is taken out of the buffer (the probe's
+    /// look at its header).
+    fn feed(&mut self, bc: Bc, mut on_keyframe: impl FnMut(&[u8])) -> Vec<MediaUnit> {
+        let BcBody::Modern(ModernMsg { extension_xml, payload: Some(payload) }) = bc.body else {
+            return Vec::new();
+        };
+        let extension = extension_xml.as_deref().and_then(|xml| Extension::from_bytes(xml).ok());
+        match self.guard.judge(extension.as_ref(), &payload) {
+            Verdict::Accept => {}
+            Verdict::Skip => return Vec::new(),
+            Verdict::Damaged => {
+                self.buffer.clear();
+                return Vec::new();
+            }
+        }
+        self.buffer.extend_from_slice(&payload);
+        let mut units = Vec::new();
+        loop {
+            match parse_one(&self.buffer) {
+                Ok(Some((unit, used))) => {
+                    let unit = match unit {
+                        BcMediaMessage::Info { width, height } => Some(MediaUnit::Info(
+                            parse_info_block(&self.buffer[..used])
+                                .unwrap_or(InfoBlock { width, height, start_utc: None, end_utc: None }),
+                        )),
+                        BcMediaMessage::Video(frame) => {
+                            let time = if frame.is_keyframe {
+                                on_keyframe(&self.buffer[..used]);
+                                keyframe_unix_time(&self.buffer[..used])
+                            } else {
+                                None
+                            };
+                            Some(MediaUnit::Video(frame, time))
+                        }
+                        BcMediaMessage::Audio(aac) => Some(MediaUnit::Audio(aac)),
+                        BcMediaMessage::Skipped => None,
+                    };
+                    self.buffer.drain(..used);
+                    units.extend(unit);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let skip = crate::protocol::bcmedia::model::resync_offset(&self.buffer);
+                    if debug_replay() {
+                        eprintln!("replay: media resync: {e}; skipped {skip} bytes");
+                    }
+                    if skip == 0 {
+                        break;
+                    }
+                    self.buffer.drain(..skip);
+                }
+            }
+        }
+        units
+    }
+}
+
+/// Probe only: describes the header of the key frame unit `b` (its footage
+/// time and the extra header bytes after the fixed part, read as a
+/// little-endian Unix time when there are four or more), for the first
+/// `limit` key frames (`logged` counts them). Lines start with
+/// "PROBE {what} [tag]".
+fn probe_keyframe_header(what: &str, tag: Option<&str>, limit: usize, logged: &mut usize, b: &[u8]) {
+    let Some(tag) = tag.filter(|_| *logged < limit) else {
+        return;
+    };
+    if b.len() < 24 {
+        return;
+    }
+    *logged += 1;
+    let microseconds = u32::from_le_bytes([b[16], b[17], b[18], b[19]]);
+    let extra_len = u32::from_le_bytes([b[12], b[13], b[14], b[15]]) as usize;
+    let extra = &b[24..b.len().min(24 + extra_len)];
+    let hex = extra.iter().take(16).map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ");
+    let time = keyframe_unix_time(b)
+        .map(|t| CivilTime::from_epoch_seconds(i64::from(t)))
+        .map_or("-".to_string(), |t| format!("{} UTC", civil(&t)));
+    eprintln!(
+        "PROBE {what} [{tag}] key frame #{logged}: footage time {microseconds} us, extra header {extra_len} B [{hex}], first 4 as Unix time: {time}"
+    );
+}
+
 /// Turns one playback's data messages into BcMedia units (the synchronous
 /// part of the playback task, the same steps as live video).
 struct ReplayReader {
@@ -843,8 +1178,7 @@ struct ReplayReader {
     seen_video: bool,
     /// The probe's device label, when the probe runs this playback.
     probe: Option<String>,
-    buffer: Vec<u8>,
-    guard: MediaGuard,
+    media: MediaAssembler,
     msg_num_mismatches: u64,
     probe_logged: usize,
     probe_keyframes: usize,
@@ -858,8 +1192,7 @@ impl ReplayReader {
             skip_through,
             seen_video: false,
             probe,
-            buffer: Vec::new(),
-            guard: MediaGuard::default(),
+            media: MediaAssembler::default(),
             msg_num_mismatches: 0,
             probe_logged: 0,
             probe_keyframes: 0,
@@ -907,47 +1240,16 @@ impl ReplayReader {
     /// The BcMedia units completed by `bc`, each key frame with the time
     /// its header carries (see `keyframe_unix_time`).
     fn feed(&mut self, bc: Bc) -> Vec<(BcMediaMessage, Option<u32>)> {
-        let BcBody::Modern(ModernMsg { extension_xml, payload: Some(payload) }) = bc.body else {
-            return Vec::new();
-        };
-        let extension = extension_xml.as_deref().and_then(|xml| Extension::from_bytes(xml).ok());
-        match self.guard.judge(extension.as_ref(), &payload) {
-            Verdict::Accept => {}
-            Verdict::Skip => return Vec::new(),
-            Verdict::Damaged => {
-                self.buffer.clear();
-                return Vec::new();
-            }
-        }
-        self.buffer.extend_from_slice(&payload);
-        let mut units = Vec::new();
-        loop {
-            match parse_one(&self.buffer) {
-                Ok(Some((unit, used))) => {
-                    let keyframe_time = match &unit {
-                        BcMediaMessage::Video(frame) if frame.is_keyframe => {
-                            self.probe_keyframe_header();
-                            keyframe_unix_time(&self.buffer[..used])
-                        }
-                        _ => None,
-                    };
-                    self.buffer.drain(..used);
-                    units.push((unit, keyframe_time));
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    let skip = crate::protocol::bcmedia::model::resync_offset(&self.buffer);
-                    if debug_replay() {
-                        eprintln!("replay: media resync: {e}; skipped {skip} bytes");
-                    }
-                    if skip == 0 {
-                        break;
-                    }
-                    self.buffer.drain(..skip);
-                }
-            }
-        }
-        units
+        let Self { media, probe, probe_keyframes, .. } = self;
+        media
+            .feed(bc, |unit| probe_keyframe_header("replay", probe.as_deref(), PROBE_LOGGED_KEYFRAMES, probe_keyframes, unit))
+            .into_iter()
+            .map(|unit| match unit {
+                MediaUnit::Info(info) => (BcMediaMessage::Info { width: info.width, height: info.height }, None),
+                MediaUnit::Video(frame, time) => (BcMediaMessage::Video(frame), time),
+                MediaUnit::Audio(aac) => (BcMediaMessage::Audio(aac), None),
+            })
+            .collect()
     }
 
     /// Whether `unit` repeats footage that an earlier opening of the file
@@ -977,32 +1279,6 @@ impl ReplayReader {
             BcMediaMessage::Audio(_) => !self.seen_video,
             _ => false,
         }
-    }
-
-    /// Probe only: describes the header of the key frame at the start of
-    /// the buffer (its footage time and the extra header bytes after the
-    /// fixed part, read as a little-endian Unix time when there are four or
-    /// more), for the first few key frames of the playback.
-    fn probe_keyframe_header(&mut self) {
-        let Some(tag) = self.probe.as_deref().filter(|_| self.probe_keyframes < PROBE_LOGGED_KEYFRAMES) else {
-            return;
-        };
-        let b = &self.buffer;
-        if b.len() < 24 {
-            return;
-        }
-        self.probe_keyframes += 1;
-        let microseconds = u32::from_le_bytes([b[16], b[17], b[18], b[19]]);
-        let extra_len = u32::from_le_bytes([b[12], b[13], b[14], b[15]]) as usize;
-        let extra = &b[24..b.len().min(24 + extra_len)];
-        let hex = extra.iter().take(16).map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ");
-        let time = keyframe_unix_time(b)
-            .map(|t| CivilTime::from_epoch_seconds(i64::from(t)))
-            .map_or("-".to_string(), |t| format!("{} UTC", civil(&t)));
-        eprintln!(
-            "PROBE replay [{tag}] key frame #{}: footage time {microseconds} us, extra header {extra_len} B [{hex}], first 4 as Unix time: {time}",
-            self.probe_keyframes
-        );
     }
 }
 
@@ -1191,16 +1467,23 @@ impl ReolinkClient {
         if self.replay_task.as_ref().is_some_and(|t| !t.is_finished()) {
             return Err(Error::ProtocolError(format!("a recording is playing on this device; stop it before {what}")));
         }
+        if self.download_running() {
+            return Err(Error::ProtocolError(format!("a download is running on this device; stop it before {what}")));
+        }
         Ok(())
     }
 
     /// A playback whose reader has stopped (its frames were dropped, or the
     /// connection failed) can still be open on the device, which then goes
-    /// on sending: close it before a request that reads its own answer.
+    /// on sending: close it before a request that reads its own answer. A
+    /// download whose reader has stopped, or was cancelled and is still
+    /// draining, is taken care of the same way (see
+    /// `finish_cancelled_download`).
     async fn close_finished_replay(&mut self) {
         if self.replay.is_some() && self.replay_task.as_ref().map_or(true, |t| t.is_finished()) {
             let _ = self.stop_replay().await;
         }
+        self.finish_cancelled_download().await;
     }
 
     /// The days of `month` (1–12) of `year` on which channel `channel_id`
@@ -1470,6 +1753,12 @@ impl ReolinkClient {
         }
         if self.replay.is_some() || self.replay_task.is_some() {
             let _ = self.stop_replay().await;
+        }
+        self.finish_cancelled_download().await;
+        if self.download_running() {
+            return Err(Error::ProtocolError(
+                "a download is running on this device; stop it before playing a recording".to_string(),
+            ));
         }
         if from.seek_time >= file.end {
             return Err(Error::ProtocolError("the seek time is at or after the end of the recording".to_string()));
@@ -1773,8 +2062,10 @@ impl ReolinkClient {
     }
 
     /// Reads pushes until the channel list has given `channel_id` a camera
-    /// UID, for up to `wait`.
-    async fn wait_for_channel_uid(&mut self, channel_id: u8, wait: Duration) -> bool {
+    /// UID (needed in recording requests), for up to `wait`; whether it has
+    /// one. Not while a stream, a playback or a download reads the
+    /// connection.
+    pub async fn wait_for_channel_uid(&mut self, channel_id: u8, wait: Duration) -> bool {
         let connection = Arc::clone(&self.connection);
         let encryption = self.encryption.clone();
         let mut image_chunks = HashMap::new();
@@ -2089,6 +2380,605 @@ impl ReolinkClient {
             Err(e) => eprintln!("PROBE replay [{tag}]: close (7): {e}"),
         }
         Some(progress.status())
+    }
+}
+
+/// Turns one download's data messages into units (the synchronous part of
+/// the download task).
+struct DownloadReader {
+    media: MediaAssembler,
+    /// The request's `msg_num`, for the report on what the data echo.
+    request_msg_num: u16,
+    /// A video frame has been handed on. Audio before the first one is
+    /// dropped, as in a playback (see `ReplayReader::seen_video`).
+    seen_video: bool,
+    probe: Option<String>,
+    logged: usize,
+    probe_keyframes: usize,
+    msg_num_mismatches: u64,
+}
+
+impl DownloadReader {
+    fn new(request_msg_num: u16, probe: Option<String>) -> Self {
+        DownloadReader {
+            media: MediaAssembler::default(),
+            request_msg_num,
+            seen_video: false,
+            probe,
+            logged: 0,
+            probe_keyframes: 0,
+            msg_num_mismatches: 0,
+        }
+    }
+
+    /// Probe only: describes a message of the download (the first few data
+    /// messages, and every message of another kind).
+    fn describe(&mut self, bc: &Bc, kind: DownloadMessage) {
+        let Some(tag) = self.probe.as_deref() else { return };
+        if kind == DownloadMessage::Data {
+            if self.logged >= PROBE_LOGGED_DOWNLOAD_MESSAGES {
+                return;
+            }
+            self.logged += 1;
+        }
+        let extension = match &bc.body {
+            BcBody::Modern(ModernMsg { extension_xml: Some(xml), .. }) => Extension::from_bytes(xml)
+                .map(|e| format!("binaryData={:?} encryptLen={:?}", e.binary_data, e.encrypt_len))
+                .unwrap_or_else(|_| format!("{} B, unreadable", xml.len())),
+            _ => "none".to_string(),
+        };
+        eprintln!(
+            "PROBE download [{tag}]: {kind:?}{}: msg_num sent={} echoed={} hdr12-13=({},{}) class={:#06x} code={} seq={:?} extension {extension} payload={} B",
+            if kind == DownloadMessage::Data { format!(" #{}", self.logged) } else { String::new() },
+            self.request_msg_num,
+            bc.meta.msg_num,
+            bc.meta.channel_id,
+            bc.meta.stream_type,
+            bc.meta.class,
+            bc.meta.response_code,
+            bc.meta.replay_seq(),
+            payload_len(bc),
+        );
+    }
+
+    /// The units of data message `bc`, audio ahead of the first video
+    /// frame left out.
+    fn feed(&mut self, bc: Bc) -> Vec<DownloadUnit> {
+        if bc.meta.msg_num != self.request_msg_num {
+            self.msg_num_mismatches += 1;
+        }
+        let Self { media, probe, probe_keyframes, seen_video, .. } = self;
+        media
+            .feed(bc, |unit| {
+                probe_keyframe_header("download", probe.as_deref(), PROBE_LOGGED_DOWNLOAD_MESSAGES, probe_keyframes, unit)
+            })
+            .into_iter()
+            .filter_map(|unit| match unit {
+                MediaUnit::Info(info) => Some(DownloadUnit::Info(info)),
+                MediaUnit::Video(frame, _) => {
+                    *seen_video = true;
+                    Some(DownloadUnit::Video(frame))
+                }
+                MediaUnit::Audio(aac) => seen_video.then_some(DownloadUnit::Audio(aac)),
+            })
+            .collect()
+    }
+}
+
+/// What the download task holds while it runs.
+struct DownloadRun {
+    reader: DownloadReader,
+    /// `None` once an error was handed on (nothing follows an error).
+    tx: Option<tokio::sync::mpsc::Sender<crate::Result<DownloadUnit>>>,
+    cancel: DownloadCancel,
+    end_request: Bc,
+    estimate: Option<u64>,
+    progress: ProgressReporter,
+    summary: DownloadSummary,
+    /// When a data message or the end marker last came.
+    last_data: Instant,
+    /// When the end request was sent, and when it was answered.
+    end_sent: Option<Instant>,
+    end_answered: Option<Instant>,
+    probe: Option<String>,
+}
+
+impl DownloadRun {
+    fn probe_line(&self, line: impl FnOnce() -> String) {
+        if let Some(tag) = &self.probe {
+            eprintln!("PROBE download [{tag}]: {}", line());
+        }
+    }
+
+    /// Whether the data are still being handed on (no end request yet).
+    fn receiving(&self) -> bool {
+        self.end_sent.is_none()
+    }
+
+    /// Whether the task is done: after the end marker, once the end
+    /// request is answered (or `DOWNLOAD_END_REPLY_WAIT` passed); after a
+    /// cancel, once that is settled and the data have stopped for
+    /// `DOWNLOAD_DRAIN_QUIET`, or `DOWNLOAD_DRAIN_MAX` after the request.
+    fn finished(&self) -> bool {
+        let Some(sent) = self.end_sent else { return false };
+        let now = Instant::now();
+        let settled = self.end_answered.is_some() || now.duration_since(sent) >= DOWNLOAD_END_REPLY_WAIT;
+        if !self.summary.cancelled {
+            return settled;
+        }
+        ((settled || self.summary.end_marker) && now.duration_since(self.last_data) >= DOWNLOAD_DRAIN_QUIET)
+            || now.duration_since(sent) >= DOWNLOAD_DRAIN_MAX
+    }
+
+    /// Hands one unit on. `false` once the units were dropped.
+    async fn hand_on(&mut self, unit: DownloadUnit) -> bool {
+        match &self.tx {
+            Some(tx) => tx.send(Ok(unit)).await.is_ok(),
+            None => false,
+        }
+    }
+
+    /// Hands an error on; the stream ends with it.
+    async fn fail(&mut self, error: Error) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(Err(error)).await;
+        }
+    }
+
+    /// Sends the end request (header-only, no Extension).
+    async fn send_end_request(
+        &mut self,
+        connection: &Arc<Mutex<BcConnection>>,
+        encryption: &EncryptionProtocol,
+        why: &str,
+    ) -> crate::Result<()> {
+        connection.lock().await.send_bc(&self.end_request, encryption).await?;
+        self.end_sent = Some(Instant::now());
+        self.probe_line(|| {
+            format!(
+                "end request (144, header-only, msg_num {}) sent: {why}; {} chunks, {} B so far",
+                self.end_request.meta.msg_num, self.summary.chunks, self.summary.bytes
+            )
+        });
+        Ok(())
+    }
+
+    async fn on_data(&mut self, bc: Bc) {
+        let bytes = payload_len(&bc) as u64;
+        self.last_data = Instant::now();
+        self.summary.chunks += 1;
+        self.summary.bytes += bytes;
+        if !self.receiving() {
+            self.summary.chunks_after_cancel += 1;
+            self.summary.bytes_after_cancel += bytes;
+            return;
+        }
+        for unit in self.reader.feed(bc) {
+            match &unit {
+                DownloadUnit::Info(info) => {
+                    self.summary.info_blocks += 1;
+                    let (n, info) = (self.summary.info_blocks, *info);
+                    self.probe_line(|| format!("info block #{n}: {}", describe_info(&info)));
+                }
+                DownloadUnit::Video(frame) => {
+                    self.summary.video_frames += 1;
+                    self.summary.keyframes += u64::from(frame.is_keyframe);
+                }
+                DownloadUnit::Audio(_) => self.summary.audio_units += 1,
+                _ => {}
+            }
+            if !self.hand_on(unit).await {
+                return;
+            }
+        }
+        if self.progress.due(self.summary.bytes) {
+            let progress = DownloadProgress { bytes: self.summary.bytes, estimate: self.estimate };
+            self.hand_on(DownloadUnit::Progress(progress)).await;
+        }
+    }
+
+    async fn on_end_marker(
+        &mut self,
+        connection: &Arc<Mutex<BcConnection>>,
+        encryption: &EncryptionProtocol,
+    ) -> crate::Result<()> {
+        self.last_data = Instant::now();
+        self.summary.end_marker = true;
+        if !self.receiving() {
+            return Ok(());
+        }
+        self.summary.complete = true;
+        if self.progress.flush(self.summary.bytes) {
+            let progress = DownloadProgress { bytes: self.summary.bytes, estimate: self.estimate };
+            self.hand_on(DownloadUnit::Progress(progress)).await;
+        }
+        self.send_end_request(connection, encryption, "the end marker came").await
+    }
+
+    fn on_end_reply(&mut self, bc: &Bc) {
+        self.summary.end_reply = Some(bc.meta.response_code);
+        self.end_answered = Some(Instant::now());
+        self.probe_line(|| {
+            format!(
+                "end request answered with code {} (msg_num sent={} echoed={}) {:.3} s after it was sent; {} chunks ({} B) came after the request",
+                bc.meta.response_code,
+                self.end_request.meta.msg_num,
+                bc.meta.msg_num,
+                self.end_sent.map_or(0.0, |t| t.elapsed().as_secs_f64()),
+                self.summary.chunks_after_cancel,
+                self.summary.bytes_after_cancel,
+            )
+        });
+    }
+
+    fn on_other_code(&mut self, code: u16) {
+        self.last_data = Instant::now();
+        if !self.summary.other_codes.contains(&code) {
+            self.summary.other_codes.push(code);
+        }
+    }
+
+    /// The last unit, then the summary.
+    async fn finish(mut self) -> DownloadSummary {
+        self.probe_line(|| {
+            format!(
+                "reader done: complete {} cancelled {} end marker {} {} chunks {} B, {} info block(s), {} video frames ({} key), {} audio units, {} after the end request ({} B), other codes {:?}, end reply {:?}, msg_num mismatches {}",
+                self.summary.complete,
+                self.summary.cancelled,
+                self.summary.end_marker,
+                self.summary.chunks,
+                self.summary.bytes,
+                self.summary.info_blocks,
+                self.summary.video_frames,
+                self.summary.keyframes,
+                self.summary.audio_units,
+                self.summary.chunks_after_cancel,
+                self.summary.bytes_after_cancel,
+                self.summary.other_codes,
+                self.summary.end_reply,
+                self.reader.msg_num_mismatches,
+            )
+        });
+        let summary = self.summary.clone();
+        self.hand_on(DownloadUnit::Done(summary.clone())).await;
+        summary
+    }
+}
+
+/// The reader of one download: its data become units, pushes are passed
+/// on, everything else is dropped. At the end marker it sends the end
+/// request and waits for the answer. A cancel (the handle, or the units
+/// dropped) sends the end request at once; the data the device still
+/// sends are dropped until they stop. Silence for `DOWNLOAD_STALL` while
+/// receiving ends the download with an error (and an end request).
+async fn run_download(
+    mut run: DownloadRun,
+    connection: Arc<Mutex<BcConnection>>,
+    encryption: EncryptionProtocol,
+    channel_updates: tokio::sync::mpsc::UnboundedSender<DeviceUpdate>,
+    pending_images: Arc<std::sync::Mutex<HashMap<u16, ImageKind>>>,
+    channel_uids: Arc<std::sync::Mutex<HashMap<u8, CameraUid>>>,
+    early: Vec<Bc>,
+) -> DownloadSummary {
+    let mut image_chunks = HashMap::new();
+    let mut early = early.into_iter();
+    loop {
+        let consumer_gone = run.tx.as_ref().map_or(true, |tx| tx.is_closed());
+        if run.receiving() && (run.cancel.is_cancelled() || consumer_gone) {
+            run.summary.cancelled = true;
+            // So that the client sees the cancel too (`finish_cancelled_download`).
+            run.cancel.cancel();
+            let why = if consumer_gone { "the units were dropped" } else { "cancelled" };
+            if let Err(e) = run.send_end_request(&connection, &encryption, why).await {
+                run.fail(e).await;
+                break;
+            }
+        }
+        if run.finished() {
+            break;
+        }
+        let bc = match early.next() {
+            Some(bc) => bc,
+            None => {
+                let received =
+                    tokio::time::timeout(READ_SLICE, async { connection.lock().await.recv_bc(&encryption).await }).await;
+                match received {
+                    Err(_) | Ok(Err(Error::ReplyTimeout)) => {
+                        if run.receiving() && run.last_data.elapsed() >= DOWNLOAD_STALL {
+                            run.summary.cancelled = true;
+                            run.probe_line(|| format!("no data for {DOWNLOAD_STALL:?}: giving the download up"));
+                            if let Err(e) = run.send_end_request(&connection, &encryption, "stalled").await {
+                                run.fail(e).await;
+                                break;
+                            }
+                            run.fail(Error::ProtocolError("the device stopped sending the download".to_string())).await;
+                        }
+                        continue;
+                    }
+                    Ok(Err(e)) => {
+                        run.fail(e).await;
+                        break;
+                    }
+                    Ok(Ok(bc)) => bc,
+                }
+            }
+        };
+        if let Some(update) = pushed_update(&bc, &mut image_chunks, &pending_images, &channel_uids) {
+            let _ = channel_updates.send(update);
+            continue;
+        }
+        if bc.meta.msg_id == MSG_ID_DOWNLOAD_END {
+            run.on_end_reply(&bc);
+            continue;
+        }
+        let kind = download_message(&bc);
+        match kind {
+            DownloadMessage::NotOurs => {}
+            DownloadMessage::Reply => run.reader.describe(&bc, kind),
+            DownloadMessage::Data => {
+                run.reader.describe(&bc, kind);
+                run.on_data(bc).await;
+            }
+            DownloadMessage::NextFile => {
+                run.reader.describe(&bc, kind);
+                run.summary.files += 1;
+                run.on_data(bc).await;
+            }
+            DownloadMessage::EndMarker => {
+                run.reader.describe(&bc, kind);
+                if let Err(e) = run.on_end_marker(&connection, &encryption).await {
+                    run.fail(e).await;
+                    break;
+                }
+            }
+            DownloadMessage::Other(code) => {
+                run.reader.describe(&bc, kind);
+                run.on_other_code(code);
+                // Should such a message carry data, they are not lost.
+                if carries_binary_data(&bc) {
+                    run.on_data(bc).await;
+                }
+            }
+        }
+    }
+    run.finish().await
+}
+
+impl ReolinkClient {
+    /// Downloads what channel `channel_id` recorded on `stream` between
+    /// `start` and `end` (device-local), as the device stores it: the info
+    /// block, then every video frame and audio unit of the range, sent as
+    /// fast as the path carries them (about 1.4 MB/s over a relay) rather
+    /// than at playback speed. The device answers the request with a size
+    /// estimate ([`DownloadStream::estimate`]; the data may come to a
+    /// third more, or less) and marks the end of the data; the client
+    /// then sends the end request. The
+    /// range may run across file boundaries: the device then sends the
+    /// files one after the other, each after its own info block (see
+    /// [`DownloadUnit::Info`]), and the footage clock may jump between
+    /// them. A range into a gap between files holds only what was
+    /// recorded.
+    ///
+    /// One download at a time per client, and none while live video or a
+    /// playback runs on it: the download reads the connection itself, as a
+    /// search does, so a running playback must be closed first
+    /// ([`ReolinkClient::stop_replay`]), and no playback or search is
+    /// possible until the download ended ([`DownloadUnit::Done`]) or was
+    /// stopped ([`ReolinkClient::stop_download`]). Pushes keep being
+    /// delivered through `take_channel_updates` meanwhile.
+    pub async fn download_range(
+        &mut self,
+        channel_id: u8,
+        stream: RecordStream,
+        start: CivilTime,
+        end: CivilTime,
+    ) -> crate::Result<DownloadStream> {
+        self.download_range_with(channel_id, stream, start, end, None).await
+    }
+
+    /// Diagnostic-only: [`ReolinkClient::download_range`], reporting every
+    /// step on stderr with lines that start with "PROBE download [tag]"
+    /// (never the camera UID).
+    pub async fn download_range_probed(
+        &mut self,
+        channel_id: u8,
+        stream: RecordStream,
+        start: CivilTime,
+        end: CivilTime,
+        tag: &str,
+    ) -> crate::Result<DownloadStream> {
+        self.download_range_with(channel_id, stream, start, end, Some(tag)).await
+    }
+
+    async fn download_range_with(
+        &mut self,
+        channel_id: u8,
+        stream: RecordStream,
+        start: CivilTime,
+        end: CivilTime,
+        probe: Option<&str>,
+    ) -> crate::Result<DownloadStream> {
+        self.close_finished_replay().await;
+        self.ensure_no_stream("downloading a recording")?;
+        if !start.is_valid() || !end.is_valid() || end <= start {
+            return Err(Error::ProtocolError("the download range is empty or not valid".to_string()));
+        }
+        let uid = self.channel_uid(channel_id);
+        if let Some(tag) = probe {
+            eprintln!(
+                "PROBE download [{tag}]: request (143): channel {channel_id}, {stream:?}, {} .. {} ({} s), uid {}",
+                civil(&start),
+                civil(&end),
+                end.to_epoch_seconds() - start.to_epoch_seconds(),
+                if uid.is_some() { "present" } else { "absent" },
+            );
+        }
+        let request = DownloadRequest::new(channel_id, uid, stream, start, end).to_bytes();
+        // The data come as fast as the path carries them: the bound a
+        // playback gets on unread data, not live video's.
+        self.connection.lock().await.set_replay_buffering(true);
+        let opened = match self.open_download(channel_id, request, probe).await {
+            Ok(opened) => opened,
+            Err(e) => {
+                self.connection.lock().await.set_replay_buffering(false);
+                return Err(e);
+            }
+        };
+        let (request_msg_num, estimate, file_count, early) = opened;
+        let end_msg_num = self.next_msg_num();
+        let cancel = DownloadCancel::default();
+        let units = self.spawn_download_task(channel_id, request_msg_num, end_msg_num, estimate, early, cancel.clone(), probe);
+        self.download_cancel = Some(cancel.clone());
+        Ok(DownloadStream { units, estimate, file_count, cancel })
+    }
+
+    /// Sends the request and reads its answer: the size estimate (XML),
+    /// or, should a device send none, the first data (handed to the
+    /// reader). Returns the request's `msg_num`, the estimate, the file
+    /// count and any data read.
+    async fn open_download(
+        &mut self,
+        channel_id: u8,
+        request: Vec<u8>,
+        probe: Option<&str>,
+    ) -> crate::Result<(u16, Option<u64>, Option<u32>, Vec<Bc>)> {
+        let msg_num = self.send_request(MSG_ID_DOWNLOAD, channel_id, request).await?;
+        let (reply, _) = self.await_reply_counting(MSG_ID_DOWNLOAD, msg_num, REPLY_TIMEOUT).await?;
+        let kind = download_message(&reply);
+        if let Some(tag) = probe {
+            eprintln!(
+                "PROBE download [{tag}]: answer: {kind:?} code {} msg_num sent={msg_num} echoed={} hdr12-13=({},{}) class={:#06x} payload={} B",
+                reply.meta.response_code,
+                reply.meta.msg_num,
+                reply.meta.channel_id,
+                reply.meta.stream_type,
+                reply.meta.class,
+                payload_len(&reply),
+            );
+        }
+        match kind {
+            DownloadMessage::Data | DownloadMessage::NextFile | DownloadMessage::EndMarker => {
+                return Ok((msg_num, None, None, vec![reply]))
+            }
+            DownloadMessage::Reply => {}
+            DownloadMessage::NotOurs | DownloadMessage::Other(_) => expect_ok(&reply, "download")?,
+        }
+        // The device has accepted (code 200) and starts sending the range:
+        // an answer whose XML cannot be read only costs the estimate, not
+        // the download (which would then pour into the connection with
+        // no reader on it).
+        let entry = match reply_xml(&reply) {
+            Ok(xml) => xml.file_info_list.and_then(|list| list.files.into_iter().next()),
+            Err(e) => {
+                if debug_replay() || probe.is_some() {
+                    eprintln!("PROBE download: the answer's XML could not be read ({e}); no estimate");
+                }
+                None
+            }
+        };
+        let estimate = entry.as_ref().and_then(FileInfo::size_bytes);
+        let file_count = entry.as_ref().and_then(|e| e.file_count);
+        if let Some(tag) = probe {
+            eprintln!(
+                "PROBE download [{tag}]: estimate: sizeL {:?} sizeH {:?} ({estimate:?} B) FileCount {file_count:?}",
+                entry.as_ref().and_then(|e| e.size_l),
+                entry.as_ref().and_then(|e| e.size_h),
+            );
+        }
+        Ok((msg_num, estimate, file_count, Vec::new()))
+    }
+
+    fn spawn_download_task(
+        &mut self,
+        channel_id: u8,
+        request_msg_num: u16,
+        end_msg_num: u16,
+        estimate: Option<u64>,
+        early: Vec<Bc>,
+        cancel: DownloadCancel,
+        probe: Option<&str>,
+    ) -> ReceiverStream<crate::Result<DownloadUnit>> {
+        let (tx, rx) = channel(32);
+        let connection = Arc::clone(&self.connection);
+        let encryption = self.encryption.clone();
+        let channel_updates = self.channel_updates_tx.clone();
+        let pending_images = Arc::clone(&self.pending_images);
+        let channel_uids = Arc::clone(&self.channel_uids);
+        let end_request = Bc {
+            meta: BcMeta {
+                msg_id: MSG_ID_DOWNLOAD_END,
+                channel_id,
+                stream_type: 0,
+                msg_num: end_msg_num,
+                response_code: 0,
+                class: 0x6414,
+            },
+            body: BcBody::Modern(ModernMsg { extension_xml: None, payload: None }),
+        };
+        let run = DownloadRun {
+            reader: DownloadReader::new(request_msg_num, probe.map(str::to_string)),
+            tx: Some(tx),
+            cancel,
+            end_request,
+            estimate,
+            progress: ProgressReporter::new(DOWNLOAD_PROGRESS_STEP_BYTES),
+            summary: DownloadSummary { files: 1, ..DownloadSummary::default() },
+            last_data: Instant::now(),
+            end_sent: None,
+            end_answered: None,
+            probe: probe.map(str::to_string),
+        };
+        self.download_task = Some(tokio::spawn(async move {
+            let summary =
+                run_download(run, Arc::clone(&connection), encryption, channel_updates, pending_images, channel_uids, early)
+                    .await;
+            connection.lock().await.set_replay_buffering(false);
+            summary
+        }));
+        ReceiverStream::new(rx)
+    }
+
+    /// Whether a download's reader is running on this client (its data
+    /// still coming, or being dropped after a cancel).
+    pub fn download_running(&self) -> bool {
+        self.download_task.as_ref().is_some_and(|t| !t.is_finished())
+    }
+
+    /// Ends the running download, if any: cancels it (see
+    /// [`DownloadCancel::cancel`]) and waits until its reader has stopped,
+    /// at most `DOWNLOAD_DRAIN_MAX` and a little; the summary of what it
+    /// got. `None` with no download, or when the reader had to be aborted
+    /// (the device went on sending past the wait).
+    pub async fn stop_download(&mut self) -> Option<DownloadSummary> {
+        self.stop_download_within(DOWNLOAD_DRAIN_MAX + 2 * READ_SLICE).await
+    }
+
+    /// `stop_download`, waiting at most `wait` for the reader to stop.
+    pub async fn stop_download_within(&mut self, wait: Duration) -> Option<DownloadSummary> {
+        if let Some(cancel) = self.download_cancel.take() {
+            cancel.cancel();
+        }
+        let mut task = self.download_task.take()?;
+        match tokio::time::timeout(wait, &mut task).await {
+            Ok(Ok(summary)) => Some(summary),
+            Ok(Err(_)) => None,
+            Err(_) => {
+                task.abort();
+                self.connection.lock().await.set_replay_buffering(false);
+                None
+            }
+        }
+    }
+
+    /// A download that was cancelled (or whose units were dropped) may
+    /// still be draining what the device sends: a request that reads its
+    /// own answers waits for that first.
+    async fn finish_cancelled_download(&mut self) {
+        let cancelled = self.download_cancel.as_ref().is_some_and(|c| c.is_cancelled());
+        let finished = self.download_task.as_ref().is_some_and(|t| t.is_finished());
+        if self.download_task.is_some() && (cancelled || finished) {
+            let _ = self.stop_download().await;
+        }
     }
 }
 
@@ -3401,5 +4291,256 @@ mod tests {
                 ..file("0120261017092107", t(9, 21, 7), t(10, 21, 5))
             }
         }
+    }
+
+    // ---- downloads -------------------------------------------------------------
+
+    fn download_xml_reply(size_l: u32, file_count: u32) -> Vec<u8> {
+        let entry = FileInfo { size_l: Some(size_l), size_h: Some(0), file_count: Some(file_count), ..Default::default() };
+        BcXml {
+            file_info_list: Some(FileInfoList { version: XML_VERSION.to_string(), files: vec![entry] }),
+            ..Default::default()
+        }
+        .to_bytes()
+    }
+
+    /// A data message of a download, as the device sends them: class
+    /// 0x0000, code 200, binary data.
+    fn download_data(msg_num: u16, unit: Vec<u8>) -> Bc {
+        device_message(MSG_ID_DOWNLOAD, msg_num, 0x0000, 200, Some(binary_extension()), Some(unit))
+    }
+
+    fn download_end_marker(msg_num: u16) -> Bc {
+        device_message(MSG_ID_DOWNLOAD, msg_num, 0x0000, RESPONSE_CODE_TRANSFER_DONE, None, None)
+    }
+
+    /// The fake device's side of a download request: checks it (no
+    /// Extension, the expected body) and answers with the size estimate.
+    /// Returns the request's `msg_num`.
+    async fn answer_download_request(device: &mut BcConnection, expected: &DownloadRequest, size_l: u32) -> u16 {
+        let request = device.recv_bc(&PLAIN).await.unwrap();
+        assert_eq!(request.meta.msg_id, MSG_ID_DOWNLOAD);
+        assert_eq!(request.meta.channel_id, expected.channel_id);
+        assert_no_extension(&request);
+        assert_eq!(DownloadRequest::from_bytes(&body_of(&request)).unwrap(), *expected);
+        let answer = reply(MSG_ID_DOWNLOAD, request.meta.msg_num, Some(download_xml_reply(size_l, 1)));
+        device.send_bc(&answer, &PLAIN).await.unwrap();
+        request.meta.msg_num
+    }
+
+    /// The end request, as the fake device must see it: header-only, no
+    /// Extension.
+    async fn expect_end_request(device: &mut BcConnection) -> Bc {
+        let end = device.recv_bc(&PLAIN).await.unwrap();
+        assert_eq!(end.meta.msg_id, MSG_ID_DOWNLOAD_END);
+        assert_no_extension(&end);
+        assert!(payload_of(&end).is_none(), "the end request is header-only");
+        end
+    }
+
+    async fn answer_calendar(device: &mut BcConnection) {
+        let calendar = device.recv_bc(&PLAIN).await.unwrap();
+        assert_eq!(calendar.meta.msg_id, MSG_ID_RECORD_CALENDAR);
+        device.send_bc(&reply(MSG_ID_RECORD_CALENDAR, calendar.meta.msg_num, None), &PLAIN).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_range_requests_streams_and_ends_as_on_the_wire() {
+        let (mut client, mut device) = client_and_device().await;
+        let (start, end) = (t(0, 48, 5), t(0, 49, 13));
+        let expected = DownloadRequest::new(0, Some(CameraUid::new(UID)), RecordStream::Sub, start, end);
+        let fake = tokio::spawn(async move {
+            // The channel list (with the camera UID) first.
+            device.send_bc(&channel_list_push(), &PLAIN).await.unwrap();
+            let msg_num = answer_download_request(&mut device, &expected, 10_485_760).await;
+            // The info block, a key frame, audio, a P-frame; then the end
+            // marker.
+            device.send_bc(&download_data(msg_num, info_block()), &PLAIN).await.unwrap();
+            device.send_bc(&download_data(msg_num, iframe_unit(1_000_000, &[0, 0, 0, 1, 0x67], true)), &PLAIN).await.unwrap();
+            device.send_bc(&download_data(msg_num, aac_unit(&[0xff, 0xf1, 0x60, 0x40, 0x01, 0x7f, 0xfc])), &PLAIN).await.unwrap();
+            device.send_bc(&download_data(msg_num, iframe_unit(1_100_000, &[9, 9], false)), &PLAIN).await.unwrap();
+            device.send_bc(&download_end_marker(msg_num), &PLAIN).await.unwrap();
+            let end = expect_end_request(&mut device).await;
+            device.send_bc(&reply(MSG_ID_DOWNLOAD_END, end.meta.msg_num, None), &PLAIN).await.unwrap();
+            // The connection is usable afterwards.
+            answer_calendar(&mut device).await;
+        });
+        assert!(client.wait_for_channel_uid(0, Duration::from_secs(5)).await);
+        let mut stream = client.download_range(0, RecordStream::Sub, start, end).await.unwrap();
+        assert_eq!((stream.estimate, stream.file_count), (Some(10_485_760), Some(1)));
+        let Some(Ok(DownloadUnit::Info(info))) = stream.units.next().await else { panic!("the info block") };
+        assert_eq!((info.width, info.height, info.start_utc), (640, 360, Some(CivilTime::new(2026, 10, 17, 6, 21, 7))));
+        let Some(Ok(DownloadUnit::Video(key))) = stream.units.next().await else { panic!("a key frame") };
+        assert!(key.is_keyframe && key.microseconds == 1_000_000);
+        let Some(Ok(DownloadUnit::Audio(aac))) = stream.units.next().await else { panic!("audio") };
+        assert_eq!(aac.len(), 7);
+        let Some(Ok(DownloadUnit::Video(p))) = stream.units.next().await else { panic!("a P-frame") };
+        assert!(!p.is_keyframe);
+        // The end: one last progress report, then the summary.
+        let Some(Ok(DownloadUnit::Progress(progress))) = stream.units.next().await else { panic!("progress") };
+        assert_eq!(progress.estimate, Some(10_485_760));
+        assert!(progress.bytes > 0 && progress.fraction().unwrap() < 0.01);
+        let Some(Ok(DownloadUnit::Done(summary))) = stream.units.next().await else { panic!("done") };
+        assert!(summary.complete && summary.end_marker && !summary.cancelled);
+        assert_eq!(
+            (summary.chunks, summary.info_blocks, summary.video_frames, summary.keyframes, summary.audio_units),
+            (4, 1, 2, 1, 1)
+        );
+        assert_eq!((summary.end_reply, summary.bytes, summary.chunks_after_cancel, summary.files), (Some(200), progress.bytes, 0, 1));
+        assert!(summary.other_codes.is_empty());
+        assert!(stream.units.next().await.is_none(), "nothing follows the summary");
+        assert_eq!(client.stop_download().await, Some(summary));
+        assert!(!client.download_running());
+        assert_eq!(client.search_month(0, 2026, 10).await.unwrap(), Vec::<u8>::new());
+        fake.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_download_sends_the_end_request_and_drops_the_rest() {
+        let (mut client, mut device) = client_and_device().await;
+        let (start, end) = (t(0, 48, 5), t(0, 49, 13));
+        let expected = DownloadRequest::new(2, None, RecordStream::Main, start, end);
+        let fake = tokio::spawn(async move {
+            let msg_num = answer_download_request(&mut device, &expected, 2 * 1024 * 1024).await;
+            device.send_bc(&download_data(msg_num, info_block()), &PLAIN).await.unwrap();
+            device.send_bc(&download_data(msg_num, iframe_unit(1, &[1], true)), &PLAIN).await.unwrap();
+            // The client cancels: the end request comes while the data
+            // run. The device sends some more, then its marker, then the
+            // answer.
+            let end = expect_end_request(&mut device).await;
+            for i in 0..3u32 {
+                device.send_bc(&download_data(msg_num, iframe_unit(2 + i, &[2], false)), &PLAIN).await.unwrap();
+            }
+            device.send_bc(&download_end_marker(msg_num), &PLAIN).await.unwrap();
+            device.send_bc(&reply(MSG_ID_DOWNLOAD_END, end.meta.msg_num, None), &PLAIN).await.unwrap();
+            answer_calendar(&mut device).await;
+        });
+        let mut stream = client.download_range(2, RecordStream::Main, start, end).await.unwrap();
+        assert!(matches!(stream.units.next().await, Some(Ok(DownloadUnit::Info(_)))));
+        assert!(matches!(stream.units.next().await, Some(Ok(DownloadUnit::Video(_)))));
+        // A search is refused while the download runs.
+        assert!(client.search_month(2, 2026, 10).await.is_err());
+        assert!(client.download_running());
+        stream.cancel.cancel();
+        let Some(Ok(DownloadUnit::Done(summary))) = stream.units.next().await else { panic!("done") };
+        assert!(summary.cancelled && !summary.complete && summary.end_marker);
+        assert_eq!((summary.chunks, summary.chunks_after_cancel, summary.video_frames), (5, 3, 1));
+        assert_eq!(summary.end_reply, Some(200));
+        assert!(stream.units.next().await.is_none());
+        assert_eq!(client.stop_download().await, Some(summary));
+        assert_eq!(client.search_month(2, 2026, 10).await.unwrap(), Vec::<u8>::new());
+        fake.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_the_units_cancels_the_download() {
+        let (mut client, mut device) = client_and_device().await;
+        let (start, end) = (t(1, 0, 0), t(1, 0, 30));
+        let expected = DownloadRequest::new(0, None, RecordStream::Sub, start, end);
+        let fake = tokio::spawn(async move {
+            let msg_num = answer_download_request(&mut device, &expected, 524_288).await;
+            device.send_bc(&download_data(msg_num, info_block()), &PLAIN).await.unwrap();
+            let end = expect_end_request(&mut device).await;
+            device.send_bc(&download_end_marker(msg_num), &PLAIN).await.unwrap();
+            device.send_bc(&reply(MSG_ID_DOWNLOAD_END, end.meta.msg_num, None), &PLAIN).await.unwrap();
+            answer_calendar(&mut device).await;
+        });
+        let stream = client.download_range(0, RecordStream::Sub, start, end).await.unwrap();
+        let cancel = stream.cancel.clone();
+        drop(stream);
+        // The reader notices within one read slice, sends the end request
+        // and stops once the device has gone quiet.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while client.download_running() {
+            assert!(Instant::now() < deadline, "the reader should stop once its units are dropped");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(cancel.is_cancelled());
+        // A request that reads its own answers takes the finished reader's
+        // summary and goes on.
+        assert_eq!(client.search_month(0, 2026, 10).await.unwrap(), Vec::<u8>::new());
+        assert!(client.download_task.is_none());
+        fake.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refused_download_is_an_error_and_leaves_the_connection_usable() {
+        let (mut client, mut device) = client_and_device().await;
+        let fake = tokio::spawn(async move {
+            let request = device.recv_bc(&PLAIN).await.unwrap();
+            assert_eq!(request.meta.msg_id, MSG_ID_DOWNLOAD);
+            device.send_bc(&device_message(MSG_ID_DOWNLOAD, request.meta.msg_num, 0x0000, 400, None, None), &PLAIN).await.unwrap();
+            answer_calendar(&mut device).await;
+        });
+        let refused = client.download_range(0, RecordStream::Sub, t(1, 0, 0), t(1, 1, 0)).await;
+        assert!(refused.is_err());
+        assert!(!client.download_running());
+        assert_eq!(client.search_month(0, 2026, 10).await.unwrap(), Vec::<u8>::new());
+        fake.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn downloads_and_streams_do_not_share_the_connection() {
+        let (mut client, _device) = client_and_device().await;
+        client.video_task = Some(tokio::spawn(std::future::pending()));
+        assert!(client.download_range(0, RecordStream::Sub, t(0, 0, 0), t(0, 1, 0)).await.is_err());
+        client.video_task.take().unwrap().abort();
+        client.download_task = Some(tokio::spawn(std::future::pending()));
+        assert!(client.search_day(0, t(0, 0, 0), RecordStream::Sub).await.is_err());
+        let file = RecordedFileFixture::hub();
+        assert!(client.start_replay(&file, file.start, ReplaySpeed::X1).await.is_err());
+        client.download_task.take().unwrap().abort();
+        // An empty range is refused without asking the device.
+        assert!(client.download_range(0, RecordStream::Sub, t(0, 1, 0), t(0, 1, 0)).await.is_err());
+    }
+
+    #[test]
+    fn download_messages_are_sorted_by_code_and_extension() {
+        assert_eq!(download_message(&reply(MSG_ID_DOWNLOAD, 1, Some(download_xml_reply(1, 1)))), DownloadMessage::Reply);
+        assert_eq!(download_message(&download_data(1, info_block())), DownloadMessage::Data);
+        assert_eq!(download_message(&download_end_marker(1)), DownloadMessage::EndMarker);
+        let next_file = device_message(MSG_ID_DOWNLOAD, 1, 0x0000, 331, Some(binary_extension()), Some(info_block()));
+        assert_eq!(download_message(&next_file), DownloadMessage::NextFile);
+        assert_eq!(download_message(&device_message(MSG_ID_DOWNLOAD, 1, 0x0000, 331, None, None)), DownloadMessage::Other(331));
+        assert_eq!(download_message(&device_message(MSG_ID_DOWNLOAD, 1, 0x0000, 400, None, None)), DownloadMessage::Other(400));
+        // Sequence-numbered data count as data whatever their code half.
+        let seq = 1_792_348_477u32;
+        let numbered = device_message(MSG_ID_DOWNLOAD, 0, (seq >> 16) as u16, seq as u16, Some(binary_extension()), Some(vec![0; 8]));
+        assert_eq!(download_message(&numbered), DownloadMessage::Data);
+        assert_eq!(download_message(&reply(MSG_ID_DOWNLOAD_END, 1, None)), DownloadMessage::NotOurs);
+        assert_eq!(download_message(&replay_data(seq, vec![0; 8])), DownloadMessage::NotOurs);
+    }
+
+    #[test]
+    fn progress_is_reported_every_step_and_once_more_at_the_end() {
+        let mut reporter = ProgressReporter::new(1000);
+        assert!(!reporter.due(999));
+        assert!(reporter.due(1000));
+        assert!(!reporter.due(1999));
+        assert!(reporter.due(2500));
+        assert!(!reporter.flush(2500), "nothing new since the last report");
+        assert!(reporter.flush(2600));
+        assert!(!reporter.flush(2600));
+        // The data may run past the estimate: the fraction never passes 1.
+        let progress = DownloadProgress { bytes: 9_719_976, estimate: Some(10_485_760) };
+        assert!((progress.fraction().unwrap() - 0.927).abs() < 0.001);
+        assert_eq!(DownloadProgress { bytes: 11_000_000, estimate: Some(10_485_760) }.fraction(), Some(1.0));
+        assert_eq!(DownloadProgress { bytes: 5, estimate: None }.fraction(), None);
+        assert_eq!(DownloadProgress { bytes: 5, estimate: Some(0) }.fraction(), None);
+    }
+
+    #[test]
+    fn the_download_reader_drops_audio_ahead_of_the_first_video_frame() {
+        let mut reader = DownloadReader::new(7, None);
+        let data = [info_block(), aac_unit(&[1, 2]), iframe_unit(5, &[1], true), aac_unit(&[3, 4])].concat();
+        let units = reader.feed(download_data(7, data));
+        assert!(matches!(
+            units.as_slice(),
+            [DownloadUnit::Info(info), DownloadUnit::Video(_), DownloadUnit::Audio(a)]
+                if info.width == 640 && info.start_utc.is_some() && a == &vec![3, 4]
+        ));
+        assert_eq!(reader.msg_num_mismatches, 0);
+        assert_eq!(reader.feed(download_data(9, aac_unit(&[5]))).len(), 1);
+        assert_eq!(reader.msg_num_mismatches, 1, "another msg_num is counted, not dropped");
     }
 }

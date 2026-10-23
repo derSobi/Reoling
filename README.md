@@ -24,7 +24,7 @@ More on <https://reoling.eu>.
 
 ## Status
 
-Version **0.1.26**, early development. Login, live video and playback work
+Version **0.1.27**, early development. Login, live video and playback work
 end to end against real hardware (a Home Hub, an NVR and their cameras),
 over UDP/P2P only: Reoling races the device's local, NAT-mapped and relay
 addresses at the same time and uses whichever answers first, as the
@@ -57,7 +57,15 @@ official client does.
   person, vehicle, animal, package or line crossing / zone, and
   previous/next-event buttons jump between them. It runs over the same
   UDP P2P connection as live video, which pauses while the tab is open
-  and comes back as it was.
+  and comes back as it was. A Download button saves a chosen time range —
+  a start, a length from 30 s to 15 min or the whole recording, main or
+  sub stream — as an MP4 with the recording's sound into the recordings
+  folder (another folder can be picked there and is remembered); a range
+  that crosses into the next recording comes out as one file. The file is
+  named after the device, camera, start and length, its range is marked
+  on the timeline, and progress shows under the controls with Cancel and
+  "Open folder"; the download runs on if the page moves to another day or
+  device. While a device downloads, its playback and live video wait.
 - Camera controls, shown per channel from what the camera reports: siren,
   spotlight, and — in a separate "Camera control" window, independent of the
   main window — pan/tilt (hold a direction to move) and zoom/focus on its
@@ -85,7 +93,7 @@ official client does.
   cached; until one loads, or for a model without one, a drawing of the
   device kind (camera, NVR, Home Hub) stands in.
 - Snapshot (PNG in `~/Pictures/Reoling`) and recording (MKV in
-  `~/Videos/Reoling`).
+  `~/Videos/Reoling`, where Playback's downloads go too).
 - Settings ("Client Settings", laid out after the official app's window):
   System Settings (General, Live View & Playback, Alarm), Download Settings,
   Local Record and About. Working: Run at Startup (an XDG autostart entry),
@@ -101,7 +109,9 @@ official client does.
 **Not done yet**
 
 - Split View, zoom on cameras behind an NVR's sub-channel numbering.
-- Playback: downloading recordings.
+- Playback: one download at a time per device, and the device's playback
+  and live video wait while it runs; no download of several cameras or of
+  a whole day at once.
 - PTZ calibration has no separate "finished" signal from the camera — the
   app only knows the request was accepted, matching what's documented for
   Baichuan generally, not a limitation specific to this capture.
@@ -116,6 +126,12 @@ official client does.
 
 **Version history**
 
+- 0.1.27 — Playback: a Download button saves a chosen time range (a start,
+  a length from 30 s to 15 min or the whole recording, main or sub stream)
+  as an MP4 with the recording's sound into the recordings folder, as one
+  file when the range crosses into the next recording; progress under the
+  controls, Cancel, "Open folder", and the range marked on the timeline.
+  A folder picked in the dialog is remembered as the recordings folder.
 - 0.1.26 — Playback: sound, at 1× and in sync with the picture (the other
   speeds are silent); the camera's detections as event bars on the day
   timeline, a detection filter (any motion, person, vehicle, animal,
@@ -263,10 +279,11 @@ src/
 ├── transport/   P2P/UDP: UID resolution, NAT traversal, relay fallback,
 │                and the reliable BCUDP connection.
 ├── client.rs    Client/session API: login and live video;
-│                `client/replay.rs`: recordings, events and playback.
+│                `client/replay.rs`: recordings, events, playback and
+│                downloads.
 ├── talk.rs      ADPCM encoding for Talk.
 ├── ui/          GTK4 + GStreamer desktop app (main window, sidebar,
-│                dialogs, settings, playback, video and audio).
+│                dialogs, settings, playback, downloads, video and audio).
 └── main.rs      The `reoling` binary.
 examples/        Small diagnostic tools (UID probe, media trace analysis).
 data/            Icons and the desktop entry.

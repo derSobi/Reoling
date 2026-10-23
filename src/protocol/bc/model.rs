@@ -102,6 +102,10 @@ pub const MSG_ID_COVER_PREVIEW: u32 = 298;
 /// Response code of the header-only message that ends the data of a
 /// download or a cover preview.
 pub const RESPONSE_CODE_TRANSFER_DONE: u16 = 300;
+/// Response code of the data message that carries the next file's info
+/// block in a download whose range runs across a file boundary; the data
+/// of that file follow it with code 200 again.
+pub const RESPONSE_CODE_NEXT_FILE: u16 = 331;
 
 /// Header classes that carry an extra 4-byte `payload_offset` word after the
 /// fixed 20-byte header. All other classes (0x6514 legacy, 0x6614 the
