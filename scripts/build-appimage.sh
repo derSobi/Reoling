@@ -239,7 +239,9 @@ rm -f "$appdir/AppRun.wrapped"
 # .DirIcon (and some the <Icon>.png next to the desktop entry) out of the
 # image, so both are real PNG files, not the symlinks linuxdeploy leaves
 # (a symlink extracted on its own points nowhere). 256 px, as AppImage
-# recommends, or the largest size the repository has.
+# recommends, or the largest size the repository has. The app itself reads
+# .DirIcon and the 512 px hicolor icon at start to write its own file's
+# thumbnail-cache entries (src/ui/icon.rs, install_appimage_integration).
 icon_name=$(sed -n 's/^Icon=//p' "$repo/data/de.dersobi.reoling.desktop")
 [ -n "$icon_name" ] || { echo "the desktop entry has no Icon= key" >&2; exit 1; }
 icon_src=""

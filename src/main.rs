@@ -40,6 +40,7 @@ fn main() {
     app.connect_startup(|_| {
         ui::icon::install();
         ui::icon::install_desktop_entry();
+        ui::icon::install_appimage_integration();
     });
 
     app.connect_activate(move |app| {

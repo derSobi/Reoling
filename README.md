@@ -408,7 +408,19 @@ the release workflow (`.github/workflows/release.yml`) so that they run on
   for the device passwords. It follows the desktop's GTK theme (and with it
   the accent colour); a theme written for a newer GTK than the bundled one
   (4.14) may print a few "Theme parser error" lines, which are harmless.
-  It keeps its own GStreamer registry under `~/.cache/reoling`.
+  It keeps its own GStreamer registry under `~/.cache/reoling`. The first
+  time it runs it also gives its own file the Reoling icon in the file
+  manager (GNOME Files shows a bare "executable" icon for an AppImage
+  otherwise): it writes the thumbnail-cache entries for the file under
+  `~/.cache/thumbnails` from the icon inside, and a per-user thumbnailer
+  entry, `~/.local/share/thumbnailers/reoling-appimage.thumbnailer`, that
+  shows any AppImage with its embedded icon where `squashfs-tools` is
+  installed (it reads the file with `unsquashfs`, never runs it). The entry
+  is written once: delete it to turn it off, and Reoling does not write it
+  again; an edited copy is left alone too. A GNOME Files window that was
+  already open before the first run picks the thumbnailer up after Files is
+  restarted; the Reoling file itself shows its icon as soon as the folder
+  is re-read.
 
 Both packages decode video in hardware where they can: with Decoding set
 to Auto (the default) GStreamer takes the highest-ranked decoder it has,
