@@ -66,20 +66,26 @@ apt-get install -y -qq "$out"/reoling_*.deb
 xvfb-run -a reoling --version
 dpkg -L reoling
 # The app itself, for 20 s on a virtual display with a session bus: it must
-# still be running when the time is up (124 from timeout).
-rc=0
-dbus-run-session -- xvfb-run -a timeout 20 reoling || rc=$?
-[ "$rc" -eq 124 ] || { echo "reoling ended early with status $rc" >&2; exit 1; }
-echo "reoling ran for 20 s"
+# still be running when the time is up (124 from timeout), and nothing it
+# loads may have failed to (a module, a pixbuf loader, a symbol, a decoder).
+run_for_20s() {
+    local rc=0
+    dbus-run-session -- xvfb-run -a timeout 20 "$1" 2> /tmp/smoke-stderr.log || rc=$?
+    cat /tmp/smoke-stderr.log
+    [ "$rc" -eq 124 ] || { echo "$1 ended early with status $rc" >&2; exit 1; }
+    if grep -E 'Unable to load image-loading module|Failed to load module|symbol lookup error|undefined symbol|Missing decoder' /tmp/smoke-stderr.log; then
+        echo "$1 printed a loading failure (above)" >&2
+        exit 1
+    fi
+    echo "$1 ran for 20 s"
+}
+run_for_20s reoling
 
 step "Smoke test: the AppImage"
 appimage=$(ls "$out"/Reoling-*-x86_64.AppImage)
 chmod +x "$appimage"
 xvfb-run -a "$appimage" --version
-rc=0
-dbus-run-session -- xvfb-run -a timeout 20 "$appimage" || rc=$?
-[ "$rc" -eq 124 ] || { echo "the AppImage ended early with status $rc" >&2; exit 1; }
-echo "the AppImage ran for 20 s"
+run_for_20s "$appimage"
 
 step "Record"
 dpkg-query -W -f='${Package} ${Version}\n' > "$out/noble-installed-packages.txt"

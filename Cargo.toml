@@ -69,11 +69,12 @@ a device's UID (no manual IP/port configuration, no cloud account required)."""
 # The GStreamer elements come from these packages: appsrc, decodebin,
 # videoconvert, audioconvert, audioresample, volume, queue, filesink (core
 # and -base); aacparse, qtmux, matroskamux, autoaudiosink (-good); h264parse,
-# h265parse and the va hardware decoders (-bad); avdec_h264, avdec_h265,
+# h265parse and the nvcodec and va hardware decoders (-bad); avdec_h264, avdec_h265,
 # avdec_aac (libav); a sink for autoaudiosink: pulsesink, pipewiresink or
 # alsasink.
 depends = "$auto, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, gstreamer1.0-pulseaudio | gstreamer1.0-pipewire | gstreamer1.0-alsa"
-# Hardware decoding needs a VA-API driver; the device passwords live in the
+# Hardware decoding needs the NVIDIA driver (libcuda/libnvcuvid, for the
+# nvcodec decoders) or a VA-API driver; the device passwords live in the
 # desktop keyring (org.freedesktop.secrets).
 recommends = "va-driver-all | mesa-va-drivers | intel-media-va-driver, gnome-keyring | kwalletmanager"
 assets = [

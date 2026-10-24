@@ -197,8 +197,9 @@ pub fn open(parent: &Window, current: &Settings, on_change: impl Fn(Settings) + 
 
     // Every control edits this one copy and reports the whole of it.
     let state = Rc::new(RefCell::new(current.clone()));
+    let edited = Rc::clone(&state);
     let commit: Commit = Rc::new(move |edit| {
-        let mut s = state.borrow_mut();
+        let mut s = edited.borrow_mut();
         edit(&mut s);
         on_change(s.clone());
     });
@@ -234,7 +235,8 @@ pub fn open(parent: &Window, current: &Settings, on_change: impl Fn(Settings) + 
     let status_button = Button::with_label("View");
     status_button.add_css_class("flat");
     let w = window.clone();
-    status_button.connect_clicked(move |_| system_status(&w));
+    let st = Rc::clone(&state);
+    status_button.connect_clicked(move |_| system_status(&w, st.borrow().decoding));
     let general = GtkBox::new(Orientation::Vertical, 0);
     general.set_margin_top(14);
     general.append(&list(&[
@@ -263,14 +265,20 @@ pub fn open(parent: &Window, current: &Settings, on_change: impl Fn(Settings) + 
     });
 
     let hardware = settings::hardware_decoders();
-    // Without any hardware decoder there is nothing to choose to force.
+    // All three modes, always: the stored one must show as it is, even
+    // "Hardware" on a machine without a hardware decoder (it then decodes
+    // in software, and the row says so).
     let modes: Vec<(Decoding, &str)> =
-        [(Decoding::Auto, "Auto"), (Decoding::Hardware, "Hardware"), (Decoding::Software, "Software")]
-            .into_iter()
-            .filter(|(m, _)| *m != Decoding::Hardware || !hardware.is_empty())
-            .collect();
+        vec![(Decoding::Auto, "Auto"), (Decoding::Hardware, "Hardware"), (Decoding::Software, "Software")];
     let labels: Vec<&str> = modes.iter().map(|(_, l)| *l).collect();
     let decoding = drop_down(&labels, modes.iter().position(|(m, _)| *m == current.decoding).unwrap_or(0) as u32);
+    let decoding_note = if hardware.is_empty() {
+        "Applies to streams started afterwards. Auto takes the best decoder GStreamer has; \
+         no hardware decoder was found on this machine, so Hardware decodes in software."
+    } else {
+        "Applies to streams started afterwards. Auto takes the best decoder GStreamer has \
+         (hardware first, software when none fits)."
+    };
     let mut device_labels = vec!["Automatic".to_string()];
     device_labels.extend(hardware.iter().map(|d| d.label.clone()));
     let device_labels: Vec<&str> = device_labels.iter().map(String::as_str).collect();
@@ -330,7 +338,7 @@ pub fn open(parent: &Window, current: &Settings, on_change: impl Fn(Settings) + 
         ),
         row("Stretch Mode", Some("Fill the whole view with the picture instead of keeping its proportions."), &stretch, true),
         row("Scrollview Time", None, &drop_down(&["10secs"], 0), false),
-        row("Decoding", Some("Applies to streams started afterwards."), &decoding, true),
+        row("Decoding", Some(decoding_note), &decoding, true),
         device_row,
         row(
             "Latency",
@@ -450,7 +458,7 @@ pub fn open(parent: &Window, current: &Settings, on_change: impl Fn(Settings) + 
 
 /// What the official app's "System Status" shows: a plain text report of
 /// what the client runs on.
-fn system_status(parent: &Window) {
+fn system_status(parent: &Window, decoding: Decoding) {
     let mut lines = vec![
         format!("Reoling {}", env!("CARGO_PKG_VERSION")),
         format!(
@@ -470,6 +478,15 @@ fn system_status(parent: &Window) {
             hardware.iter().map(|d| d.label.as_str()).collect::<Vec<_>>().join(", ")
         ));
     }
+    lines.push(format!(
+        "Decoding: {}",
+        match decoding {
+            Decoding::Auto => "Auto (the best decoder GStreamer has)",
+            Decoding::Hardware if settings::hardware_fallback() => "Hardware (none found: software)",
+            Decoding::Hardware => "Hardware",
+            Decoding::Software => "Software",
+        }
+    ));
     lines.push(format!("Settings: {}", glib::user_config_dir().join("reoling").join("settings.ini").display()));
     let text = Label::new(Some(&lines.join("\n")));
     text.set_selectable(true);

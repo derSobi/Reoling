@@ -363,30 +363,44 @@ the release workflow (`.github/workflows/release.yml`) so that they run on
   Debian 13 or newer (and derivatives with at least those library
   versions): `sudo apt install ./reoling_<version>-1_amd64.deb`. apt
   installs the GTK 4 and GStreamer runtime with it — the base, good and
-  bad plugin sets (parsers, muxers, the va hardware decoders), the libav
-  software decoders and a PulseAudio, PipeWire or ALSA sink — and
-  recommends a VA-API driver (`va-driver-all`, or the one for your GPU)
-  for hardware decoding and a keyring (GNOME Keyring or KWallet) for the
-  device passwords. Ubuntu 24.04 has no `gstreamer1.0-gtk4` package, so
+  bad plugin sets (parsers, muxers, the nvcodec and va hardware decoders),
+  the libav software decoders and a PulseAudio, PipeWire or ALSA sink —
+  and recommends a VA-API driver (`va-driver-all`, or the one for your
+  GPU) for hardware decoding and a keyring (GNOME Keyring or KWallet) for
+  the device passwords. Ubuntu 24.04 has no `gstreamer1.0-gtk4` package, so
   the .deb carries GStreamer's GTK 4 paintable sink itself, in
   `/usr/lib/reoling/gstreamer-1.0`, a directory `reoling` adds to its
   plugin registry when it starts. Reoling then appears in the
   applications menu; `reoling --version` prints the installed version.
 - **`Reoling-<version>-x86_64.AppImage`** for any other distribution with
-  glibc 2.39 or newer: `chmod +x Reoling-<version>-x86_64.AppImage` and
-  run it. The AppImage mounts itself with FUSE 2 (`libfuse2` or
-  `libfuse2t64`); without it, `--appimage-extract-and-run` unpacks it to a
+  glibc 2.39 and GLib 2.80 or newer (Ubuntu 24.04, Fedora 40, Debian 13
+  and later): `chmod +x Reoling-<version>-x86_64.AppImage` and run it.
+  The AppImage mounts itself with FUSE 2 (`libfuse2` or `libfuse2t64`);
+  without it, `--appimage-extract-and-run` unpacks it to a
   temporary directory for that run, and `--appimage-extract` unpacks it
   for good. Inside are GTK 4, GStreamer with the parsers, muxers, decoders
-  (libav in software, the va plugin for hardware) and sound sinks the app
-  uses, its GTK 4 sink, librsvg and the icons it draws. From the system it
-  takes glibc, Mesa (OpenGL/EGL), the X11 or Wayland client libraries,
-  fontconfig and the fonts, PulseAudio or PipeWire (`pipewire-pulse`) or
-  ALSA for sound, a VA-API driver for hardware decoding (looked for in
-  `/usr/lib/x86_64-linux-gnu/dri`, `/usr/lib64/dri` and `/usr/lib/dri`;
-  software decoding otherwise) and a Secret Service keyring (GNOME
-  Keyring, KWallet) for the device passwords. It keeps its own GStreamer
-  registry under `~/.cache/reoling`.
+  (libav in software; the nvcodec and va plugins for hardware) and sound
+  sinks the app uses, its GTK 4 sink, librsvg and the icons it draws. From
+  the system it takes glibc, GLib (whose GIO modules read the desktop's
+  settings), Mesa (OpenGL/EGL) or the NVIDIA driver's GL, the X11 or
+  Wayland client libraries, fontconfig and the fonts, PulseAudio or
+  PipeWire (`pipewire-pulse`) or ALSA for sound, `libva` (the FFmpeg
+  libraries behind the software decoders need it too; a system without
+  one gets the copy inside the AppImage), the hardware decoding driver —
+  NVIDIA's `libcuda`/`libnvcuvid` for NVDEC, or a VA-API driver for the
+  system's `libva` — and a Secret Service keyring (GNOME Keyring, KWallet)
+  for the device passwords. It follows the desktop's GTK theme (and with it
+  the accent colour); a theme written for a newer GTK than the bundled one
+  (4.14) may print a few "Theme parser error" lines, which are harmless.
+  It keeps its own GStreamer registry under `~/.cache/reoling`.
+
+Both packages decode video in hardware where they can: with Decoding set
+to Auto (the default) GStreamer takes the highest-ranked decoder it has,
+NVDEC (`nvh264dec`/`nvh265dec`) or VA-API (`vah264dec`/`vah265dec`) over
+the libav software decoders, and falls back to software where no driver
+is present. Settings → Live View & Playback → Decoding switches to
+Hardware (with a choice of device when there are several) or Software;
+System Status lists the hardware decoders found.
 
 The workflow installs the .deb and starts both packages (`--version`) on
 Ubuntu 24.04 before it uploads them. To build them yourself — the sink
@@ -409,8 +423,8 @@ Requires:
 - GStreamer, including `gstreamer-app`, the GTK4 paintable sink
   (`gstreamer1.0-gtk4`, or `scripts/build-gst-gtk4-plugin.sh` where the
   distribution has none) and a decoder plugin (`gstreamer1.0-libav` for
-  software decoding; the va plugin from `gstreamer1.0-plugins-bad` for
-  hardware decoding)
+  software decoding; the nvcodec and va plugins from
+  `gstreamer1.0-plugins-bad` for NVIDIA and VA-API hardware decoding)
 
 ```bash
 cargo build --release

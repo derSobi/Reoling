@@ -91,6 +91,27 @@ jobs:
           test "$(xvfb-run -a reoling --version)" = "reoling $VERSION"
           chmod +x dist/Reoling-*.AppImage
           test "$(xvfb-run -a dist/Reoling-*.AppImage --version)" = "reoling $VERSION"
+          # --version answers before GTK and GStreamer come up, so each
+          # package also runs for 20 s on a virtual display with a session
+          # bus and an empty configuration (no devices to reach): it must
+          # still be running when the time is up (124 from timeout), and
+          # nothing it loads may have failed to (a module, a pixbuf loader,
+          # a symbol, a decoder).
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/smoke-config" XDG_CACHE_HOME="$RUNNER_TEMP/smoke-cache"
+          for app in reoling dist/Reoling-*.AppImage; do
+            rc=0
+            dbus-run-session -- xvfb-run -a timeout 20 "$app" 2> "$RUNNER_TEMP/smoke-stderr.log" || rc=$?
+            cat "$RUNNER_TEMP/smoke-stderr.log"
+            if [ "$rc" -ne 124 ]; then
+              echo "::error::$app ended early with status $rc"
+              exit 1
+            fi
+            if grep -E 'Unable to load image-loading module|Failed to load module|symbol lookup error|undefined symbol|Missing decoder' "$RUNNER_TEMP/smoke-stderr.log"; then
+              echo "::error::$app printed a loading failure (above)"
+              exit 1
+            fi
+            echo "$app ran for 20 s"
+          done
           ls -l dist
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
