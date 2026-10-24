@@ -13,7 +13,7 @@ libgtk-4-dev
 libgstreamer1.0-dev
 libgstreamer-plugins-base1.0-dev
 # GStreamer runtime the app uses: parsers, muxers, decoders, audio sinks
-# (h264parse/h265parse and the va plugin live in -bad, aacparse, qtmux,
+# (h264parse/h265parse and the nvcodec and va plugins live in -bad, aacparse, qtmux,
 # matroskamux and autoaudiosink in -good, avdec_* in libav)
 gstreamer1.0-tools
 gstreamer1.0-plugins-base

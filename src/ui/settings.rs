@@ -352,6 +352,35 @@ fn original_rank(factory: &gstreamer::ElementFactory) -> i32 {
         .map_or_else(|| factory.rank().into_glib(), |(_, rank)| *rank)
 }
 
+/// The mode that is applied for `wanted`: "Hardware" needs a hardware
+/// decoder to pick, and without one it would take every decoder out of
+/// decodebin's reach (a black picture), so it then behaves as "Auto".
+fn effective_decoding(wanted: Decoding, hardware_present: bool) -> Decoding {
+    match wanted {
+        Decoding::Hardware if !hardware_present => Decoding::Auto,
+        other => other,
+    }
+}
+
+/// Whether a decoder is taken out of decodebin's reach (rank NONE) in
+/// `mode`: in "Hardware", every software decoder, and with a chosen
+/// device (`chosen`, see `hardware_key`) the other devices too. "Auto"
+/// and "Software" leave the ranks alone ("Software" asks decodebin
+/// itself for software decoders).
+fn excluded(mode: Decoding, hardware: bool, key: &str, chosen: Option<&str>) -> bool {
+    mode == Decoding::Hardware && (!hardware || chosen.is_some_and(|c| c != key))
+}
+
+/// Whether the "Hardware" setting is running in software for want of a
+/// hardware decoder (reported once on stderr and in System Status).
+static HARDWARE_FALLBACK: AtomicBool = AtomicBool::new(false);
+
+/// `true` while "Hardware" is set but no hardware decoder exists, so
+/// decoding runs in software.
+pub fn hardware_fallback() -> bool {
+    HARDWARE_FALLBACK.load(Ordering::Relaxed)
+}
+
 fn apply_decoding(settings: &Settings) {
     let decoders = video_decoders();
     let originals = ORIGINAL_RANKS.get_or_init(|| {
@@ -367,25 +396,66 @@ fn apply_decoding(settings: &Settings) {
     };
     let never = |f: &gstreamer::ElementFactory| f.set_rank(gstreamer::Rank::NONE);
 
-    let chosen = settings
-        .hardware_decoder
-        .as_ref()
-        .filter(|key| hardware_decoders().iter().any(|d| &d.key == *key));
+    let available = hardware_decoders();
+    let mode = effective_decoding(settings.decoding, !available.is_empty());
+    let fallback = mode != settings.decoding;
+    if fallback && !HARDWARE_FALLBACK.swap(true, Ordering::Relaxed) {
+        eprintln!("no hardware decoder found: \"Hardware\" decoding runs in software");
+    }
+    if !fallback {
+        HARDWARE_FALLBACK.store(false, Ordering::Relaxed);
+    }
+    // A chosen device that is not there any more does not narrow the pick.
+    let chosen = settings.hardware_decoder.as_deref().filter(|key| available.iter().any(|d| d.key == *key));
     for (factory, hardware) in &decoders {
         restore(factory);
-        if settings.decoding != Decoding::Hardware {
-            continue;
-        }
-        // Hardware only: software decoders are never picked; with a chosen
-        // device, the other devices are not either.
-        let excluded = if *hardware {
-            chosen.is_some_and(|key| hardware_key(factory).0 != *key)
-        } else {
-            true
-        };
-        if excluded {
+        if excluded(mode, *hardware, &hardware_key(factory).0, chosen) {
             never(factory);
         }
     }
-    FORCE_SOFTWARE.store(settings.decoding == Decoding::Software, Ordering::Relaxed);
+    FORCE_SOFTWARE.store(mode == Decoding::Software, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_and_software_are_applied_as_set() {
+        for present in [true, false] {
+            assert_eq!(effective_decoding(Decoding::Auto, present), Decoding::Auto);
+            assert_eq!(effective_decoding(Decoding::Software, present), Decoding::Software);
+        }
+    }
+
+    #[test]
+    fn hardware_needs_a_hardware_decoder() {
+        assert_eq!(effective_decoding(Decoding::Hardware, true), Decoding::Hardware);
+        // Without one, "Hardware" must not leave decodebin empty-handed.
+        assert_eq!(effective_decoding(Decoding::Hardware, false), Decoding::Auto);
+    }
+
+    #[test]
+    fn auto_keeps_every_decoder_at_its_rank() {
+        // decodebin then picks by rank: a hardware decoder (primary + 1)
+        // over a software one (primary).
+        assert!(!excluded(Decoding::Auto, true, "nvcodec|", None));
+        assert!(!excluded(Decoding::Auto, false, "libav|", None));
+        assert!(!excluded(Decoding::Auto, true, "va|GPU A", Some("va|GPU B")));
+    }
+
+    #[test]
+    fn software_leaves_the_ranks_to_force_sw_decoders() {
+        assert!(!excluded(Decoding::Software, true, "nvcodec|", None));
+        assert!(!excluded(Decoding::Software, false, "libav|", None));
+    }
+
+    #[test]
+    fn hardware_drops_software_and_other_devices() {
+        assert!(excluded(Decoding::Hardware, false, "libav|", None));
+        assert!(!excluded(Decoding::Hardware, true, "nvcodec|", None));
+        assert!(!excluded(Decoding::Hardware, true, "nvcodec|", Some("nvcodec|")));
+        assert!(excluded(Decoding::Hardware, true, "va|GPU A", Some("nvcodec|")));
+        assert!(!excluded(Decoding::Hardware, true, "va|GPU A", Some("va|GPU A")));
+    }
 }
