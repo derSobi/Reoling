@@ -24,7 +24,7 @@ More on <https://reoling.eu>.
 
 ## Status
 
-Version **1.0.0**, the first release with installable packages (see
+Version **1.0.1**, the first release with installable packages (see
 [Installation](#installation)). Login, live video, PTZ and the camera
 controls, the camera and device settings pages, and playback with sound,
 event bars and downloads work end to end on real hardware — a Home Hub,
@@ -159,11 +159,27 @@ answers first.
 
 **Version history**
 
-- 1.0.0 — the first release with packages: `reoling_1.0.0-1_amd64.deb`
+- 1.0.1 — the first published packages: `reoling_1.0.1-1_amd64.deb` for
+  Ubuntu 24.04 LTS and later (Debian 13 and later too) and
+  `Reoling-1.0.1-x86_64.AppImage` for other distributions, both built on
+  Ubuntu 24.04 by the release workflow and attached to the release on
+  GitHub (see [Installation](#installation)).
+  - Decoding: the hardware decoder — NVDEC or VA-API — is picked
+    automatically, with the software decoders as the fallback. Hardware,
+    set on a machine without a usable hardware decoder, now decodes in
+    software instead of leaving the picture black; the setting is shown
+    as it is stored, the Decoding row says that no hardware decoder was
+    found, and System Status names the mode in use.
+  - AppImage: it follows the desktop's theme and accent colour (the 1.0.0
+    build forced its own theme, which coloured the connection dot blue),
+    bundles the NVIDIA and VA-API GStreamer plugins for hardware decoding,
+    and takes GLib and libva from the system, so the desktop's settings
+    are read and the VA-API driver matches its library.
+- 1.0.0 — the first release built as packages: `reoling_1.0.0-1_amd64.deb`
   for Ubuntu 24.04 LTS and later (Debian 13 and later too) and
   `Reoling-1.0.0-x86_64.AppImage` for other distributions, both built on
-  Ubuntu 24.04 by a GitHub Actions workflow and attached to every release
-  (see [Installation](#installation)); `reoling --version` prints the
+  Ubuntu 24.04 by a GitHub Actions workflow (they were not published: the
+  AppImage had the faults 1.0.1 fixes); `reoling --version` prints the
   version.
   - Settings pages, read-only, with the values as the device reports
     them: the camera settings window gets Info, Image, Display,
@@ -359,9 +375,9 @@ carries two packages for x86_64 Linux, both built on Ubuntu 24.04 LTS by
 the release workflow (`.github/workflows/release.yml`) so that they run on
 24.04 and everything newer:
 
-- **`reoling_<version>-1_amd64.deb`** for Ubuntu 24.04 LTS or newer and
+- **`reoling_1.0.1-1_amd64.deb`** for Ubuntu 24.04 LTS or newer and
   Debian 13 or newer (and derivatives with at least those library
-  versions): `sudo apt install ./reoling_<version>-1_amd64.deb`. apt
+  versions): `sudo apt install ./reoling_1.0.1-1_amd64.deb`. apt
   installs the GTK 4 and GStreamer runtime with it — the base, good and
   bad plugin sets (parsers, muxers, the nvcodec and va hardware decoders),
   the libav software decoders and a PulseAudio, PipeWire or ALSA sink —
@@ -372,9 +388,9 @@ the release workflow (`.github/workflows/release.yml`) so that they run on
   `/usr/lib/reoling/gstreamer-1.0`, a directory `reoling` adds to its
   plugin registry when it starts. Reoling then appears in the
   applications menu; `reoling --version` prints the installed version.
-- **`Reoling-<version>-x86_64.AppImage`** for any other distribution with
+- **`Reoling-1.0.1-x86_64.AppImage`** for any other distribution with
   glibc 2.39 and GLib 2.80 or newer (Ubuntu 24.04, Fedora 40, Debian 13
-  and later): `chmod +x Reoling-<version>-x86_64.AppImage` and run it.
+  and later): `chmod +x Reoling-1.0.1-x86_64.AppImage` and run it.
   The AppImage mounts itself with FUSE 2 (`libfuse2` or `libfuse2t64`);
   without it, `--appimage-extract-and-run` unpacks it to a
   temporary directory for that run, and `--appimage-extract` unpacks it
@@ -400,7 +416,10 @@ NVDEC (`nvh264dec`/`nvh265dec`) or VA-API (`vah264dec`/`vah265dec`) over
 the libav software decoders, and falls back to software where no driver
 is present. Settings → Live View & Playback → Decoding switches to
 Hardware (with a choice of device when there are several) or Software;
-System Status lists the hardware decoders found.
+System Status lists the hardware decoders found and the decoding mode in
+use. Hardware on a machine without a usable hardware decoder decodes in
+software instead of leaving the picture black, and the Decoding row says
+so.
 
 The workflow installs the .deb and starts both packages (`--version`) on
 Ubuntu 24.04 before it uploads them. To build them yourself — the sink
@@ -409,7 +428,7 @@ rehearses the whole release in an `ubuntu:24.04` container:
 
 ```bash
 scripts/build-gst-gtk4-plugin.sh target/gst-gtk4   # the GTK 4 sink, where the distribution has none
-cargo install cargo-deb && cargo deb                # target/debian/reoling_<version>-1_amd64.deb
+cargo install cargo-deb && cargo deb                # target/debian/reoling_1.0.1-1_amd64.deb
 scripts/fetch-appimage-tools.sh ~/appimage-tools    # linuxdeploy, its plugins, appimagetool (pinned)
 APPIMAGE_TOOLS=~/appimage-tools scripts/build-appimage.sh target/release/reoling dist
 ```
