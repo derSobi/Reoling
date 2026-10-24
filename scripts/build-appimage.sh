@@ -235,13 +235,14 @@ APPRUN
 chmod +x "$appdir/AppRun"
 rm -f "$appdir/AppRun.wrapped"
 
-# The icon the file manager shows for the .AppImage file: thumbnailers read
-# .DirIcon (and some the <Icon>.png next to the desktop entry) out of the
-# image, so both are real PNG files, not the symlinks linuxdeploy leaves
-# (a symlink extracted on its own points nowhere). 256 px, as AppImage
-# recommends, or the largest size the repository has. The app itself reads
-# .DirIcon and the 512 px hicolor icon at start to write its own file's
-# thumbnail-cache entries (src/ui/icon.rs, install_appimage_integration).
+# The icon the file manager shows for the .AppImage file: at start the app
+# reads .DirIcon and the 512 px hicolor icon out of the mounted image to
+# write its own file's thumbnail-cache entries (src/ui/icon.rs,
+# install_appimage_integration), and AppImage tools read .DirIcon (some
+# the <Icon>.png next to the desktop entry) as well, so both are real PNG
+# files, not the symlinks linuxdeploy leaves (a symlink extracted on its
+# own points nowhere). 256 px, as AppImage recommends, or the largest size
+# the repository has.
 icon_name=$(sed -n 's/^Icon=//p' "$repo/data/de.dersobi.reoling.desktop")
 [ -n "$icon_name" ] || { echo "the desktop entry has no Icon= key" >&2; exit 1; }
 icon_src=""
