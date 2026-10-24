@@ -78,24 +78,24 @@ pub fn install_desktop_entry() {
 }
 
 /// Started from an AppImage, the file manager shows the `.AppImage` file
-/// with the generic "executable" icon: no thumbnailer on a stock desktop
-/// reads the icon an AppImage embeds, and the icon themes have none for
-/// its MIME type. Two per-user files put that right. Both are written only
-/// when the AppImage runtime set `APPIMAGE` (the file's path) and `APPDIR`
-/// (its mount point), so the .deb and a source build never do this:
+/// with the generic "executable" icon: nothing on a stock desktop reads the
+/// icon an AppImage embeds, and the icon themes have none for its MIME
+/// type. This writes the thumbnail-cache entries for this very file
+/// (`~/.cache/thumbnails/{large,x-large}/<md5 of the file URI>.png`, see
+/// [`thumbnail_sources`]) from the icons inside the mounted AppImage, and
+/// drops a thumbnailing failure the desktop recorded for it. GNOME Files,
+/// and every file manager that reads the shared cache, then shows the
+/// Reoling icon for the file from the first run on, with no thumbnailer
+/// involved. For this file only: Reoling installs no thumbnailer, which
+/// the desktop would run on every AppImage the user so much as views in a
+/// folder.
 ///
-/// - the thumbnail-cache entries for this very file
-///   (`~/.cache/thumbnails/{large,x-large}/<md5 of the file URI>.png`),
-///   made from the icons inside the AppImage. GNOME Files, and every file
-///   manager that reads the shared cache, then shows the Reoling icon for
-///   the file from the first run on, with no thumbnailer involved;
-/// - a `.thumbnailer` entry in `~/.local/share/thumbnailers/` that lets
-///   the desktop's thumbnail factory show any AppImage's embedded icon,
-///   see [`APPIMAGE_THUMBNAILER`]. It is written once; from then on the
-///   user's copy is theirs to delete or edit.
-///
-/// Idempotent: a second start rewrites nothing. Errors are printed and
-/// otherwise ignored; the worst case is today's generic icon.
+/// The entries are written only when the AppImage runtime set `APPIMAGE`
+/// (the file's path) and `APPDIR` (its mount point), so the .deb and a
+/// source build never do this, and again when the file was replaced (its
+/// modification time changed) or moved (the entries are keyed by the
+/// path); otherwise a second start rewrites nothing. Errors are printed
+/// and otherwise ignored; the worst case is today's generic icon.
 pub fn install_appimage_integration() {
     let (Some(appimage), Some(appdir)) = (std::env::var_os("APPIMAGE"), std::env::var_os("APPDIR")) else {
         return;
@@ -117,11 +117,6 @@ pub fn install_appimage_integration() {
         if let Err(e) = seed_own_thumbnail(path, &appdir, &thumbnails) {
             eprintln!("could not write the AppImage's file icon to {}: {e}", thumbnails.display());
         }
-    }
-    let thumbnailers = glib::user_data_dir().join("thumbnailers");
-    let marker = glib::user_data_dir().join("reoling").join(APPIMAGE_THUMBNAILER_MARKER);
-    if let Err(e) = install_appimage_thumbnailer(&thumbnailers, &marker) {
-        eprintln!("could not write {}: {e}", thumbnailers.join(APPIMAGE_THUMBNAILER_FILE).display());
     }
 }
 
@@ -154,10 +149,13 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 /// The icon inside the AppDir for each thumbnail size: the cache directory
-/// name and the source, relative to `APPDIR`. `.DirIcon` is the 256 px
-/// icon every AppImage has at its root; the 512 px one is the largest the
-/// icon theme files have. The desktop shows the largest entry present,
-/// scaled to its icon size.
+/// name and the source, relative to `APPDIR`. Of the sizes the thumbnail
+/// spec names (normal 128 px, large 256, x-large 512, xx-large 1024), the
+/// two the icons cover: `.DirIcon` is the 256 px icon every AppImage has
+/// at its root, the 512 px one the largest the icon theme files have. GIO
+/// resolves `thumbnail::path`, the one attribute GNOME Files asks for, to
+/// the largest entry present, and Files scales that to its icon size, so
+/// a `normal` entry would never be looked at next to these.
 fn thumbnail_sources() -> [(&'static str, PathBuf); 2] {
     [
         ("large", PathBuf::from(".DirIcon")),
@@ -309,90 +307,10 @@ fn thumbnail_is_current(png: &[u8], uri: &str, mtime: u64) -> bool {
     has("Thumb::URI", uri) && has("Thumb::MTime", &mtime.to_string())
 }
 
-/// The file name of the thumbnailer entry under `~/.local/share/thumbnailers`.
-pub const APPIMAGE_THUMBNAILER_FILE: &str = "reoling-appimage.thumbnailer";
-
-/// The first line of [`APPIMAGE_THUMBNAILER`]: what tells an entry Reoling
-/// wrote, which a newer text may replace, from one the user edited.
-const APPIMAGE_THUMBNAILER_HEADER: &str = "# Written by Reoling";
-
-/// The file under `~/.local/share/reoling` that records that the thumbnailer
-/// entry was written once, so that an entry the user deleted stays deleted.
-pub const APPIMAGE_THUMBNAILER_MARKER: &str = "appimage-thumbnailer-installed";
-
-/// A thumbnailer entry for AppImage files, for the thumbnail factory that
-/// GNOME Files, Thunar, Nemo and Caja share. The factory runs `Exec` in a
-/// sandbox (on GNOME: bubblewrap with only `/usr`, the input file and the
-/// output directory in it), so the entry can use nothing but programs
-/// installed on the system: `od` reads the ELF header (64-bit or 32-bit)
-/// for the end of the AppImage runtime, where the squashfs image starts,
-/// the way the runtime itself works it out: the end of the section header
-/// table (`e_shoff + e_shentsize * e_shnum`) or the end of the last
-/// section (`sh_offset + sh_size`), whichever is further. `unsquashfs
-/// -cat` prints `.DirIcon` out of that image, `head` keeps the output to
-/// 16 MiB however big a stranger's icon claims to be, and an empty output
-/// (no icon in the image) ends the run with a failure, which the factory
-/// records. The AppImage is read, never run. Where squashfs-tools is not
-/// installed, `TryExec` leaves the entry inert.
-pub const APPIMAGE_THUMBNAILER: &str = r#"# Written by Reoling so that GNOME Files (and other file managers that read
-# .thumbnailer entries) show an AppImage file with the icon embedded in it.
-# The file is only read: its ELF header gives the offset of the squashfs
-# image, out of which unsquashfs prints .DirIcon (at most 16 MiB of it).
-# Delete this file to turn that off; Reoling does not write it again. An
-# edited copy is left alone, too.
-[Thumbnailer Entry]
-TryExec=unsquashfs
-Exec=sh -c 'f=$1; r() { echo $(( $(od -An -t"u$2" -j"$1" -N"$2" "$f") )); }; if [ "$(r 4 1)" -eq 1 ]; then s=$(r 32 4); e=$(r 46 2); n=$(r 48 2); w=4; a=16; b=20; else s=$(r 40 8); e=$(r 58 2); n=$(r 60 2); w=8; a=24; b=32; fi; o=$(( s + e * n )); if [ "$n" -gt 0 ]; then l=$(( s + e * (n - 1) )); t=$(( $(r $(( l + a )) $w) + $(r $(( l + b )) $w) )); [ "$t" -gt "$o" ] && o=$t; fi; unsquashfs -o "$o" -cat "$f" .DirIcon | head -c 16777216 > "$2" && [ -s "$2" ]' reoling-appimage-thumbnailer %i %o
-MimeType=application/vnd.appimage;
-"#;
-
-/// Writes [`APPIMAGE_THUMBNAILER`] into `dir` (`~/.local/share/thumbnailers`)
-/// the first time and records that in `marker`. From then on the user's
-/// copy is theirs: an entry they deleted is not written again (the marker
-/// says it was there once), an entry they edited (one that no longer
-/// starts with Reoling's header) is left as it is, and only an older entry
-/// of Reoling's own is replaced by the current text, through a rename so
-/// the factory's directory monitor sees one complete file.
-fn install_appimage_thumbnailer(dir: &Path, marker: &Path) -> io::Result<()> {
-    let path = dir.join(APPIMAGE_THUMBNAILER_FILE);
-    match fs::read_to_string(&path) {
-        Ok(current) if current == APPIMAGE_THUMBNAILER => return write_marker(marker),
-        Ok(current) if !current.starts_with(APPIMAGE_THUMBNAILER_HEADER) => return Ok(()),
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound && marker.exists() => return Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    fs::create_dir_all(dir)?;
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    let result = fs::write(&tmp, APPIMAGE_THUMBNAILER).and_then(|()| fs::rename(&tmp, &path));
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result?;
-    write_marker(marker)
-}
-
-/// Creates `marker`, with a line on what it is for, unless it exists.
-fn write_marker(marker: &Path) -> io::Result<()> {
-    if marker.exists() {
-        return Ok(());
-    }
-    if let Some(dir) = marker.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    fs::write(
-        marker,
-        "Reoling wrote ~/.local/share/thumbnailers/reoling-appimage.thumbnailer once.\n\
-         While this file exists it does not write that entry again after it was deleted.\n",
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::process::{Command, Stdio};
     use std::time::Duration;
 
     /// A 1x1 transparent RGBA PNG: signature, IHDR, IDAT, IEND.
@@ -567,243 +485,6 @@ mod tests {
         assert_eq!(through_link, dir.join("link/R.AppImage"));
         assert!(same_file(&through_link, &real.join("R.AppImage")));
         assert!(!same_file(&through_link, &dir.join("missing")));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn thumbnailer_is_written_once_and_then_the_users() {
-        let dir = scratch("thumbnailer-install");
-        let thumbnailers = dir.join("thumbnailers");
-        let marker = dir.join("reoling").join(APPIMAGE_THUMBNAILER_MARKER);
-        let path = thumbnailers.join(APPIMAGE_THUMBNAILER_FILE);
-        let content = || fs::read_to_string(&path);
-        let inode = || fs::metadata(&path).unwrap().ino();
-        let install = || install_appimage_thumbnailer(&thumbnailers, &marker).unwrap();
-        assert!(APPIMAGE_THUMBNAILER.starts_with(APPIMAGE_THUMBNAILER_HEADER));
-
-        install();
-        assert_eq!(content().unwrap(), APPIMAGE_THUMBNAILER);
-        assert!(marker.is_file());
-        assert_eq!(fs::read_dir(&thumbnailers).unwrap().count(), 1);
-        // Unchanged: nothing rewritten.
-        let first = inode();
-        install();
-        assert_eq!(inode(), first);
-        // An older entry of Reoling's own is replaced.
-        let older = format!("{APPIMAGE_THUMBNAILER_HEADER}, an earlier version\n[Thumbnailer Entry]\nExec=true\n");
-        fs::write(&path, older).unwrap();
-        install();
-        assert_eq!(content().unwrap(), APPIMAGE_THUMBNAILER);
-        assert_eq!(fs::read_dir(&thumbnailers).unwrap().count(), 1);
-        // One the user edited is left alone.
-        let edited = "[Thumbnailer Entry]\nTryExec=unsquashfs\nExec=true\nMimeType=application/vnd.appimage;\n";
-        fs::write(&path, edited).unwrap();
-        install();
-        assert_eq!(content().unwrap(), edited);
-        // One the user deleted stays deleted...
-        fs::remove_file(&path).unwrap();
-        install();
-        assert!(!path.exists());
-        assert!(!thumbnailers.exists() || fs::read_dir(&thumbnailers).unwrap().count() == 0);
-        // ...as long as the record of it is there.
-        fs::remove_file(&marker).unwrap();
-        install();
-        assert_eq!(content().unwrap(), APPIMAGE_THUMBNAILER);
-        assert!(marker.is_file());
-        // An entry without the record gets one, and stays as it is.
-        fs::remove_file(&marker).unwrap();
-        let current = inode();
-        install();
-        assert!(marker.is_file());
-        assert_eq!(inode(), current);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    fn thumbnailer_entry() -> glib::KeyFile {
-        let entry = glib::KeyFile::new();
-        entry.load_from_data(APPIMAGE_THUMBNAILER, glib::KeyFileFlags::NONE).unwrap();
-        entry
-    }
-
-    /// What the thumbnail factory runs: `Exec` with `%i` and `%o` replaced
-    /// by the shell-quoted paths, split the way a shell would.
-    fn thumbnailer_argv(input: &Path, output: &Path) -> Vec<String> {
-        let exec = thumbnailer_entry().string("Thumbnailer Entry", "Exec").unwrap();
-        let quote = |path: &Path| glib::shell_quote(path).to_string_lossy().into_owned();
-        let line = exec.replace("%i", &quote(input)).replace("%o", &quote(output));
-        glib::shell_parse_argv(line).unwrap().iter().map(|arg| arg.to_string_lossy().into_owned()).collect()
-    }
-
-    #[test]
-    fn thumbnailer_entry_is_well_formed() {
-        let entry = thumbnailer_entry();
-        assert_eq!(entry.groups().len(), 1);
-        assert!(entry.has_group("Thumbnailer Entry"));
-        assert_eq!(entry.string("Thumbnailer Entry", "TryExec").unwrap(), "unsquashfs");
-        assert_eq!(entry.string("Thumbnailer Entry", "MimeType").unwrap(), "application/vnd.appimage;");
-        let argv = thumbnailer_argv(Path::new("/tmp/in put.AppImage"), Path::new("/tmp/out.png"));
-        assert_eq!(argv.len(), 6);
-        assert_eq!((argv[0].as_str(), argv[1].as_str()), ("sh", "-c"));
-        let tail = "unsquashfs -o \"$o\" -cat \"$f\" .DirIcon | head -c 16777216 > \"$2\" && [ -s \"$2\" ]";
-        assert!(argv[2].ends_with(tail), "{}", argv[2]);
-        assert_eq!(&argv[3..], ["reoling-appimage-thumbnailer", "/tmp/in put.AppImage", "/tmp/out.png"]);
-    }
-
-    /// Where an AppImage's squashfs image starts, as the runtime works it
-    /// out: after the section header table or after the last section,
-    /// whichever ends later. The arithmetic the thumbnailer's `Exec` does
-    /// with `od`.
-    fn payload_offset(elf: &[u8]) -> Option<u64> {
-        let le = |range: std::ops::Range<usize>| {
-            elf.get(range).map(|bytes| bytes.iter().rev().fold(0u64, |acc, &b| (acc << 8) | u64::from(b)))
-        };
-        if elf.get(..4)? != b"\x7fELF" {
-            return None;
-        }
-        // e_shoff, e_shentsize, e_shnum; the width of a section header's
-        // offset and size fields and where they sit in the header.
-        let (shoff, entsize, num, width, offset_at, size_at) = match elf.get(4)? {
-            1 => (le(0x20..0x24)?, le(0x2e..0x30)?, le(0x30..0x32)?, 4, 16, 20),
-            2 => (le(0x28..0x30)?, le(0x3a..0x3c)?, le(0x3c..0x3e)?, 8, 24, 32),
-            _ => return None,
-        };
-        let table_end = shoff + entsize * num;
-        if num == 0 {
-            return Some(table_end);
-        }
-        let last = (shoff + entsize * (num - 1)) as usize;
-        let field = |at: usize| le(last + at..last + at + width);
-        let section_end = field(offset_at)? + field(size_at)?;
-        Some(table_end.max(section_end))
-    }
-
-    /// A stand-in for the AppImage runtime, `len` bytes long: an ELF header
-    /// (64- or 32-bit, little-endian, with the type-2 AppImage marker) and
-    /// its section header table, which is the last thing in it, as in
-    /// every runtime in use, or, with `section_after_table`, is followed
-    /// by the last section, which reaches to `len`.
-    fn fake_runtime(class: u8, len: usize, section_after_table: bool) -> Vec<u8> {
-        let mut elf = vec![0u8; len];
-        elf[..4].copy_from_slice(b"\x7fELF");
-        elf[4] = class;
-        elf[5] = 1;
-        elf[6] = 1;
-        elf[8..11].copy_from_slice(b"AI\x02");
-        let trailing = if section_after_table { 256 } else { 0 };
-        // (e_shentsize, e_shnum), the width of the section header fields and
-        // where the offset and the size sit in a header.
-        let (entsize, num, width, offset_at, size_at) = match class {
-            2 => (64usize, 3usize, 8, 24, 32),
-            1 => (40, 4, 4, 16, 20),
-            _ => unreachable!(),
-        };
-        let shoff = len - entsize * num - trailing;
-        let last = shoff + entsize * (num - 1);
-        let (offset, size) = if section_after_table { (shoff + entsize * num, trailing) } else { (64, 16) };
-        let put = |elf: &mut [u8], at: usize, width: usize, value: usize| {
-            elf[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
-        };
-        match class {
-            2 => {
-                put(&mut elf, 0x28, 8, shoff);
-                put(&mut elf, 0x3a, 2, entsize);
-                put(&mut elf, 0x3c, 2, num);
-            }
-            _ => {
-                put(&mut elf, 0x20, 4, shoff);
-                put(&mut elf, 0x2e, 2, entsize);
-                put(&mut elf, 0x30, 2, num);
-            }
-        }
-        put(&mut elf, last + offset_at, width, offset);
-        put(&mut elf, last + size_at, width, size);
-        elf
-    }
-
-    #[test]
-    fn payload_offset_is_what_the_runtime_computes() {
-        // The numbers of a real x86_64 runtime: e_shoff 942712, 30 section
-        // headers of 64 bytes, the last section (.shstrtab, 276 bytes at
-        // 942436) ending where the table starts: squashfs at 944632.
-        let mut elf = vec![0u8; 944_632];
-        elf[..4].copy_from_slice(b"\x7fELF");
-        elf[4] = 2;
-        elf[0x28..0x30].copy_from_slice(&942_712u64.to_le_bytes());
-        elf[0x3a..0x3c].copy_from_slice(&64u16.to_le_bytes());
-        elf[0x3c..0x3e].copy_from_slice(&30u16.to_le_bytes());
-        let last = 942_712 + 64 * 29;
-        elf[last + 24..last + 32].copy_from_slice(&942_436u64.to_le_bytes());
-        elf[last + 32..last + 40].copy_from_slice(&276u64.to_le_bytes());
-        assert_eq!(payload_offset(&elf), Some(944_632));
-        // The same runtime with its last section moved behind the table.
-        elf[last + 24..last + 32].copy_from_slice(&944_632u64.to_le_bytes());
-        assert_eq!(payload_offset(&elf), Some(944_908));
-        for section_after_table in [false, true] {
-            assert_eq!(payload_offset(&fake_runtime(2, 4096, section_after_table)), Some(4096));
-            assert_eq!(payload_offset(&fake_runtime(1, 8192, section_after_table)), Some(8192));
-        }
-        assert_eq!(payload_offset(TINY_PNG), None);
-        assert_eq!(payload_offset(&elf[..40]), None);
-    }
-
-    /// Builds `<name>.AppImage` in `dir`: a fake runtime of `class` with
-    /// a squashfs image of `root` after it.
-    fn fake_appimage(dir: &Path, name: &str, class: u8, root: &Path, section_after_table: bool) -> PathBuf {
-        let image = dir.join(format!("{name}.squashfs"));
-        let status = Command::new("mksquashfs")
-            .arg(root)
-            .arg(&image)
-            .args(["-noappend", "-no-progress", "-all-root", "-no-xattrs"])
-            .stdout(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "mksquashfs failed");
-        let mut bytes = fake_runtime(class, 4096, section_after_table);
-        assert_eq!(payload_offset(&bytes), Some(bytes.len() as u64));
-        bytes.extend(fs::read(&image).unwrap());
-        let path = dir.join(format!("{name}.AppImage"));
-        fs::write(&path, bytes).unwrap();
-        path
-    }
-
-    #[test]
-    fn thumbnailer_exec_prints_the_embedded_icon() {
-        if glib::find_program_in_path("mksquashfs").is_none() || glib::find_program_in_path("unsquashfs").is_none() {
-            eprintln!("skipped: squashfs-tools is not installed");
-            return;
-        }
-        let dir = scratch("thumbnailer-exec");
-        let run = |appimage: &Path| {
-            let out = dir.join("thumbnail.png");
-            let _ = fs::remove_file(&out);
-            let argv = thumbnailer_argv(appimage, &out);
-            let status = Command::new(&argv[0]).args(&argv[1..]).stderr(Stdio::null()).status().unwrap();
-            (status.success(), fs::read(&out).unwrap_or_default())
-        };
-        // A regular .DirIcon, read through a 64-bit and a 32-bit header,
-        // with the section header table last and with a section after it.
-        let root = dir.join("regular");
-        fs::create_dir(&root).unwrap();
-        fs::write(root.join(".DirIcon"), TINY_PNG).unwrap();
-        for class in [2u8, 1] {
-            for section_after_table in [false, true] {
-                let name = format!("regular-{class}-{section_after_table}");
-                let appimage = fake_appimage(&dir, &name, class, &root, section_after_table);
-                assert_eq!(run(&appimage), (true, TINY_PNG.to_vec()), "{name}");
-            }
-        }
-        // No icon at all: a clean failure, which the factory records as one.
-        let root = dir.join("bare");
-        fs::create_dir(&root).unwrap();
-        fs::write(root.join("AppRun"), "#! /bin/sh\n").unwrap();
-        assert_eq!(run(&fake_appimage(&dir, "bare", 2, &root, false)), (false, Vec::new()));
-        // A file posing as a 17 MiB icon: 16 MiB of it come out, no more.
-        let root = dir.join("huge");
-        fs::create_dir(&root).unwrap();
-        File::create(root.join(".DirIcon")).unwrap().set_len(17 << 20).unwrap();
-        let (ok, out) = run(&fake_appimage(&dir, "huge", 2, &root, false));
-        assert!(ok);
-        assert_eq!(out.len(), 16 << 20);
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -412,15 +412,10 @@ the release workflow (`.github/workflows/release.yml`) so that they run on
   time it runs it also gives its own file the Reoling icon in the file
   manager (GNOME Files shows a bare "executable" icon for an AppImage
   otherwise): it writes the thumbnail-cache entries for the file under
-  `~/.cache/thumbnails` from the icon inside, and a per-user thumbnailer
-  entry, `~/.local/share/thumbnailers/reoling-appimage.thumbnailer`, that
-  shows any AppImage with its embedded icon where `squashfs-tools` is
-  installed (it reads the file with `unsquashfs`, never runs it). The entry
-  is written once: delete it to turn it off, and Reoling does not write it
-  again; an edited copy is left alone too. A GNOME Files window that was
-  already open before the first run picks the thumbnailer up after Files is
-  restarted; the Reoling file itself shows its icon as soon as the folder
-  is re-read.
+  `~/.cache/thumbnails` from the icon inside, as a thumbnailer would have,
+  and writes them again when the file is replaced or moved. That is all it
+  touches: it installs no thumbnailer, so nothing of Reoling's runs on
+  other AppImage files. The icon shows as soon as the folder is re-read.
 
 Both packages decode video in hardware where they can: with Decoding set
 to Auto (the default) GStreamer takes the highest-ranked decoder it has,

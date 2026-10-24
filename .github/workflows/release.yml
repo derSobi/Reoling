@@ -111,25 +111,22 @@ jobs:
               exit 1
             fi
             echo "$app ran for 20 s"
-            if [ "$app" = reoling ] && [ -e "$XDG_DATA_HOME/thumbnailers" ]; then
-              echo "::error::the installed reoling wrote a thumbnailer entry; only the AppImage does that"
+            # No build installs a thumbnailer (a program the desktop would
+            # run on every AppImage file the user views).
+            if [ -e "$XDG_DATA_HOME/thumbnailers" ]; then
+              echo "::error::$app wrote a thumbnailer entry; Reoling installs none"
               exit 1
             fi
           done
           # At its start the AppImage (and only the AppImage) gives its own
           # file an icon in the file manager: thumbnail-cache entries for
-          # the file's URI (the runtime names the file by its real path) and
-          # a per-user thumbnailer entry for AppImage files.
-          thumbnailer="$XDG_DATA_HOME/thumbnailers/reoling-appimage.thumbnailer"
+          # the file's URI (the runtime names the file by its real path).
           key=$(printf 'file://%s' "$(realpath dist/Reoling-*.AppImage)" | md5sum | cut -c1-32)
           for size in large x-large; do
             png="$XDG_CACHE_HOME/thumbnails/$size/$key.png"
             test -s "$png" || { echo "::error::the AppImage wrote no $size thumbnail of itself ($png)"; exit 1; }
             file "$png"
           done
-          test -f "$thumbnailer" || { echo "::error::the AppImage wrote no thumbnailer entry ($thumbnailer)"; exit 1; }
-          grep -q '^MimeType=application/vnd.appimage;$' "$thumbnailer"
-          test -f "$XDG_DATA_HOME/reoling/appimage-thumbnailer-installed"
           ls -l dist
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
