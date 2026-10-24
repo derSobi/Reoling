@@ -11,9 +11,11 @@
 !/LICENSE
 !/README.md
 
-# GitHub metadata (the Sponsor button)
+# GitHub metadata (the Sponsor button) and the release workflow
 !/.github/
 !/.github/FUNDING.yml
+!/.github/workflows/
+!/.github/workflows/*.yml
 
 # The project's code
 !/src/**

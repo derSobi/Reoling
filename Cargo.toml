@@ -1,10 +1,10 @@
 [package]
 name = "reoling"
-version = "0.1.27"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.75"
 license = "AGPL-3.0-or-later"
-description = "Reoling, an unofficial Linux client for Reolink cameras, NVRs and Home Hubs over the Baichuan P2P protocol"
+description = "Unofficial Linux client for Reolink cameras, NVRs and Home Hubs (Baichuan P2P)"
 repository = "https://github.com/derSobi/Reoling"
 homepage = "https://reoling.eu"
 
@@ -48,3 +48,47 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
+
+# `cargo deb` (cargo-deb 3.x). Build scripts/build-gst-gtk4-plugin.sh
+# target/gst-gtk4 first: Ubuntu 24.04 has no gstreamer1.0-gtk4, so the
+# package carries the GTK 4 paintable sink in /usr/lib/reoling/gstreamer-1.0,
+# a directory the binary adds to its plugin registry at start (see
+# `scan_private_plugins` in src/main.rs). The package is built on Ubuntu 24.04
+# (GTK 4.14, GStreamer 1.24) and installs on 24.04 and later.
+[package.metadata.deb]
+maintainer = "derSobi <14218571+derSobi@users.noreply.github.com>"
+copyright = "2025-2026, derSobi"
+license-file = ["LICENSE", "0"]
+section = "video"
+priority = "optional"
+extended-description = """\
+An unofficial client for Reolink® devices — cameras, NVRs, and Home Hubs —
+that connects over Reolink's proprietary "Baichuan" P2P protocol using only
+a device's UID (no manual IP/port configuration, no cloud account required)."""
+# $auto: the shared libraries the binary and the plugin link (dpkg-shlibdeps).
+# The GStreamer elements come from these packages: appsrc, decodebin,
+# videoconvert, audioconvert, audioresample, volume, queue, filesink (core
+# and -base); aacparse, qtmux, matroskamux, autoaudiosink (-good); h264parse,
+# h265parse and the va hardware decoders (-bad); avdec_h264, avdec_h265,
+# avdec_aac (libav); a sink for autoaudiosink: pulsesink, pipewiresink or
+# alsasink.
+depends = "$auto, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, gstreamer1.0-pulseaudio | gstreamer1.0-pipewire | gstreamer1.0-alsa"
+# Hardware decoding needs a VA-API driver; the device passwords live in the
+# desktop keyring (org.freedesktop.secrets).
+recommends = "va-driver-all | mesa-va-drivers | intel-media-va-driver, gnome-keyring | kwalletmanager"
+assets = [
+    ["target/release/reoling", "usr/bin/", "755"],
+    ["target/gst-gtk4/libgstgtk4.so", "usr/lib/reoling/gstreamer-1.0/", "644"],
+    ["data/de.dersobi.reoling.desktop", "usr/share/applications/", "644"],
+    ["data/icons/hicolor/16x16/apps/de.dersobi.reoling.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
+    ["data/icons/hicolor/22x22/apps/de.dersobi.reoling.png", "usr/share/icons/hicolor/22x22/apps/", "644"],
+    ["data/icons/hicolor/24x24/apps/de.dersobi.reoling.png", "usr/share/icons/hicolor/24x24/apps/", "644"],
+    ["data/icons/hicolor/32x32/apps/de.dersobi.reoling.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
+    ["data/icons/hicolor/48x48/apps/de.dersobi.reoling.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
+    ["data/icons/hicolor/64x64/apps/de.dersobi.reoling.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["data/icons/hicolor/128x128/apps/de.dersobi.reoling.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["data/icons/hicolor/256x256/apps/de.dersobi.reoling.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["data/icons/hicolor/512x512/apps/de.dersobi.reoling.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+    ["README.md", "usr/share/doc/reoling/", "644"],
+    ["LICENSE", "usr/share/doc/reoling/", "644"],
+]

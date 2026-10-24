@@ -1,23 +1,64 @@
 //! The camera settings window: which camera it is (product picture, model,
-//! firmware) and its video encoding per stream — resolution, frame rate,
-//! bitrate and I-frame interval, offered only as the device itself allows.
+//! firmware), its video encoding per stream — resolution, frame rate,
+//! bitrate and I-frame interval, offered only as the device itself allows —
+//! and, in further tabs, everything else the camera tells about itself,
+//! shown read-only: picture, display, detection, lights and sound,
+//! schedules, network.
 
 use crate::ui::product_image::{self, Category};
+use crate::ui::settings_pages::{self, Context};
+use crate::ui::settings_view::{ReadOnlyPage, LIVE_STOPPED, NOT_CONNECTED, READING, WAITING_FOR_DOWNLOAD};
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Button, DropDown, Grid, Image, Label, Orientation, StringList, Window,
+    Align, Box as GtkBox, Button, DropDown, Grid, Image, Label, Orientation, Stack, StackSwitcher, StringList, Window,
 };
 use reoling::encoding::{
     current_profile, profiles_for, EncodeProfile, EncodedStream, Encoding, GopRange, StreamEncoding,
 };
+use reoling::{CameraPage, ChannelAbilities, DeviceKind, SettingsPage, SettingsTarget};
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 pub struct Handlers {
-    /// Ask the device for this channel's settings again.
+    /// Ask the device for this channel's encoding settings again.
     pub on_reload: Box<dyn Fn(u8)>,
     /// Write these settings (a 57 body) to this channel.
     pub on_save: Box<dyn Fn(u8, String)>,
+    /// Ask the device for one read-only tab of this channel; `false` when
+    /// there is no connection to ask over.
+    pub on_read_page: Box<dyn Fn(u8, CameraPage) -> bool>,
+}
+
+/// The stack name of the Encoding tab; the read-only tabs go by `page_name`.
+const ENCODING_TAB: &str = "encoding";
+
+fn page_name(page: CameraPage) -> &'static str {
+    match page {
+        CameraPage::Info => "info",
+        CameraPage::Image => "image",
+        CameraPage::Display => "display",
+        CameraPage::Detection => "detection",
+        CameraPage::LightSound => "light-sound",
+        CameraPage::Schedules => "schedules",
+        CameraPage::Network => "network",
+    }
+}
+
+fn page_title(page: CameraPage) -> &'static str {
+    match page {
+        CameraPage::Info => "Info",
+        CameraPage::Image => "Image",
+        CameraPage::Display => "Display",
+        CameraPage::Detection => "Detection",
+        CameraPage::LightSound => "Light & sound",
+        CameraPage::Schedules => "Schedules",
+        CameraPage::Network => "Network",
+    }
+}
+
+fn page_of(name: &str) -> Option<CameraPage> {
+    CameraPage::ALL.into_iter().find(|p| page_name(*p) == name)
 }
 
 /// One editable stream's controls and the values behind each list.
@@ -40,12 +81,27 @@ pub struct CameraSettings {
     title: Label,
     model: Label,
     firmware: Label,
+    /// The footer line: the Encoding tab's status (the read-only tabs have
+    /// their own line each).
     status: Label,
+    encoding_status: RefCell<String>,
     save: Button,
+    stack: Stack,
+    /// The read-only tabs, in tab order.
+    pages: Vec<(CameraPage, ReadOnlyPage)>,
+    /// Tabs read at least once since the window was opened.
+    loaded: RefCell<HashSet<CameraPage>>,
+    /// The last answer per tab, shown again when the abilities arrive.
+    answers: RefCell<HashMap<CameraPage, SettingsPage>>,
+    abilities: Cell<Option<ChannelAbilities>>,
     rows: Vec<Rc<StreamRow>>,
     third: Label,
     handlers: Handlers,
     channel: Cell<Option<u8>>,
+    /// The channel's live video is on, so the window has a connection to
+    /// read over; false after Stop or on the Playback page, until the
+    /// window is opened anew for the channel.
+    watched: Cell<bool>,
     encoding: RefCell<Option<Encoding>>,
     /// The device's profiles that cover this channel.
     profiles: RefCell<Vec<EncodeProfile>>,
@@ -90,7 +146,7 @@ fn position(values: &mut Vec<u32>, value: u32) -> usize {
 
 impl CameraSettings {
     pub fn new(handlers: Handlers) -> Rc<Self> {
-        let window = Window::builder().title("Camera settings").resizable(false).build();
+        let window = Window::builder().title("Camera settings").default_width(760).default_height(640).build();
         window.connect_close_request(|w| {
             w.set_visible(false);
             gtk4::glib::Propagation::Stop
@@ -122,9 +178,22 @@ impl CameraSettings {
         header.append(&about);
         root.append(&header);
 
+        // The tabs: Encoding (editable, as before) and the read-only pages.
+        let stack = Stack::new();
+        stack.set_vexpand(true);
+        stack.set_transition_type(gtk4::StackTransitionType::None);
+        let switcher = StackSwitcher::new();
+        switcher.set_stack(Some(&stack));
+        switcher.set_halign(Align::Center);
+        root.append(&switcher);
+        root.append(&stack);
+
         // Encoding, one row per stream.
+        let encoding_page = GtkBox::new(Orientation::Vertical, 16);
+        encoding_page.set_margin_top(4);
+        encoding_page.set_valign(Align::Start);
         let heading = Label::builder().label("Encoding").xalign(0.0).css_classes(["heading"]).build();
-        root.append(&heading);
+        encoding_page.append(&heading);
         let grid = Grid::builder().row_spacing(8).column_spacing(10).build();
         for (col, text) in ["Stream", "Resolution", "Frame rate", "Bitrate", "I-frame interval", "Codec"].iter().enumerate() {
             grid.attach(&Label::builder().label(*text).xalign(0.0).css_classes(["dim-label"]).build(), col as i32, 0, 1, 1);
@@ -157,7 +226,15 @@ impl CameraSettings {
         let third = Label::builder().xalign(0.0).css_classes(["dim-label"]).build();
         grid.attach(&Label::builder().label(stream_label(EncodedStream::Third)).xalign(0.0).build(), 0, 3, 1, 1);
         grid.attach(&third, 1, 3, 5, 1);
-        root.append(&grid);
+        encoding_page.append(&grid);
+        stack.add_titled(&encoding_page, Some(ENCODING_TAB), "Encoding");
+
+        let mut pages = Vec::new();
+        for page in CameraPage::ALL {
+            let view = ReadOnlyPage::new();
+            stack.add_titled(view.widget(), Some(page_name(page)), page_title(page));
+            pages.push((page, view));
+        }
 
         let footer = GtkBox::new(Orientation::Horizontal, 8);
         let status = Label::builder().xalign(0.0).hexpand(true).wrap(true).build();
@@ -177,11 +254,18 @@ impl CameraSettings {
             model,
             firmware,
             status,
+            encoding_status: RefCell::new(String::new()),
             save: save.clone(),
+            stack: stack.clone(),
+            pages,
+            loaded: RefCell::new(HashSet::new()),
+            answers: RefCell::new(HashMap::new()),
+            abilities: Cell::new(None),
             rows,
             third,
             handlers,
             channel: Cell::new(None),
+            watched: Cell::new(true),
             encoding: RefCell::new(None),
             profiles: RefCell::new(Vec::new()),
             profile: RefCell::new(None),
@@ -191,7 +275,17 @@ impl CameraSettings {
         let weak = Rc::downgrade(&this);
         reload.connect_clicked(move |_| {
             if let Some(s) = weak.upgrade() {
-                s.reload();
+                match s.current_page() {
+                    Some(page) => s.read_page(page),
+                    None => s.reload(),
+                }
+            }
+        });
+        // A tab is read the first time it is shown; Save belongs to Encoding.
+        let weak = Rc::downgrade(&this);
+        stack.connect_visible_child_name_notify(move |_| {
+            if let Some(s) = weak.upgrade() {
+                s.tab_changed();
             }
         });
         let weak = Rc::downgrade(&this);
@@ -213,23 +307,179 @@ impl CameraSettings {
         this
     }
 
-    /// Opens the window for one channel of a device.
-    pub fn open(&self, title: &str, channel: u8, model: &str, device_profiles: &[EncodeProfile]) {
+    /// Opens the window for one channel of a device, on the Encoding tab.
+    /// `kind` is the device the channel belongs to (an NVR's cameras have
+    /// no Network tab) and `abilities` what the channel's camera can do, as
+    /// far as the device has said. A window already on screen is not raised
+    /// (see `present`): it is opened again for every channel the sidebar
+    /// switches to.
+    pub fn open(
+        &self,
+        title: &str,
+        channel: u8,
+        model: &str,
+        device_profiles: &[EncodeProfile],
+        kind: DeviceKind,
+        abilities: Option<ChannelAbilities>,
+    ) {
         self.channel.set(Some(channel));
+        self.watched.set(true);
+        self.abilities.set(abilities);
         self.title.set_text(title);
         self.set_model(model, None);
         *self.profiles.borrow_mut() = profiles_for(device_profiles, channel).into_iter().cloned().collect();
         *self.encoding.borrow_mut() = None;
         self.clear_rows();
-        self.status.set_text("Reading the camera's settings…");
+        self.loaded.borrow_mut().clear();
+        self.answers.borrow_mut().clear();
+        for (_, view) in &self.pages {
+            view.clear();
+        }
+        // Encoding first, then the Network tab is hidden where it does not
+        // apply: hiding the tab on show would make the stack pick another
+        // one, which would then be read for nothing.
+        self.stack.set_visible_child_name(ENCODING_TAB);
+        for (page, view) in &self.pages {
+            // An NVR answers a camera's network read with its own address
+            // block, so that tab is left out there.
+            let shown = *page != CameraPage::Network || kind != DeviceKind::Nvr;
+            self.stack.page(view.widget()).set_visible(shown);
+        }
+        self.show_status("Reading the camera's settings…");
         self.save.set_sensitive(false);
+        if !self.window.is_visible() {
+            self.present();
+        }
+        (self.handlers.on_reload)(channel);
+    }
+
+    /// Raises the window, with the focus on Save. `open` leaves a window
+    /// already on screen where it is: opened again for another channel
+    /// while the sidebar is being clicked, it must not come over the main
+    /// window and take the keyboard.
+    pub fn present(&self) {
         self.window.present();
         gtk4::prelude::GtkWindowExt::set_focus(&self.window, Some(&self.save));
-        (self.handlers.on_reload)(channel);
+    }
+
+    /// The channel's abilities, when they arrive after the window opened:
+    /// the rows they gate are shown again.
+    pub fn set_abilities(&self, channel: u8, abilities: ChannelAbilities) {
+        if self.channel.get() != Some(channel) || self.abilities.get() == Some(abilities) {
+            return;
+        }
+        self.abilities.set(Some(abilities));
+        let answers: Vec<SettingsPage> = self.answers.borrow().values().cloned().collect();
+        for page in answers {
+            self.render(&page);
+        }
+    }
+
+    /// One read-only tab's answer; ignored unless it is this channel's.
+    pub fn set_page(&self, page: &SettingsPage) {
+        let SettingsTarget::Camera { channel, page: which } = page.target() else { return };
+        if self.channel.get() != Some(channel) {
+            return;
+        }
+        self.answers.borrow_mut().insert(which, page.clone());
+        self.render(page);
+    }
+
+    /// A download holds the connection; the tab is read once it is over.
+    pub fn page_deferred(&self, target: &SettingsTarget) {
+        let SettingsTarget::Camera { channel, page } = target else { return };
+        if self.channel.get() != Some(*channel) {
+            return;
+        }
+        if let Some(view) = self.view(*page) {
+            view.set_status(WAITING_FOR_DOWNLOAD);
+        }
+    }
+
+    fn render(&self, page: &SettingsPage) {
+        let SettingsTarget::Camera { page: which, .. } = page.target() else { return };
+        let Some(view) = self.view(which) else { return };
+        let ctx = Context { abilities: self.abilities.get(), ..Context::default() };
+        view.show(&settings_pages::build(page, &ctx));
+    }
+
+    fn view(&self, page: CameraPage) -> Option<&ReadOnlyPage> {
+        self.pages.iter().find(|(p, _)| *p == page).map(|(_, v)| v)
+    }
+
+    /// The read-only tab on show, or `None` for Encoding.
+    fn current_page(&self) -> Option<CameraPage> {
+        self.stack.visible_child_name().and_then(|name| page_of(&name))
+    }
+
+    fn tab_changed(&self) {
+        let current = self.current_page();
+        self.save.set_visible(current.is_none());
+        let footer = if current.is_none() { self.encoding_status.borrow().clone() } else { String::new() };
+        self.status.set_text(&footer);
+        if let Some(page) = current {
+            if !self.loaded.borrow().contains(&page) {
+                self.read_page(page);
+            }
+        }
+    }
+
+    /// Asks the device for one read-only tab.
+    fn read_page(&self, page: CameraPage) {
+        let Some(channel) = self.channel.get() else { return };
+        let Some(view) = self.view(page) else { return };
+        if !self.watched.get() {
+            view.set_status(LIVE_STOPPED);
+            return;
+        }
+        if !(self.handlers.on_read_page)(channel, page) {
+            // Not marked loaded: the tab asks again the next time it is shown.
+            view.set_status(NOT_CONNECTED);
+            return;
+        }
+        self.loaded.borrow_mut().insert(page);
+        view.set_status(READING);
+    }
+
+    /// The footer line, which belongs to the Encoding tab.
+    fn show_status(&self, text: &str) {
+        *self.encoding_status.borrow_mut() = text.to_string();
+        if self.current_page().is_none() {
+            self.status.set_text(text);
+        }
     }
 
     pub fn is_open_for(&self, channel: u8) -> bool {
         self.window.is_visible() && self.channel.get() == Some(channel)
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.window.is_visible()
+    }
+
+    /// The watched channel's connection is gone: nothing can be read or
+    /// saved until it is watched again (the window is then opened anew).
+    pub fn lost(&self, reason: &str) {
+        self.show_status(&format!("Not connected: {reason}"));
+        self.save.set_sensitive(false);
+        self.loaded.borrow_mut().clear();
+        if let Some(view) = self.current_page().and_then(|page| self.view(page)) {
+            view.set_status(NOT_CONNECTED);
+        }
+    }
+
+    /// The channel's live video was stopped (the Stop button, the Playback
+    /// page): the device stays connected, but the window reads and saves
+    /// nothing more until the channel is watched again, when it is opened
+    /// anew. The tabs say so, not "Not connected".
+    pub fn live_stopped(&self) {
+        self.watched.set(false);
+        self.show_status(LIVE_STOPPED);
+        self.save.set_sensitive(false);
+        self.loaded.borrow_mut().clear();
+        if let Some(view) = self.current_page().and_then(|page| self.view(page)) {
+            view.set_status(LIVE_STOPPED);
+        }
     }
 
     /// Whether the window still needs the channel's own allowed values
@@ -257,7 +507,7 @@ impl CameraSettings {
 
     pub fn set_encoding(&self, encoding: Option<Encoding>) {
         let Some(encoding) = encoding else {
-            self.status.set_text("The camera did not give its encoding settings.");
+            self.show_status("The camera did not give its encoding settings.");
             return;
         };
         let profiles = self.profiles.borrow().clone();
@@ -273,10 +523,10 @@ impl CameraSettings {
         self.filling.set(false);
         *self.encoding.borrow_mut() = Some(encoding);
         if profile.is_some() {
-            self.status.set_text("");
+            self.show_status("");
             self.save.set_sensitive(true);
         } else {
-            self.status.set_text("The camera did not say which values it allows, so its settings are shown but cannot be changed here.");
+            self.show_status("The camera did not say which values it allows, so its settings are shown but cannot be changed here.");
             self.save.set_sensitive(false);
             for row in &self.rows {
                 for d in [&row.resolution, &row.frame_rate, &row.bitrate, &row.gop] {
@@ -289,22 +539,26 @@ impl CameraSettings {
     /// The device's answer to a save.
     pub fn saved(&self, code: u16) {
         if code == 200 {
-            self.status.set_text("Saved. The live picture restarts with the new settings.");
+            self.show_status("Saved. The live picture restarts with the new settings.");
             self.reload_quietly();
         } else {
-            self.status.set_text(&format!("The camera refused the change (code {code})."));
+            self.show_status(&format!("The camera refused the change (code {code})."));
             self.save.set_sensitive(true);
         }
     }
 
     pub fn failed(&self, reason: &str) {
-        self.status.set_text(reason);
+        self.show_status(reason);
         self.save.set_sensitive(true);
     }
 
     fn reload(&self) {
         let Some(channel) = self.channel.get() else { return };
-        self.status.set_text("Reading the camera's settings…");
+        if !self.watched.get() {
+            self.show_status(LIVE_STOPPED);
+            return;
+        }
+        self.show_status("Reading the camera's settings…");
         (self.handlers.on_reload)(channel);
     }
 
@@ -441,11 +695,11 @@ impl CameraSettings {
             }
         }
         if !changed && std::env::var("REOLING_ENCODING_NOOP_WRITE").is_err() {
-            self.status.set_text("Nothing changed.");
+            self.show_status("Nothing changed.");
             return;
         }
         self.save.set_sensitive(false);
-        self.status.set_text("Saving…");
+        self.show_status("Saving…");
         (self.handlers.on_save)(channel, body);
     }
 }

@@ -18,7 +18,7 @@
 //! footage time in every opening of the file.
 
 use super::*;
-use crate::protocol::bcmedia::model::{keyframe_unix_time, parse_info_block, InfoBlock};
+use crate::protocol::bcmedia::model::{keyframe_unix_time, parse_info_block, parse_one_within, InfoBlock, RECORDED_UNIT_LIMITS};
 use crate::protocol::time::CivilTime;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -1069,13 +1069,25 @@ enum MediaUnit {
     Audio(Vec<u8>),
 }
 
+/// The most a partial unit may hold in the assembler's buffer: the largest
+/// unit the parser believes (see `RECORDED_UNIT_LIMITS`) plus its padding.
+/// The parser refuses a header claiming more, so a buffer past this means
+/// the parser stopped completing units; it is cleared then, so that what
+/// a device sends can never be held in memory without bound.
+const MAX_PARTIAL_UNIT_BYTES: usize = 24 + RECORDED_UNIT_LIMITS.extra_header + RECORDED_UNIT_LIMITS.payload + 8;
+
 /// Turns the payloads of recorded-media data messages into BcMedia units:
 /// the camera's self-check, the unit buffer and the resync after a damaged
-/// unit (the synchronous steps a playback and a download share).
+/// unit (the synchronous steps a playback and a download share). A unit
+/// header claiming more than `RECORDED_UNIT_LIMITS` is treated as damage:
+/// the buffer resyncs at the next unit instead of waiting for a unit that
+/// would never complete (and growing by everything received meanwhile).
 #[derive(Default)]
 struct MediaAssembler {
     buffer: Vec<u8>,
     guard: MediaGuard,
+    /// How often the buffer was cleared for passing `MAX_PARTIAL_UNIT_BYTES`.
+    overflows: u32,
 }
 
 impl MediaAssembler {
@@ -1096,9 +1108,31 @@ impl MediaAssembler {
             }
         }
         self.buffer.extend_from_slice(&payload);
+        let units = self.take_units(&mut on_keyframe);
+        self.drop_oversized_partial();
+        units
+    }
+
+    /// Clears the buffer when a partial unit has grown past
+    /// `MAX_PARTIAL_UNIT_BYTES` (which the parser's limits should never let
+    /// happen); whether it did.
+    fn drop_oversized_partial(&mut self) -> bool {
+        if self.buffer.len() <= MAX_PARTIAL_UNIT_BYTES {
+            return false;
+        }
+        self.buffer.clear();
+        self.overflows += 1;
+        if debug_replay() {
+            eprintln!("replay: dropped an oversized partial unit (#{})", self.overflows);
+        }
+        true
+    }
+
+    /// The units complete at the start of the buffer, taken out of it.
+    fn take_units(&mut self, on_keyframe: &mut impl FnMut(&[u8])) -> Vec<MediaUnit> {
         let mut units = Vec::new();
         loop {
-            match parse_one(&self.buffer) {
+            match parse_one_within(&self.buffer, &RECORDED_UNIT_LIMITS) {
                 Ok(Some((unit, used))) => {
                     let unit = match unit {
                         BcMediaMessage::Info { width, height } => Some(MediaUnit::Info(
@@ -2765,7 +2799,10 @@ impl ReolinkClient {
     /// ([`ReolinkClient::stop_replay`]), and no playback or search is
     /// possible until the download ended ([`DownloadUnit::Done`]) or was
     /// stopped ([`ReolinkClient::stop_download`]). Pushes keep being
-    /// delivered through `take_channel_updates` meanwhile.
+    /// delivered through `take_channel_updates` meanwhile. A request the
+    /// device does not answer in time fails, but is ended on the device
+    /// all the same: [`ReolinkClient::download_running`] stays true until
+    /// the device has stopped sending (wait for that with `stop_download`).
     pub async fn download_range(
         &mut self,
         channel_id: u8,
@@ -2773,7 +2810,7 @@ impl ReolinkClient {
         start: CivilTime,
         end: CivilTime,
     ) -> crate::Result<DownloadStream> {
-        self.download_range_with(channel_id, stream, start, end, None).await
+        self.download_range_with(channel_id, stream, start, end, None, REPLY_TIMEOUT).await
     }
 
     /// Diagnostic-only: [`ReolinkClient::download_range`], reporting every
@@ -2787,9 +2824,16 @@ impl ReolinkClient {
         end: CivilTime,
         tag: &str,
     ) -> crate::Result<DownloadStream> {
-        self.download_range_with(channel_id, stream, start, end, Some(tag)).await
+        self.download_range_with(channel_id, stream, start, end, Some(tag), REPLY_TIMEOUT).await
     }
 
+    /// `download_range`, waiting at most `wait` for the device's answer to
+    /// the request. A request that gets no answer in time may have been
+    /// accepted all the same (a relay has been seen to pause for tens of
+    /// seconds): a reader then takes the download over, ends it and drops
+    /// what the device still sends (see `abandon_download`), so that the
+    /// error leaves the connection usable, and `download_running` is true
+    /// until that is over.
     async fn download_range_with(
         &mut self,
         channel_id: u8,
@@ -2797,6 +2841,7 @@ impl ReolinkClient {
         start: CivilTime,
         end: CivilTime,
         probe: Option<&str>,
+        wait: Duration,
     ) -> crate::Result<DownloadStream> {
         self.close_finished_replay().await;
         self.ensure_no_stream("downloading a recording")?;
@@ -2817,33 +2862,69 @@ impl ReolinkClient {
         // The data come as fast as the path carries them: the bound a
         // playback gets on unread data, not live video's.
         self.connection.lock().await.set_replay_buffering(true);
-        let opened = match self.open_download(channel_id, request, probe).await {
-            Ok(opened) => opened,
+        let request_msg_num = match self.send_request(MSG_ID_DOWNLOAD, channel_id, request).await {
+            Ok(msg_num) => msg_num,
             Err(e) => {
+                // Nothing went out: the device knows of no download.
                 self.connection.lock().await.set_replay_buffering(false);
                 return Err(e);
             }
         };
-        let (request_msg_num, estimate, file_count, early) = opened;
+        let (estimate, file_count, early) = match self.await_download_answer(request_msg_num, probe, wait).await {
+            Ok(answer) => answer,
+            Err(Error::ReplyTimeout) => {
+                // The request is out and unanswered: the device may have
+                // accepted it and be sending the range. The reader that
+                // takes it over ends it and keeps the playback's bound on
+                // unread data until the device has stopped.
+                self.abandon_download(channel_id, request_msg_num, probe);
+                return Err(Error::ReplyTimeout);
+            }
+            Err(e) => {
+                // The device refused (it started nothing), or the
+                // connection failed: no download to end.
+                self.connection.lock().await.set_replay_buffering(false);
+                return Err(e);
+            }
+        };
         let end_msg_num = self.next_msg_num();
         let cancel = DownloadCancel::default();
-        let units = self.spawn_download_task(channel_id, request_msg_num, end_msg_num, estimate, early, cancel.clone(), probe);
+        let (tx, rx) = channel(32);
+        self.spawn_download_task(channel_id, request_msg_num, end_msg_num, estimate, early, cancel.clone(), Some(tx), probe);
         self.download_cancel = Some(cancel.clone());
-        Ok(DownloadStream { units, estimate, file_count, cancel })
+        Ok(DownloadStream { units: ReceiverStream::new(rx), estimate, file_count, cancel })
     }
 
-    /// Sends the request and reads its answer: the size estimate (XML),
-    /// or, should a device send none, the first data (handed to the
-    /// reader). Returns the request's `msg_num`, the estimate, the file
-    /// count and any data read.
-    async fn open_download(
+    /// A download requested (with `request_msg_num`) and not answered in
+    /// time, which the device may be sending all the same: a reader with
+    /// no one to hand units to takes it over. Its first step is the end
+    /// request; it then drops what the device still sends until that has
+    /// stopped (see `DownloadRun::finished`), as after a cancel, and
+    /// `download_running` says so meanwhile. Nothing is waited for here;
+    /// the next request that reads its own answers waits for the reader
+    /// (`finish_cancelled_download`), as does [`ReolinkClient::stop_download`].
+    fn abandon_download(&mut self, channel_id: u8, request_msg_num: u16, probe: Option<&str>) {
+        let end_msg_num = self.next_msg_num();
+        let cancel = DownloadCancel::default();
+        cancel.cancel();
+        if let Some(tag) = probe {
+            eprintln!("PROBE download [{tag}]: no answer in time; ending the download the device may have started");
+        }
+        self.spawn_download_task(channel_id, request_msg_num, end_msg_num, None, Vec::new(), cancel.clone(), None, probe);
+        self.download_cancel = Some(cancel);
+    }
+
+    /// Reads the answer to the download request sent with `msg_num`: the
+    /// size estimate (XML), or, should a device send none, the first data
+    /// (handed to the reader). Returns the estimate, the file count and
+    /// any data read.
+    async fn await_download_answer(
         &mut self,
-        channel_id: u8,
-        request: Vec<u8>,
+        msg_num: u16,
         probe: Option<&str>,
-    ) -> crate::Result<(u16, Option<u64>, Option<u32>, Vec<Bc>)> {
-        let msg_num = self.send_request(MSG_ID_DOWNLOAD, channel_id, request).await?;
-        let (reply, _) = self.await_reply_counting(MSG_ID_DOWNLOAD, msg_num, REPLY_TIMEOUT).await?;
+        wait: Duration,
+    ) -> crate::Result<(Option<u64>, Option<u32>, Vec<Bc>)> {
+        let (reply, _) = self.await_reply_counting(MSG_ID_DOWNLOAD, msg_num, wait).await?;
         let kind = download_message(&reply);
         if let Some(tag) = probe {
             eprintln!(
@@ -2858,7 +2939,7 @@ impl ReolinkClient {
         }
         match kind {
             DownloadMessage::Data | DownloadMessage::NextFile | DownloadMessage::EndMarker => {
-                return Ok((msg_num, None, None, vec![reply]))
+                return Ok((None, None, vec![reply]))
             }
             DownloadMessage::Reply => {}
             DownloadMessage::NotOurs | DownloadMessage::Other(_) => expect_ok(&reply, "download")?,
@@ -2885,9 +2966,13 @@ impl ReolinkClient {
                 entry.as_ref().and_then(|e| e.size_h),
             );
         }
-        Ok((msg_num, estimate, file_count, Vec::new()))
+        Ok((estimate, file_count, Vec::new()))
     }
 
+    /// Starts the reader of a download (see `run_download`), handing its
+    /// units to `tx`; with `None` there is no one to hand them to, and the
+    /// reader ends the download at once (see `abandon_download`).
+    #[allow(clippy::too_many_arguments)]
     fn spawn_download_task(
         &mut self,
         channel_id: u8,
@@ -2896,9 +2981,9 @@ impl ReolinkClient {
         estimate: Option<u64>,
         early: Vec<Bc>,
         cancel: DownloadCancel,
+        tx: Option<tokio::sync::mpsc::Sender<crate::Result<DownloadUnit>>>,
         probe: Option<&str>,
-    ) -> ReceiverStream<crate::Result<DownloadUnit>> {
-        let (tx, rx) = channel(32);
+    ) {
         let connection = Arc::clone(&self.connection);
         let encryption = self.encryption.clone();
         let channel_updates = self.channel_updates_tx.clone();
@@ -2917,7 +3002,7 @@ impl ReolinkClient {
         };
         let run = DownloadRun {
             reader: DownloadReader::new(request_msg_num, probe.map(str::to_string)),
-            tx: Some(tx),
+            tx,
             cancel,
             end_request,
             estimate,
@@ -2935,7 +3020,6 @@ impl ReolinkClient {
             connection.lock().await.set_replay_buffering(false);
             summary
         }));
-        ReceiverStream::new(rx)
     }
 
     /// Whether a download's reader is running on this client (its data
@@ -4264,6 +4348,61 @@ mod tests {
         assert!(matches!(units.as_slice(), [(BcMediaMessage::Video(f), None)] if f.data == vec![5; 40]));
     }
 
+    /// A key frame header claiming `payload` payload bytes and `extra`
+    /// bytes of extra header, with nothing after it.
+    fn header_claiming(payload: u32, extra: u32) -> Vec<u8> {
+        let mut header = iframe_unit(1, &[], true);
+        header[8..12].copy_from_slice(&payload.to_le_bytes());
+        header[12..16].copy_from_slice(&extra.to_le_bytes());
+        header
+    }
+
+    #[test]
+    fn a_unit_header_claiming_an_absurd_length_is_skipped_and_the_stream_recovers() {
+        for header in [header_claiming(u32::MAX, 0), header_claiming(0, u32::MAX)] {
+            let mut media = MediaAssembler::default();
+            assert!(media.feed(replay_data(5, header), |_| {}).is_empty());
+            // The data that would have been the unit's payload keep coming;
+            // nothing is handed on, and nothing accumulates either.
+            for _ in 0..100 {
+                assert!(media.feed(replay_data(5, vec![0x55; 1300]), |_| {}).is_empty());
+                assert!(media.buffer.len() < 1300, "{} bytes held", media.buffer.len());
+            }
+            assert_eq!((media.guard.resyncs, media.overflows), (0, 0));
+            // The next real unit is found and handed on.
+            let units = media.feed(replay_data(5, iframe_unit(9, &[0, 0, 0, 1, 0x65], true)), |_| {});
+            assert!(matches!(units.as_slice(), [MediaUnit::Video(f, None)] if f.is_keyframe && f.microseconds == 9));
+            assert!(media.buffer.is_empty());
+        }
+        // The download's reader goes the same way.
+        let mut reader = DownloadReader::new(7, None);
+        assert!(reader.feed(download_data(7, header_claiming(u32::MAX, 0))).is_empty());
+        for _ in 0..10 {
+            assert!(reader.feed(download_data(7, vec![0x55; 1300])).is_empty());
+        }
+        let units = reader.feed(download_data(7, [info_block(), iframe_unit(3, &[1], true)].concat()));
+        assert!(matches!(units.as_slice(), [DownloadUnit::Info(_), DownloadUnit::Video(f)] if f.microseconds == 3));
+    }
+
+    #[test]
+    fn a_partial_unit_past_the_bound_is_dropped() {
+        // The parser's limits keep the buffer below the bound; should a
+        // partial unit ever pass it all the same, it is dropped.
+        let mut media = MediaAssembler::default();
+        media.buffer = vec![0x55; MAX_PARTIAL_UNIT_BYTES];
+        assert!(!media.drop_oversized_partial());
+        assert_eq!(media.buffer.len(), MAX_PARTIAL_UNIT_BYTES);
+        media.buffer.push(0x55);
+        assert!(media.drop_oversized_partial());
+        assert!(media.buffer.is_empty());
+        assert_eq!(media.overflows, 1);
+        // The bound holds the largest unit the parser believes.
+        let largest = header_claiming(RECORDED_UNIT_LIMITS.payload as u32, RECORDED_UNIT_LIMITS.extra_header as u32);
+        assert!(media.feed(replay_data(5, largest), |_| {}).is_empty());
+        assert_eq!(media.buffer.len(), 24, "waited for, not refused");
+        assert_eq!(media.overflows, 1);
+    }
+
     #[test]
     fn the_probe_opens_a_finished_file_and_looks_back_one_month() {
         let a = file("a", t(8, 0, 0), t(9, 0, 0));
@@ -4474,7 +4613,74 @@ mod tests {
         });
         let refused = client.download_range(0, RecordStream::Sub, t(1, 0, 0), t(1, 1, 0)).await;
         assert!(refused.is_err());
+        assert!(!client.download_running(), "the device never started: nothing to end");
+        assert_eq!(client.search_month(0, 2026, 10).await.unwrap(), Vec::<u8>::new());
+        fake.await.unwrap();
+    }
+
+    /// How long the two tests below let the client wait for the answer to
+    /// its request (the real wait is `REPLY_TIMEOUT`).
+    const SHORT_ANSWER_WAIT: Duration = Duration::from_millis(300);
+
+    #[tokio::test]
+    async fn an_unanswered_download_request_is_ended_and_its_late_data_drained() {
+        let (mut client, mut device) = client_and_device().await;
+        let (start, end) = (t(1, 0, 0), t(1, 0, 30));
+        let expected = DownloadRequest::new(0, None, RecordStream::Sub, start, end);
+        let fake = tokio::spawn(async move {
+            let request = device.recv_bc(&PLAIN).await.unwrap();
+            assert_eq!(request.meta.msg_id, MSG_ID_DOWNLOAD);
+            assert_eq!(DownloadRequest::from_bytes(&body_of(&request)).unwrap(), expected);
+            let msg_num = request.meta.msg_num;
+            // The path pauses: the answer and the first data come once the
+            // client has given the request up.
+            tokio::time::sleep(SHORT_ANSWER_WAIT * 2).await;
+            device.send_bc(&reply(MSG_ID_DOWNLOAD, msg_num, Some(download_xml_reply(1_048_576, 1))), &PLAIN).await.unwrap();
+            device.send_bc(&download_data(msg_num, info_block()), &PLAIN).await.unwrap();
+            device.send_bc(&download_data(msg_num, iframe_unit(1, &[1], true)), &PLAIN).await.unwrap();
+            // The client has ended the download meanwhile; one more chunk
+            // is in flight, then the answer to the end request.
+            let end = expect_end_request(&mut device).await;
+            device.send_bc(&download_data(msg_num, iframe_unit(2, &[2], false)), &PLAIN).await.unwrap();
+            device.send_bc(&reply(MSG_ID_DOWNLOAD_END, end.meta.msg_num, None), &PLAIN).await.unwrap();
+            // No second request follows, and the connection is usable.
+            answer_calendar(&mut device).await;
+        });
+        let result = client.download_range_with(0, RecordStream::Sub, start, end, None, SHORT_ANSWER_WAIT).await;
+        assert!(matches!(result, Err(Error::ReplyTimeout)), "no answer in time");
+        assert!(client.download_running(), "the request went out: a reader ends what the device may send");
+        let summary = client.stop_download().await.expect("the reader's summary");
+        assert!(summary.cancelled && !summary.complete);
+        assert_eq!((summary.chunks, summary.chunks_after_cancel, summary.end_reply), (3, 3, Some(200)));
+        assert_eq!((summary.info_blocks, summary.video_frames), (0, 0), "nothing was handed on");
         assert!(!client.download_running());
+        assert_eq!(client.search_month(0, 2026, 10).await.unwrap(), Vec::<u8>::new());
+        assert!(client.download_task.is_none());
+        fake.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_download_request_the_device_never_answers_is_released_within_the_drain_wait() {
+        let (mut client, mut device) = client_and_device().await;
+        let fake = tokio::spawn(async move {
+            let request = device.recv_bc(&PLAIN).await.unwrap();
+            assert_eq!(request.meta.msg_id, MSG_ID_DOWNLOAD);
+            // The device says nothing to the request, nor to the end
+            // request that follows it; the connection is usable afterwards.
+            expect_end_request(&mut device).await;
+            answer_calendar(&mut device).await;
+        });
+        let result = client.download_range_with(0, RecordStream::Sub, t(1, 0, 0), t(1, 1, 0), None, SHORT_ANSWER_WAIT).await;
+        assert!(matches!(result, Err(Error::ReplyTimeout)));
+        assert!(client.download_running());
+        let began = Instant::now();
+        let summary = client.stop_download().await.expect("the reader's summary");
+        assert!(
+            began.elapsed() < DOWNLOAD_END_REPLY_WAIT + DOWNLOAD_DRAIN_QUIET + 2 * READ_SLICE,
+            "released after {:?}",
+            began.elapsed()
+        );
+        assert!(summary.cancelled && summary.end_reply.is_none() && summary.chunks == 0);
         assert_eq!(client.search_month(0, 2026, 10).await.unwrap(), Vec::<u8>::new());
         fake.await.unwrap();
     }

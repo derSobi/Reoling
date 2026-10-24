@@ -1,0 +1,113 @@
+# Builds the release packages on Ubuntu 24.04 (the oldest supported target:
+# glibc 2.39, GTK 4.14, GStreamer 1.24) so that they install on 24.04 and
+# later: reoling_<version>-1_amd64.deb and Reoling-<version>-x86_64.AppImage.
+#
+# Triggers: a pushed tag v<version> (a GitHub release created from the web
+# UI pushes its tag) uploads both files to that tag's release; a manual run
+# (workflow_dispatch) builds the branch or commit it is dispatched on and
+# only keeps them as a workflow artifact. Either way the version named by
+# the tag or the input must be the one in Cargo.toml.
+name: Release packages
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version being packaged, as in Cargo.toml (for example 1.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  packages:
+    name: .deb and AppImage (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check the version against Cargo.toml
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          case "$GITHUB_EVENT_NAME" in
+            push) wanted=${GITHUB_REF_NAME#v} ;;
+            *)    wanted=${INPUT_VERSION#v} ;;
+          esac
+          if [ "$crate" != "$wanted" ]; then
+            echo "::error::Cargo.toml has version $crate, the release asks for $wanted"
+            exit 1
+          fi
+          echo "version=$crate" >> "$GITHUB_OUTPUT"
+          echo "Packaging reoling $crate"
+
+      - name: Install the Ubuntu 24.04 packages
+        run: |
+          sudo apt-get update
+          # shellcheck disable=SC2046
+          sudo apt-get install -y --no-install-recommends $(grep -v '^#' scripts/noble-packages.txt)
+
+      - name: Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          cargo --version
+          rustc --version
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: xvfb-run -a cargo test --release --locked
+
+      - name: GTK 4 paintable sink plugin
+        run: scripts/build-gst-gtk4-plugin.sh target/gst-gtk4
+
+      - name: Debian package
+        run: |
+          cargo install cargo-deb --locked --version 3.8.0
+          cargo deb
+          mkdir -p dist
+          cp target/debian/reoling_*.deb dist/
+
+      - name: AppImage
+        run: |
+          scripts/fetch-appimage-tools.sh "$RUNNER_TEMP/appimage-tools"
+          APPIMAGE_TOOLS="$RUNNER_TEMP/appimage-tools" scripts/build-appimage.sh target/release/reoling dist
+
+      - name: Smoke tests
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sudo apt-get install -y ./dist/reoling_*.deb
+          test "$(xvfb-run -a reoling --version)" = "reoling $VERSION"
+          chmod +x dist/Reoling-*.AppImage
+          test "$(xvfb-run -a dist/Reoling-*.AppImage --version)" = "reoling $VERSION"
+          ls -l dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reoling-packages
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Upload to the release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$GITHUB_REF_NAME
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            # The tag arrived without a release: make a draft one to hold the
+            # files, for the maintainer to publish.
+            gh release create "$tag" --draft --verify-tag --title "Reoling ${tag#v}" --generate-notes
+          fi
+          gh release upload "$tag" dist/reoling_*.deb dist/Reoling-*.AppImage --clobber
