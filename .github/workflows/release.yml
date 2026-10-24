@@ -92,17 +92,19 @@ jobs:
           # bus and an empty configuration (no devices to reach): it must
           # still be running when the time is up (124 from timeout), and
           # nothing it loads may have failed to (a module, a pixbuf loader,
-          # a symbol, a decoder).
+          # a GStreamer plugin, a library, a symbol, a decoder). Ubuntu's
+          # xvfb-run sends the program's stderr to its stdout, so the log
+          # takes both.
           export XDG_CONFIG_HOME="$RUNNER_TEMP/smoke-config" XDG_CACHE_HOME="$RUNNER_TEMP/smoke-cache" XDG_DATA_HOME="$RUNNER_TEMP/smoke-data"
           smoke() {
             rc=0
-            dbus-run-session -- xvfb-run -a timeout 20 "$1" 2> "$RUNNER_TEMP/smoke-stderr.log" || rc=$?
-            cat "$RUNNER_TEMP/smoke-stderr.log"
+            dbus-run-session -- xvfb-run -a timeout 20 "$1" > "$RUNNER_TEMP/smoke.log" 2>&1 || rc=$?
+            cat "$RUNNER_TEMP/smoke.log"
             if [ "$rc" -ne 124 ]; then
               echo "::error::$1 ended early with status $rc"
               exit 1
             fi
-            if grep -E 'Unable to load image-loading module|Failed to load module|symbol lookup error|undefined symbol|Missing decoder' "$RUNNER_TEMP/smoke-stderr.log"; then
+            if grep -E 'Unable to load image-loading module|Failed to load module|Failed to load plugin|cannot open shared object file|symbol lookup error|undefined symbol|Missing decoder' "$RUNNER_TEMP/smoke.log"; then
               echo "::error::$1 printed a loading failure (above)"
               exit 1
             fi
@@ -119,9 +121,10 @@ jobs:
           # it) gives its own file an icon in the file manager: the Reoling
           # icon copied into the user's icon theme for the sizes the system
           # theme lacks (all of them here) and set as the file's custom icon
-          # (an attribute the session's gvfs keeps; not checked here), and
+          # (an attribute the session's gvfs keeps; not checked here),
           # thumbnail-cache entries for the file's URI (the runtime names
-          # the file by its real path).
+          # the file by its real path), and, the system having no Reoling
+          # desktop entry yet, a per-user one that starts the file.
           chmod +x dist/Reoling-*.AppImage
           test "$(xvfb-run -a dist/Reoling-*.AppImage --version)" = "reoling $VERSION"
           smoke dist/Reoling-*.AppImage
@@ -136,10 +139,28 @@ jobs:
             test -s "$png" || { echo "::error::the AppImage wrote no $size thumbnail of itself ($png)"; exit 1; }
             file "$png"
           done
-          # Then the .deb, installed; it does none of the above.
+          entry="$XDG_DATA_HOME/applications/de.dersobi.reoling.desktop"
+          appimage=$(realpath dist/Reoling-*.AppImage)
+          test -s "$entry" || { echo "::error::the AppImage wrote no desktop entry ($entry)"; exit 1; }
+          cat "$entry"
+          for line in "Exec=\"$appimage\"" "TryExec=$appimage" "Icon=de.dersobi.reoling" "X-Reoling-Generated=true"; do
+            grep -qFx "$line" "$entry" || { echo "::error::the AppImage's desktop entry lacks $line"; exit 1; }
+          done
+          if grep -q '^MimeType=' "$entry"; then
+            echo "::error::the AppImage's desktop entry claims MIME types"
+            exit 1
+          fi
+          desktop-file-validate "$entry"
+          # Then the .deb, installed; it does none of the above, and its
+          # start removes the AppImage's per-user desktop entry, which would
+          # hide the .deb's own.
           sudo apt-get install -y ./dist/reoling_*.deb
           test "$(xvfb-run -a reoling --version)" = "reoling $VERSION"
           smoke reoling
+          if [ -e "$entry" ]; then
+            echo "::error::the .deb left the AppImage's per-user desktop entry in place ($entry)"
+            exit 1
+          fi
           ls -l dist
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
