@@ -24,7 +24,7 @@ More on <https://reoling.eu>.
 
 ## Status
 
-Version **1.0.1**, the first release with installable packages (see
+Version **1.0.0**, the first release with installable packages (see
 [Installation](#installation)). Login, live video, PTZ and the camera
 controls, the camera and device settings pages, and playback with sound,
 event bars and downloads work end to end on real hardware — a Home Hub,
@@ -159,28 +159,12 @@ answers first.
 
 **Version history**
 
-- 1.0.1 — the first published packages: `reoling_1.0.1-1_amd64.deb` for
+- 1.0.0 — the first published packages: `reoling_1.0.0-1_amd64.deb` for
   Ubuntu 24.04 LTS and later (Debian 13 and later too) and
-  `Reoling-1.0.1-x86_64.AppImage` for other distributions, both built on
-  Ubuntu 24.04 by the release workflow and attached to the release on
-  GitHub (see [Installation](#installation)).
-  - Decoding: the hardware decoder — NVDEC or VA-API — is picked
-    automatically, with the software decoders as the fallback. Hardware,
-    set on a machine without a usable hardware decoder, now decodes in
-    software instead of leaving the picture black; the setting is shown
-    as it is stored, the Decoding row says that no hardware decoder was
-    found, and System Status names the mode in use.
-  - AppImage: it follows the desktop's theme and accent colour (the 1.0.0
-    build forced its own theme, which coloured the connection dot blue),
-    bundles the NVIDIA and VA-API GStreamer plugins for hardware decoding,
-    and takes GLib and libva from the system, so the desktop's settings
-    are read and the VA-API driver matches its library.
-- 1.0.0 — the first release built as packages: `reoling_1.0.0-1_amd64.deb`
-  for Ubuntu 24.04 LTS and later (Debian 13 and later too) and
   `Reoling-1.0.0-x86_64.AppImage` for other distributions, both built on
-  Ubuntu 24.04 by a GitHub Actions workflow (they were not published: the
-  AppImage had the faults 1.0.1 fixes); `reoling --version` prints the
-  version.
+  Ubuntu 24.04 by the release workflow and attached to the release on
+  GitHub (see [Installation](#installation)); `reoling --version` prints
+  the version.
   - Settings pages, read-only, with the values as the device reports
     them: the camera settings window gets Info, Image, Display,
     Detection, Light & sound, Schedules and Network tabs beside Encoding,
@@ -200,6 +184,19 @@ answers first.
     at the next frame.
   - Requests that arrive while a download holds the connection, the
     settings reads among them, wait and go out once it is over.
+  - Decoding: the hardware decoder — NVDEC or VA-API — is picked
+    automatically, with the software decoders as the fallback. Hardware,
+    set on a machine without a usable hardware decoder, decodes in
+    software instead of leaving the picture black; the setting is shown
+    as it is stored, the Decoding row says that no hardware decoder was
+    found, and System Status names the mode in use.
+  - AppImage: it follows the desktop's theme and accent colour, bundles
+    the NVIDIA and VA-API GStreamer plugins for hardware decoding, takes
+    GLib and libva from the system (so the desktop's settings are read and
+    the VA-API driver matches its library), and gives its own file the
+    Reoling icon in GNOME Files from the first run on — the file's custom
+    icon, set per user; other file managers may still show the generic
+    icon.
 - 0.1.27 — Playback: a Download button saves a chosen time range (a start,
   a length from 30 s to 15 min or the whole recording, main or sub stream)
   as an MP4 with the recording's sound into the recordings folder, as one
@@ -375,9 +372,9 @@ carries two packages for x86_64 Linux, both built on Ubuntu 24.04 LTS by
 the release workflow (`.github/workflows/release.yml`) so that they run on
 24.04 and everything newer:
 
-- **`reoling_1.0.1-1_amd64.deb`** for Ubuntu 24.04 LTS or newer and
+- **`reoling_1.0.0-1_amd64.deb`** for Ubuntu 24.04 LTS or newer and
   Debian 13 or newer (and derivatives with at least those library
-  versions): `sudo apt install ./reoling_1.0.1-1_amd64.deb`. apt
+  versions): `sudo apt install ./reoling_1.0.0-1_amd64.deb`. apt
   installs the GTK 4 and GStreamer runtime with it — the base, good and
   bad plugin sets (parsers, muxers, the nvcodec and va hardware decoders),
   the libav software decoders and a PulseAudio, PipeWire or ALSA sink —
@@ -388,9 +385,9 @@ the release workflow (`.github/workflows/release.yml`) so that they run on
   `/usr/lib/reoling/gstreamer-1.0`, a directory `reoling` adds to its
   plugin registry when it starts. Reoling then appears in the
   applications menu; `reoling --version` prints the installed version.
-- **`Reoling-1.0.1-x86_64.AppImage`** for any other distribution with
+- **`Reoling-1.0.0-x86_64.AppImage`** for any other distribution with
   glibc 2.39 and GLib 2.80 or newer (Ubuntu 24.04, Fedora 40, Debian 13
-  and later): `chmod +x Reoling-1.0.1-x86_64.AppImage` and run it.
+  and later): `chmod +x Reoling-1.0.0-x86_64.AppImage` and run it.
   The AppImage mounts itself with FUSE 2 (`libfuse2` or `libfuse2t64`);
   without it, `--appimage-extract-and-run` unpacks it to a
   temporary directory for that run, and `--appimage-extract` unpacks it
@@ -409,13 +406,21 @@ the release workflow (`.github/workflows/release.yml`) so that they run on
   the accent colour); a theme written for a newer GTK than the bundled one
   (4.14) may print a few "Theme parser error" lines, which are harmless.
   It keeps its own GStreamer registry under `~/.cache/reoling`. The first
-  time it runs it also gives its own file the Reoling icon in the file
-  manager (GNOME Files shows a bare "executable" icon for an AppImage
-  otherwise): it writes the thumbnail-cache entries for the file under
-  `~/.cache/thumbnails` from the icon inside, as a thumbnailer would have,
-  and writes them again when the file is replaced or moved. That is all it
+  time it runs it also gives its own file the Reoling icon in GNOME Files,
+  which otherwise shows the bare "executable" icon for an AppImage: it
+  copies the Reoling icon into your icon theme (under
+  `~/.local/share/icons/hicolor`, for the sizes the system theme lacks)
+  and sets it as the file's custom icon — the GIO attribute
+  `metadata::custom-icon`, which Files shows at every zoom level and gvfs
+  keeps per user and per path; by hand that is
+  `gio set <file> metadata::custom-icon file://<icon>`. It also writes the
+  file's thumbnail-cache entries under `~/.cache/thumbnails` for the file
+  managers and dialogs that read the cache but no custom icon. Both are
+  checked at every start, so a replaced file (a new download) or a moved
+  one gets its icon back the next time it runs. Other file managers
+  (Dolphin among them) may still show the generic icon. That is all it
   touches: it installs no thumbnailer, so nothing of Reoling's runs on
-  other AppImage files. The icon shows as soon as the folder is re-read.
+  other AppImage files.
 
 Both packages decode video in hardware where they can: with Decoding set
 to Auto (the default) GStreamer takes the highest-ranked decoder it has,
@@ -435,7 +440,7 @@ rehearses the whole release in an `ubuntu:24.04` container:
 
 ```bash
 scripts/build-gst-gtk4-plugin.sh target/gst-gtk4   # the GTK 4 sink, where the distribution has none
-cargo install cargo-deb && cargo deb                # target/debian/reoling_1.0.1-1_amd64.deb
+cargo install cargo-deb && cargo deb                # target/debian/reoling_1.0.0-1_amd64.deb
 scripts/fetch-appimage-tools.sh ~/appimage-tools    # linuxdeploy, its plugins, appimagetool (pinned)
 APPIMAGE_TOOLS=~/appimage-tools scripts/build-appimage.sh target/release/reoling dist
 ```

@@ -236,8 +236,10 @@ chmod +x "$appdir/AppRun"
 rm -f "$appdir/AppRun.wrapped"
 
 # The icon the file manager shows for the .AppImage file: at start the app
-# reads .DirIcon and the 512 px hicolor icon out of the mounted image to
-# write its own file's thumbnail-cache entries (src/ui/icon.rs,
+# copies the hicolor icons out of the mounted image into the user's icon
+# theme (the file's custom icon, which GNOME Files shows, points at one of
+# them) and reads .DirIcon and the 512 px hicolor icon to write its own
+# file's thumbnail-cache entries (src/ui/icon.rs,
 # install_appimage_integration), and AppImage tools read .DirIcon (some
 # the <Icon>.png next to the desktop entry) as well, so both are real PNG
 # files, not the symlinks linuxdeploy leaves (a symlink extracted on its

@@ -1495,7 +1495,7 @@ dependencies = [
 
 [[package]]
 name = "reoling"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "aes",
  "async-channel",
