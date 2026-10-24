@@ -15,7 +15,7 @@
 //! finished by [`Mp4Writer`]; the cancelled one is discarded, as the app
 //! would.
 
-use crate::ui::recording_file::{download_file_name, Mp4Writer};
+use crate::ui::recording_file::{download_file_name, AudioExpectation, Mp4Writer};
 use reoling::{CivilTime, DeviceIdentity, DownloadSummary, DownloadUnit, RecordStream, RecordingFile, ReolinkClient};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -210,7 +210,7 @@ async fn download(
         stream.estimate,
         stream.file_count
     ));
-    let mut writer = Mp4Writer::new(path.to_path_buf(), file.has_audio);
+    let mut writer = Mp4Writer::new(path.to_path_buf(), AudioExpectation { first: file.has_audio, later: false });
     let (mut info_blocks, mut first_data_at, mut cancelled_at, mut progress_lines) = (0u64, None::<Instant>, None::<Instant>, 0u32);
     let mut outcome: Option<DownloadSummary> = None;
     let mut failed = false;

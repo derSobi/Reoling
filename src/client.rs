@@ -17,6 +17,13 @@ use tokio_stream::wrappers::ReceiverStream;
 pub use crate::protocol::bcmedia::model::{VideoFrame, VideoType};
 
 mod replay;
+pub mod settings;
+pub use settings::{
+    probe_channel as settings_probe_channel, CameraDetectionPage, CameraDisplayPage, CameraImagePage, CameraInfoPage,
+    CameraLightSoundPage, CameraPage, CameraSchedulesPage, DeviceAlertsPage, DeviceInfoPage, DeviceKind,
+    DeviceLightSoundPage, DeviceMaintenancePage, DeviceNetworkPage, DevicePage, DeviceStoragePage, DeviceTimePage,
+    DeviceUsersPage, NetworkRows, Read, ReadFailure, SettingsGates, SettingsPage, SettingsTarget, SETTINGS_REPLY_TIMEOUT,
+};
 pub use replay::{
     file_for_time, next_file, sort_and_dedup_files, DownloadCancel, DownloadProgress, DownloadStream, DownloadSummary,
     DownloadUnit, FootageAnchor, RecordedEvent, RecordingFile, ReplayKeyframe, ReplayProgress, ReplayResume,
@@ -62,6 +69,15 @@ pub struct ChannelAbilities {
     pub monitor_point: bool,
     /// Re-calibrates the pan/tilt mechanism.
     pub calibration: bool,
+    /// Has a status LED that can be switched (the settings pages' Status
+    /// LED row).
+    pub status_led: bool,
+    /// Can follow a moving object (pan/tilt motors): the tracking rows.
+    pub tracking: bool,
+    /// Offers a binning mode in its picture settings.
+    pub binning: bool,
+    /// Calls the third smart-detection type "Pet" rather than "Animal".
+    pub pet_label: bool,
 }
 
 impl ChannelAbilities {
@@ -104,6 +120,8 @@ pub enum DeviceUpdate {
     EncodeProfiles { channel_id: u8, profiles: Vec<crate::encoding::EncodeProfile> },
     /// What camera sits on a channel: its own name, model and firmware.
     ChannelVersion { channel_id: u8, name: Option<String>, model: Option<String>, firmware: Option<String> },
+    /// One read-only settings page, complete (see `query_settings`).
+    Settings(SettingsPage),
 }
 
 /// What the device says it is, as reported after login.
@@ -184,13 +202,19 @@ pub struct ReolinkClient {
     /// AAC (ADTS) frames of the running stream's audio.
     audio_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     audio_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
-    /// What each in-flight `MSG_ID_IMAGE_FILE` request (keyed by its
-    /// `msg_num`) is for, so its reply — read by whichever task happens to
-    /// be reading the connection when it arrives, not necessarily the one
-    /// that sent the request — knows which `DeviceUpdate` to emit. `Arc` so
-    /// the video task's own read loop (a `'static` spawned task with no
-    /// `&mut self`) can share it too.
+    /// What each in-flight request (keyed by its `msg_num`) is for, so its
+    /// reply — read by whichever task happens to be reading the connection
+    /// when it arrives, not necessarily the one that sent the request —
+    /// knows which `DeviceUpdate` to emit: the `MSG_ID_IMAGE_FILE` requests
+    /// it was made for, and the settings reads (`ImageKind::SettingsPage`).
+    /// `Arc` so the video task's own read loop (a `'static` spawned task
+    /// with no `&mut self`) can share it too. (The name predates the
+    /// settings reads; renaming it touches the playback readers, so that
+    /// waits for a quiet moment there.)
     pending_images: Arc<std::sync::Mutex<HashMap<u16, ImageKind>>>,
+    /// The settings page last asked for per target, for replacing a read
+    /// that is still pending and for the probe.
+    settings_pages: HashMap<SettingsTarget, Arc<std::sync::Mutex<settings::PageCollector>>>,
     /// The encoder values the device allows, from its login reply.
     encode_profiles: Vec<crate::encoding::EncodeProfile>,
     /// Each channel's camera UID, from the pushed channel list (shared with
@@ -211,14 +235,17 @@ pub struct ReolinkClient {
     download_cancel: Option<replay::DownloadCancel>,
 }
 
-/// What a `MSG_ID_IMAGE_FILE` request (see its own doc comment) was asking
-/// for.
-#[derive(Debug, Clone, Copy)]
+/// What an in-flight request was asking for: a `MSG_ID_IMAGE_FILE` request
+/// (see its own doc comment), or one read of a settings page.
+#[derive(Debug, Clone)]
 enum ImageKind {
     MonitorPoint,
     Preset(u8),
     /// A live snapshot taken for this preset (Add / Edit's picture).
     Snapshot(u8),
+    /// One read of a settings page; the collector gathers the page's
+    /// replies (see `client::settings`).
+    SettingsPage(Arc<std::sync::Mutex<settings::PageCollector>>),
 }
 
 #[derive(Debug, Clone)]
@@ -386,6 +413,13 @@ fn pushed_update(
     pending_images: &std::sync::Mutex<HashMap<u16, ImageKind>>,
     channel_uids: &std::sync::Mutex<HashMap<u8, CameraUid>>,
 ) -> Option<DeviceUpdate> {
+    // A reply to one of a settings page's reads goes to its page and
+    // nowhere else (its id would mean something else below); nothing else
+    // is routed by message number.
+    match settings::settings_reply(bc, pending_images) {
+        settings::Routed::Consumed(update) => return update,
+        settings::Routed::NotOurs => {}
+    }
     if bc.meta.msg_id == MSG_ID_IMAGE_FILE || bc.meta.msg_id == MSG_ID_SNAP {
         if bc.meta.response_code == 0xffff {
             // The device's answer for "no file by that name" (e.g. a
@@ -683,6 +717,7 @@ impl ReolinkClient {
             audio_tx,
             audio_rx: Some(audio_rx),
             pending_images: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            settings_pages: HashMap::new(),
             encode_profiles: Vec::new(),
             channel_uids: Arc::new(std::sync::Mutex::new(HashMap::new())),
             replay: None,
@@ -731,6 +766,9 @@ impl ReolinkClient {
     fn next_msg_num(&mut self) -> u16 {
         let n = self.next_msg_num;
         self.next_msg_num = self.next_msg_num.wrapping_add(1);
+        // The number comes round again after 65536 requests: an unanswered
+        // settings read left under it must not take this request's reply.
+        settings::number_reused(&self.pending_images, n);
         n
     }
 

@@ -140,9 +140,42 @@ pub fn keyframe_unix_time(buf: &[u8]) -> Option<u32> {
     (additional_header_size >= 4).then(|| u32::from_le_bytes(buf[24..28].try_into().unwrap()))
 }
 
+/// The largest video unit a parser believes: a header claiming more than
+/// this is an error (and the stream resyncs at the next unit), not a unit
+/// to wait for. The header's length fields are plain 32-bit counts, and
+/// a unit is held in memory until it is complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnitLimits {
+    /// Payload bytes of one video frame.
+    pub payload: usize,
+    /// Bytes of the extra header between the fixed 24 and the payload.
+    pub extra_header: usize,
+}
+
+impl UnitLimits {
+    /// No limit: every length the header can express is waited for.
+    pub const NONE: UnitLimits = UnitLimits { payload: usize::MAX, extra_header: usize::MAX };
+}
+
+/// Limits for recorded footage (playback and download). The largest key
+/// frames seen are a few MB on main streams (see the replay sink's queue
+/// notes in `video_view.rs`); extra headers of 8, 160 and 168 bytes have
+/// been seen (see [`keyframe_unix_time`]). Both limits leave a wide
+/// margin.
+pub const RECORDED_UNIT_LIMITS: UnitLimits = UnitLimits { payload: 16 << 20, extra_header: 64 << 10 };
+
 /// Parses exactly one BcMedia unit from the start of `buf`. Returns
-/// `Ok(None)` if `buf` doesn't yet contain a complete unit.
+/// `Ok(None)` if `buf` doesn't yet contain a complete unit. No limit on
+/// the unit's length: see [`parse_one_within`].
 pub fn parse_one(buf: &[u8]) -> crate::protocol::Result<Option<(BcMediaMessage, usize)>> {
+    parse_one_within(buf, &UnitLimits::NONE)
+}
+
+/// [`parse_one`] that believes a video unit's header only within `limits`:
+/// a payload or extra header claimed larger is an error, so that a damaged
+/// (or hostile) length field cannot make the caller hold on to everything
+/// that follows while waiting for a unit that never completes.
+pub fn parse_one_within(buf: &[u8], limits: &UnitLimits) -> crate::protocol::Result<Option<(BcMediaMessage, usize)>> {
     if buf.len() < 4 {
         return Ok(None);
     }
@@ -174,9 +207,20 @@ pub fn parse_one(buf: &[u8]) -> crate::protocol::Result<Option<(BcMediaMessage, 
                 u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
             let microseconds = u32::from_le_bytes(buf[16..20].try_into().unwrap());
 
-            let data_start = 24 + additional_header_size;
+            let oversized = || {
+                Error::ProtocolError(format!(
+                    "video unit claims {payload_size} payload bytes and {additional_header_size} extra header bytes"
+                ))
+            };
+            if payload_size > limits.payload || additional_header_size > limits.extra_header {
+                return Err(oversized());
+            }
+            let data_start = 24usize.checked_add(additional_header_size).ok_or_else(oversized)?;
             let pad = pad_len(payload_size);
-            let total = data_start + payload_size + pad;
+            let total = data_start
+                .checked_add(payload_size)
+                .and_then(|n| n.checked_add(pad))
+                .ok_or_else(oversized)?;
             if buf.len() < total {
                 return Ok(None);
             }
@@ -359,6 +403,42 @@ mod tests {
     fn returns_none_when_more_bytes_are_needed() {
         let bytes = iframe_bytes(&[1, 2, 3]);
         assert!(parse_one(&bytes[..bytes.len() - 1]).unwrap().is_none());
+    }
+
+    /// The 24-byte header of a key frame claiming `payload` payload bytes
+    /// and `extra` bytes of extra header, with nothing after it.
+    fn header_claiming(payload: u32, extra: u32) -> Vec<u8> {
+        let mut header = iframe_bytes(&[]);
+        header.truncate(24);
+        header[8..12].copy_from_slice(&payload.to_le_bytes());
+        header[12..16].copy_from_slice(&extra.to_le_bytes());
+        header
+    }
+
+    #[test]
+    fn a_video_unit_claiming_more_than_the_limits_is_an_error_not_a_wait() {
+        let limits = &RECORDED_UNIT_LIMITS;
+        // Every length the header can express is waited for without limits
+        // (the live stream's parser is unchanged)...
+        assert!(parse_one(&header_claiming(u32::MAX, 0)).unwrap().is_none());
+        assert!(parse_one(&header_claiming(0, u32::MAX)).unwrap().is_none());
+        // ...and refused within the recorded-footage limits, so that the
+        // caller resyncs instead of buffering for ever.
+        let error = parse_one_within(&header_claiming(u32::MAX, 0), limits).unwrap_err();
+        assert!(error.to_string().contains("4294967295 payload bytes"), "{error}");
+        assert!(parse_one_within(&header_claiming(0, u32::MAX), limits).is_err());
+        assert!(parse_one_within(&header_claiming(limits.payload as u32 + 1, 0), limits).is_err());
+        assert!(parse_one_within(&header_claiming(0, limits.extra_header as u32 + 1), limits).is_err());
+        // A unit exactly at the limits is still waited for (the header
+        // alone: nothing is allocated for the payload).
+        let at_limit = header_claiming(limits.payload as u32, limits.extra_header as u32);
+        assert!(parse_one_within(&at_limit, limits).unwrap().is_none());
+        // Complete units and the other kinds parse as before.
+        let bytes = iframe_bytes(&[1, 2, 3]);
+        assert_eq!(parse_one_within(&bytes, limits).unwrap(), parse_one(&bytes).unwrap());
+        assert!(parse_one_within(&bytes[..bytes.len() - 1], limits).unwrap().is_none());
+        let info = info_v1_bytes(640, 360);
+        assert_eq!(parse_one_within(&info, limits).unwrap(), parse_one(&info).unwrap());
     }
 
     #[test]

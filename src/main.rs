@@ -5,7 +5,15 @@ use gtk4::Application;
 use ui::bridge::UidTransport;
 
 fn main() {
+    // `--version` answers before GTK or GStreamer come up, so it works in a
+    // bare shell with no display: the packaging smoke tests run it.
+    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("reoling {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     gstreamer::init().expect("failed to initialize GStreamer");
+    scan_private_plugins();
 
     // Plain UDP/P2P is the default and the only path the real app
     // targets — the official Reolink client never uses TCP for the BC
@@ -44,4 +52,20 @@ fn main() {
     // parser doesn't know `--prefer-udp` (parsed by hand above) and would
     // reject it as an invalid option.
     app.run_with_args::<&str>(&[]);
+}
+
+/// The Debian package carries the GTK 4 paintable sink itself when the
+/// distribution has no `gstreamer1.0-gtk4` of its own (Ubuntu 24.04): it
+/// lands in `<prefix>/lib/reoling/gstreamer-1.0`, beside
+/// `<prefix>/bin/reoling`. That directory is added to the plugin registry
+/// when it exists, so `reoling` finds the sink from a terminal as well as
+/// from the desktop entry, with no wrapper script and no environment to
+/// set. A source build or an AppImage has no such directory and skips this.
+fn scan_private_plugins() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(prefix) = exe.parent().and_then(|bin| bin.parent()) else { return };
+    let dir = prefix.join("lib/reoling/gstreamer-1.0");
+    if dir.is_dir() {
+        gstreamer::Registry::get().scan_path(&dir);
+    }
 }

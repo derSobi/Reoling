@@ -11,9 +11,11 @@
 !/LICENSE
 !/README.md
 
-# Metadate GitHub (butonul Sponsor)
+# Metadate GitHub (butonul Sponsor) și workflow-ul de release
 !/.github/
 !/.github/FUNDING.yml
+!/.github/workflows/
+!/.github/workflows/*.yml
 
 # Codul proiectului
 !/src/**

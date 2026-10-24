@@ -4,19 +4,21 @@
 //! (`DownloadRequest`, through `DeviceLink::download`). The device's
 //! thread closes the playback it may be running (a download reads the
 //! connection itself, as a search does, so nothing else can be open),
-//! resolves the range against the day's recordings, reads the data from
-//! the device as fast as the path carries them and writes them to an MP4
-//! file (`Mp4Writer`). The page hears `DownloadEvent`s: the start with the
-//! file's name and the device's size estimate, progress a few times a
-//! second, and the end. Every event names the page's playback session the
-//! request came from, so that a page that has moved on (another day or
-//! device) drops them; the download itself runs to its end, or until it
-//! is cancelled. Playback and live-video commands that arrive meanwhile
-//! wait in `bridge.rs` until it is over.
+//! resolves the range against the day's recordings, reserves the file's
+//! name (an empty file from this moment on, so that no two downloads of
+//! any device share one), reads the data from the device as fast as the
+//! path carries them and writes them to that MP4 file (`Mp4Writer`). The
+//! page hears `DownloadEvent`s: the start with the file's name and the
+//! device's size estimate, progress a few times a second, and the end.
+//! Every event names the page's playback session the request came from,
+//! so that a page that has moved on (another day or device) drops them;
+//! the download itself runs to its end, or until it is cancelled.
+//! Playback and live-video commands that arrive meanwhile wait in
+//! `bridge.rs` until it is over.
 
 use crate::ui::bridge::DeviceEvent;
 use crate::ui::playback_driver::PlaybackDriver;
-use crate::ui::recording_file::{download_file_name, range_of, unused_path, Mp4Writer};
+use crate::ui::recording_file::{download_file_name, range_of, reserve_path, AudioExpectation, Mp4Writer};
 use reoling::{CivilTime, DownloadCancel, DownloadUnit, RecordStream, RecordingFile, ReolinkClient};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -81,15 +83,22 @@ impl DownloadEvent {
     }
 }
 
+/// A later recording of the range counts as bringing sound only when the
+/// range covers at least this much of it: adjoining recordings overlap by
+/// two or three seconds, and the device need not send the successor's
+/// overlap at all, so a whole silent recording is not promised sound by
+/// the one after it.
+const LATER_AUDIO_MIN_OVERLAP_SECS: i64 = 5;
+
 /// The range as the device is asked for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Resolved {
     pub start: CivilTime,
     pub end: CivilTime,
     pub duration_secs: i64,
-    /// A recording in the range has sound (what the file's audio track
-    /// waits for).
-    pub expect_audio: bool,
+    /// Which recordings of the range have sound, as the list says (what
+    /// the file's audio track is made for).
+    pub audio: AudioExpectation,
 }
 
 /// The range of `files` (the day's, sorted) a request for `start` and
@@ -97,8 +106,25 @@ pub(crate) struct Resolved {
 pub(crate) fn resolve(files: &[RecordingFile], start: CivilTime, duration: Option<i64>) -> Result<Resolved, String> {
     let spans: Vec<(CivilTime, CivilTime)> = files.iter().map(|f| (f.start, f.end)).collect();
     let (start, end) = range_of(&spans, start, duration)?;
-    let expect_audio = files.iter().any(|f| f.start < end && start < f.end && f.has_audio);
-    Ok(Resolved { start, end, duration_secs: end.to_epoch_seconds() - start.to_epoch_seconds(), expect_audio })
+    let overlapping: Vec<&RecordingFile> = files.iter().filter(|f| f.start < end && start < f.end).collect();
+    // The data start in the recording(s) holding `start`, or, from a gap,
+    // in the first one of the range; a later one brings sound when the
+    // range covers enough of it.
+    let holding: Vec<&&RecordingFile> = overlapping.iter().filter(|f| f.start <= start).collect();
+    let first = match holding.as_slice() {
+        [] => overlapping.first().is_some_and(|f| f.has_audio),
+        holding => holding.iter().any(|f| f.has_audio),
+    };
+    let later = overlapping.iter().skip(if holding.is_empty() { 1 } else { holding.len() }).any(|f| {
+        let covered = f.end.min(end).to_epoch_seconds() - f.start.max(start).to_epoch_seconds();
+        f.has_audio && covered >= LATER_AUDIO_MIN_OVERLAP_SECS
+    });
+    Ok(Resolved {
+        start,
+        end,
+        duration_secs: end.to_epoch_seconds() - start.to_epoch_seconds(),
+        audio: AudioExpectation { first, later },
+    })
 }
 
 /// How a download's data ended.
@@ -168,11 +194,17 @@ impl DownloadJob {
         let resolved = resolve(&files, request.start, request.duration)?;
         std::fs::create_dir_all(&request.dir).map_err(|e| format!("Could not create the folder: {e}"))?;
         let wanted = download_file_name(&request.device, &request.camera, resolved.start, resolved.duration_secs);
-        let path = unused_path(&request.dir, &wanted);
+        // The name is taken from here on; the file is removed again should
+        // the download not start.
+        let path = reserve_path(&request.dir, &wanted).map_err(|e| format!("Could not create the file: {e}"))?;
         let name = path.file_name().map_or(wanted, |n| n.to_string_lossy().to_string());
         let stream = match client.download_range(request.channel, request.stream, resolved.start, resolved.end).await {
             Ok(stream) => stream,
             Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                // A request the device never answered may be running on it
+                // all the same; the client ends it, and the page hears the
+                // failure once the device has stopped (`REAP_WAIT` at most).
                 let _ = client.stop_download_within(REAP_WAIT).await;
                 return Err(format!("Could not start the download: {e}"));
             }
@@ -192,7 +224,7 @@ impl DownloadJob {
             path: path.clone(),
             units: stream.units,
             cancel: stream.cancel,
-            writer: Some(Mp4Writer::new(path, resolved.expect_audio)),
+            writer: Some(Mp4Writer::new(path, resolved.audio)),
             estimate,
             bytes: 0,
             reported_at: Instant::now(),
@@ -263,10 +295,10 @@ impl DownloadJob {
         let writer = self.writer.take();
         let outcome = match ended {
             Ended::Complete => match writer.map(Mp4Writer::finish) {
-                Some(Ok(_)) => {
-                    let bytes = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(self.bytes);
-                    DownloadOutcome::Saved { name: self.name.clone(), path: self.path.clone(), bytes }
-                }
+                Some(Ok(_)) => match std::fs::metadata(&self.path) {
+                    Ok(meta) => DownloadOutcome::Saved { name: self.name.clone(), path: self.path.clone(), bytes: meta.len() },
+                    Err(_) => DownloadOutcome::Failed("The file is gone".to_string()),
+                },
                 Some(Err(e)) => DownloadOutcome::Failed(format!("Could not write the file: {e}")),
                 None => DownloadOutcome::Failed("Nothing was written".to_string()),
             },
@@ -320,22 +352,46 @@ mod tests {
 
     #[test]
     fn a_request_resolves_to_the_range_and_whether_sound_is_expected() {
+        let sound = |first, later| AudioExpectation { first, later };
         let files = [file(t(14, 0, 0), 600, false), file(t(14, 10, 0), 600, true), file(t(16, 0, 0), 300, true)];
         // A minute inside the silent file.
         let r = resolve(&files, t(14, 2, 0), Some(60)).unwrap();
-        assert_eq!((r.start, r.end, r.duration_secs, r.expect_audio), (t(14, 2, 0), t(14, 3, 0), 60, false));
-        // Across the boundary into the file with sound: sound is expected.
+        assert_eq!((r.start, r.end, r.duration_secs, r.audio), (t(14, 2, 0), t(14, 3, 0), 60, sound(false, false)));
+        // Across the boundary into the file with sound: the data start
+        // without sound, and sound comes later.
         let r = resolve(&files, t(14, 9, 30), Some(60)).unwrap();
-        assert_eq!((r.start, r.end, r.expect_audio), (t(14, 9, 30), t(14, 10, 30), true));
+        assert_eq!((r.start, r.end, r.audio), (t(14, 9, 30), t(14, 10, 30), sound(false, true)));
         // The whole recording that holds the start.
         let r = resolve(&files, t(14, 15, 0), None).unwrap();
-        assert_eq!((r.start, r.end, r.duration_secs, r.expect_audio), (t(14, 10, 0), t(14, 20, 0), 600, true));
-        // A start in a gap: the next recording.
+        assert_eq!((r.start, r.end, r.duration_secs, r.audio), (t(14, 10, 0), t(14, 20, 0), 600, sound(true, false)));
+        // A start in a gap: the next recording (with sound from its start).
         let r = resolve(&files, t(15, 0, 0), None).unwrap();
-        assert_eq!((r.start, r.duration_secs), (t(16, 0, 0), 300));
+        assert_eq!((r.start, r.duration_secs, r.audio), (t(16, 0, 0), 300, sound(true, false)));
         assert_eq!(resolve(&files, t(15, 0, 0), Some(60)).unwrap_err(), "No recording between 15:00:00 and 15:01:00");
         assert_eq!(resolve(&files, t(17, 0, 0), None).unwrap_err(), "Nothing recorded after 17:00:00");
         assert_eq!(resolve(&[], t(14, 0, 0), Some(60)).unwrap_err(), "No recordings on this day");
+    }
+
+    #[test]
+    fn a_successors_boundary_overlap_promises_no_sound_but_a_covered_successor_does() {
+        let sound = |first, later| AudioExpectation { first, later };
+        // Adjoining recordings overlap by two seconds; the second has sound.
+        let files = [file(t(14, 0, 0), 602, false), file(t(14, 10, 0), 600, true), file(t(14, 20, 0), 600, false)];
+        // The whole silent recording: its successor's two seconds may never
+        // be sent, so no sound is promised.
+        let r = resolve(&files, t(14, 5, 0), None).unwrap();
+        assert_eq!((r.start, r.end, r.audio), (t(14, 0, 0), t(14, 10, 2), sound(false, false)));
+        // A range reaching five seconds into the successor: sound later.
+        assert_eq!(resolve(&files, t(14, 9, 0), Some(65)).unwrap().audio, sound(false, true));
+        assert_eq!(resolve(&files, t(14, 9, 0), Some(64)).unwrap().audio, sound(false, false));
+        // A start inside the overlap: either recording may be the first,
+        // so the one with sound is waited for.
+        assert_eq!(resolve(&files, t(14, 10, 1), Some(30)).unwrap().audio, sound(true, false));
+        // From the recording with sound into a silent one: sound first.
+        assert_eq!(resolve(&files, t(14, 19, 0), Some(120)).unwrap().audio, sound(true, false));
+        // A range from a gap over a silent recording into one with sound.
+        let gap = [file(t(15, 0, 0), 60, false), file(t(15, 1, 0), 60, true)];
+        assert_eq!(resolve(&gap, t(14, 59, 30), Some(120)).unwrap().audio, sound(false, true));
     }
 
     #[test]

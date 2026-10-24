@@ -24,6 +24,20 @@ pub use client::{
     DownloadUnit, FootageAnchor, RecordedEvent, RecordingFile, ReplayKeyframe, ReplayProgress, ReplayResume,
     ReplaySpeed, ReplayStatus, ReplayStream, ReplayUnit,
 };
+pub use client::{
+    settings_probe_channel, CameraDetectionPage, CameraDisplayPage, CameraImagePage, CameraInfoPage, CameraLightSoundPage,
+    CameraPage, CameraSchedulesPage, DeviceAlertsPage, DeviceInfoPage, DeviceKind, DeviceLightSoundPage,
+    DeviceMaintenancePage, DeviceNetworkPage, DevicePage, DeviceStoragePage, DeviceTimePage, DeviceUsersPage, NetworkRows,
+    Read, ReadFailure, SettingsGates, SettingsPage, SettingsTarget, SETTINGS_REPLY_TIMEOUT,
+};
+pub use protocol::bc::settings_xml::{
+    AccessUser, AccessUserList, AccountName, AiCfg, AiDenoise, AiDetectCfg, ApCfg, AudioCfg, AutoReboot, ChannelSwitch,
+    CompressionAudio, DayNightThreshold, Ddns, DeviceAudioCfg, DnsConfig, Dst, Enable, FloodlightTask, HddInfo,
+    HddInfoList, HourSpan, InputAdvanceCfg, IpConfig, KitApCfg, LedState, MacAddress, MinMaxCur, ModeOnly, MotionDetect,
+    NoiseReduction, Norm, Ntp, OsdDatetime, OsdName, PowerLineFrequency, PushCfg, RecordCfg, ScheduleItem, ScheduleTable,
+    ScheduledTask, SensitivityInfo, SensitivityInfoList, SensitivityNew, ServicePort, Ssid, StreamAudio, SystemGeneral,
+    TrackLimit, TrackSchedule, TypeScheduleList, UserEntry, UserList,
+};
 pub use protocol::bc::xml::{CameraUid, RecordStream, RecordingId};
 pub use protocol::bcmedia::model::InfoBlock;
 pub use protocol::time::CivilTime;

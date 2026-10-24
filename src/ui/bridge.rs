@@ -2,8 +2,8 @@ use crate::ui::download_job::DownloadJob;
 use crate::ui::playback_driver::{PlaybackCommand, PlaybackDriver, PLAYBACK_TICK};
 use crate::ui::video_view::VideoSink;
 use reoling::{
-    ChannelInfo, CivilTime, DeviceIdentity, DeviceUpdate, RecordStream, ReolinkClient, ReplaySpeed, StreamProfile,
-    VideoFrame, VideoType,
+    ChannelInfo, CivilTime, DeviceIdentity, DeviceUpdate, RecordStream, ReolinkClient, ReplaySpeed, SettingsGates,
+    SettingsPage, SettingsTarget, StreamProfile, VideoFrame, VideoType,
 };
 use std::collections::VecDeque;
 use std::net::IpAddr;
@@ -63,6 +63,10 @@ pub enum DeviceEvent {
     Playback(PlaybackEvent),
     /// A recording download (see `download_job`).
     Download(DownloadEvent),
+    /// One read-only settings page, complete (answer to `query_settings`).
+    Settings(SettingsPage),
+    /// A download runs; the settings page is read once it is over.
+    SettingsDeferred(SettingsTarget),
 }
 
 enum Command {
@@ -95,6 +99,7 @@ enum Command {
     QueryEncodeProfiles { channel: u8 },
     QueryChannelVersion { channel: u8 },
     SetEncoding { channel: u8, body: String },
+    QuerySettings { target: SettingsTarget, gates: SettingsGates },
     Playback(PlaybackCommand),
     Download(DownloadRequest),
     DownloadCancel,
@@ -153,6 +158,9 @@ async fn deferral_notice(
             };
             let event = PlaybackEvent::Notice { session, message: "Playback continues after the download".to_string() };
             let _ = tx.send(DeviceEvent::Playback(event)).await;
+        }
+        Command::QuerySettings { target, .. } => {
+            let _ = tx.send(DeviceEvent::SettingsDeferred(*target)).await;
         }
         _ => {}
     }
@@ -268,6 +276,12 @@ impl DeviceLink {
     /// for message 57).
     pub fn set_encoding(&self, channel: u8, body: String) {
         let _ = self.commands.send(Command::SetEncoding { channel, body });
+    }
+
+    /// Reads one settings page (answered as `Settings`; `SettingsDeferred`
+    /// first when a download has the connection).
+    pub fn query_settings(&self, target: SettingsTarget, gates: SettingsGates) {
+        let _ = self.commands.send(Command::QuerySettings { target, gates });
     }
 
     /// Streams the channel (replacing whatever this device was streaming).
@@ -520,6 +534,11 @@ pub fn spawn_device(
             if let Some(channel_id) = crate::ui::download_probe::probe_channel() {
                 crate::ui::download_probe::run(&mut client, channel_id, &identity).await;
             }
+            // Diagnostic-only: every settings page, read once (see
+            // `client::settings::probe_settings`).
+            if let Some(channel_id) = reoling::settings_probe_channel() {
+                client.probe_settings(channel_id, &identity, &username).await;
+            }
             let _ = tx.send(DeviceEvent::Connected(identity)).await;
             let _ = tx.send(DeviceEvent::EncodeProfiles(client.encode_profiles())).await;
 
@@ -547,7 +566,9 @@ pub fn spawn_device(
                     incoming = async {
                         if has_deferred { Incoming::Deferred } else { Incoming::Received(command_rx.recv().await) }
                     } => match incoming.command(&mut deferred) {
-                        Some(command @ (Command::Play { .. } | Command::Stop | Command::Playback(_))) if downloading => {
+                        Some(command @ (Command::Play { .. } | Command::Stop | Command::Playback(_) | Command::QuerySettings { .. }))
+                            if downloading =>
+                        {
                             if let Some(job) = download.as_mut() {
                                 deferral_notice(&command, job, &driver, &deferred, &tx).await;
                             }
@@ -595,6 +616,7 @@ pub fn spawn_device(
                         Some(Command::QueryEncoding { channel }) => client.query_encoding(channel).await,
                         Some(Command::QueryEncodeProfiles { channel }) => client.query_encode_profiles(channel).await,
                         Some(Command::QueryChannelVersion { channel }) => client.query_channel_version(channel).await,
+                        Some(Command::QuerySettings { target, gates }) => client.query_settings(target, &gates).await,
                         Some(Command::SetEncoding { channel, body }) => {
                             if let Err(e) = client.set_encoding(channel, body).await {
                                 let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
@@ -775,6 +797,7 @@ pub fn spawn_device(
                             DeviceUpdate::ChannelVersion { channel_id, model, firmware, .. } => {
                                 DeviceEvent::ChannelVersion { channel_id, model, firmware }
                             }
+                            DeviceUpdate::Settings(page) => DeviceEvent::Settings(page),
                         };
                         if tx.send(event).await.is_err() {
                             break;

@@ -184,6 +184,13 @@ pub struct SupportItem {
     /// see `.plans/reolink-baichuan-calibration-monitor-point.md`).
     #[serde(rename = "ptzControl")]
     pub ptz_control: Option<u32>,
+    /// The picture pipeline's generation; 219075 goes with the cameras
+    /// that offer a binning mode.
+    #[serde(rename = "newIspCfg")]
+    pub new_isp_cfg: Option<u32>,
+    /// 0 for cameras that call the third detection type "Pet", 1 "Animal".
+    #[serde(rename = "aiAnimalType")]
+    pub ai_animal_type: Option<u32>,
 }
 
 impl Support {
@@ -210,6 +217,10 @@ impl Support {
                         zoom: matches!(ptz, 1 | 2 | 5),
                         monitor_point: physical_ptz && ptz_control & (1 << 2) != 0,
                         calibration: physical_ptz && ptz_control & (1 << 3) != 0,
+                        status_led: i.led_ctrl.unwrap_or(0) & 1 != 0,
+                        tracking: physical_ptz,
+                        binning: i.new_isp_cfg == Some(219075),
+                        pet_label: i.ai_animal_type == Some(0),
                     },
                 ))
             })
@@ -286,9 +297,11 @@ impl ChannelInfoList {
     }
 }
 
-/// The device's own description of itself (reply to `MSG_ID_VERSION`): the
-/// name the owner gave it and its model.
-#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
+/// The device's own description of itself (reply to `MSG_ID_VERSION`, or
+/// to `MSG_ID_CHANNEL_VERSION` for the camera on a channel): the name the
+/// owner gave it, its model, and its build, hardware and firmware versions.
+/// The serial number the reply also carries is never read.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct VersionInfo {
     #[serde(rename = "channelId")]
     pub channel_id: Option<u8>,
@@ -297,6 +310,18 @@ pub struct VersionInfo {
     pub model: Option<String>,
     #[serde(rename = "firmwareVersion")]
     pub firmware_version: Option<String>,
+    /// The build, as text (`build 2510172100`).
+    #[serde(rename = "buildDay")]
+    pub build_day: Option<String>,
+    #[serde(rename = "hardwareVersion")]
+    pub hardware_version: Option<String>,
+    #[serde(rename = "cfgVersion")]
+    pub cfg_version: Option<String>,
+    /// The hardware detail string.
+    pub detail: Option<String>,
+    /// Only cameras with a separate detection model report it.
+    #[serde(rename = "aiVersion")]
+    pub ai_version: Option<String>,
 }
 
 impl BcXml {
@@ -1294,6 +1319,25 @@ mod channel_info_tests {
         // ptzControl=64 has bits 2/3 clear, and no physical PTZ either.
         assert!(!of(2).monitor_point && !of(2).calibration);
         assert!(!of(3).siren && !of(3).talk && !of(3).spotlight);
+    }
+
+    #[test]
+    fn support_table_gives_the_settings_gates() {
+        // The four rows of a real NVR: a PTZ camera with a status LED, a
+        // spotlight camera with the newer picture pipeline, a plain camera
+        // and one that calls the third detection type "Pet".
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" ?><body><Support version="1.1">
+            <item><chnID>0</chnID><ledCtrl>3</ledCtrl><ptzType>5</ptzType><ptzControl>47</ptzControl><newIspCfg>88003</newIspCfg><aiAnimalType>1</aiAnimalType></item>
+            <item><chnID>1</chnID><ledCtrl>38</ledCtrl><ptzType>0</ptzType><ptzControl>64</ptzControl><newIspCfg>219075</newIspCfg><aiAnimalType>1</aiAnimalType></item>
+            <item><chnID>2</chnID><ledCtrl>0</ledCtrl><newIspCfg>88003</newIspCfg><aiAnimalType>1</aiAnimalType></item>
+            <item><chnID>3</chnID><ledCtrl>38</ledCtrl><newIspCfg>219075</newIspCfg><aiAnimalType>0</aiAnimalType></item>
+            </Support></body>"#;
+        let abilities = BcXml::from_bytes(xml).unwrap().support.unwrap().into_abilities();
+        let of = |c: u8| abilities.iter().find(|(id, _)| *id == c).unwrap().1;
+        assert!(of(0).status_led && of(0).tracking && !of(0).binning && !of(0).pet_label);
+        assert!(!of(1).status_led && !of(1).tracking && of(1).binning && !of(1).pet_label);
+        assert!(!of(2).status_led && !of(2).tracking && !of(2).binning && !of(2).pet_label);
+        assert!(!of(3).status_led && !of(3).tracking && of(3).binning && of(3).pet_label);
     }
 
     #[test]

@@ -1,0 +1,35 @@
+# Ubuntu 24.04 packages the release build needs: read by the release
+# workflow (.github/workflows/release.yml) and by scripts/validate-in-docker.sh,
+# so both install exactly the same set. One package per line, '#' comments.
+#
+# Toolchain and headers
+build-essential
+pkg-config
+curl
+ca-certificates
+git
+dpkg-dev
+libgtk-4-dev
+libgstreamer1.0-dev
+libgstreamer-plugins-base1.0-dev
+# GStreamer runtime the app uses: parsers, muxers, decoders, audio sinks
+# (h264parse/h265parse and the va plugin live in -bad, aacparse, qtmux,
+# matroskamux and autoaudiosink in -good, avdec_* in libav)
+gstreamer1.0-tools
+gstreamer1.0-plugins-base
+gstreamer1.0-plugins-good
+gstreamer1.0-plugins-bad
+gstreamer1.0-libav
+gstreamer1.0-pulseaudio
+gstreamer1.0-alsa
+# Icons and the SVG loader the AppImage bundles
+adwaita-icon-theme
+librsvg2-common
+# Packaging, tests and smoke tests
+xvfb
+dbus
+libfuse2t64
+desktop-file-utils
+appstream
+patchelf
+file

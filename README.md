@@ -24,11 +24,13 @@ More on <https://reoling.eu>.
 
 ## Status
 
-Version **0.1.27**, early development. Login, live video and playback work
-end to end against real hardware (a Home Hub, an NVR and their cameras),
-over UDP/P2P only: Reoling races the device's local, NAT-mapped and relay
-addresses at the same time and uses whichever answers first, as the
-official client does.
+Version **1.0.0**, the first release with installable packages (see
+[Installation](#installation)). Login, live video, PTZ and the camera
+controls, the camera and device settings pages, and playback with sound,
+event bars and downloads work end to end on real hardware — a Home Hub,
+an NVR and their cameras — over UDP/P2P only: Reoling races the device's
+local, NAT-mapped and relay addresses at the same time and uses whichever
+answers first.
 
 **What the app does today**
 
@@ -89,9 +91,36 @@ official client does.
   Clear (main) and Fluent (sub) can be changed: resolution, frame rate,
   bitrate and I-frame interval, offered only as the camera itself allows;
   the live picture restarts with the new settings. Balanced (extern) is
-  shown as it is. Product pictures come from Reolink's own site and are
-  cached; until one loads, or for a model without one, a drawing of the
-  device kind (camera, NVR, Home Hub) stands in.
+  shown as it is. Beside Encoding, read-only tabs show what else the
+  camera tells about itself, with the values as the camera reports them:
+  Info (model, firmware, UID), Image (brightness, contrast, saturation,
+  sharpness, hue, corridor mode, day and night switching, the advanced
+  picture settings), Display (date, time and camera name on the picture,
+  the watermark), Detection (motion sensitivity and alarm delay, smart
+  detection types and object sizes, auto tracking), Light & sound
+  (status LED, infrared lights, the spotlight and its schedule, siren
+  triggers, sound), Schedules (the weekly recording, email, push, FTP
+  and siren schedules, drawn as grids) and Network (address mode, IP,
+  mask, gateway, MAC, DNS). Rows a model does not have — binning, auto
+  tracking, a status LED, "Pet" instead of "Animal" — are left out, as
+  the camera's own ability table says. Reload reads a tab again; the
+  tabs are read while the camera's live video runs (press Play first if
+  it is stopped) and wait while a download holds the connection. Product
+  pictures come from Reolink's own site and are cached; until one loads,
+  or for a model without one, a drawing of the device kind (camera, NVR,
+  Home Hub) stands in.
+- Device settings ("Device settings…" in the card menu of a connected Home
+  Hub or NVR): the device's own window, read-only, one tab each. Info
+  (model, firmware, UID), Storage (each drive's size and fill level, what
+  happens when it is full, recording encryption), Network (address, the
+  service ports — HTTP, HTTPS, RTSP, RTMP, ONVIF, UPnP —, DDNS, NTP and,
+  on a Hub, the Wi-Fi it offers its cameras), Time (time zone, clock,
+  date and time format, daylight saving, NTP), Light & sound on a Hub
+  (status LED, notification and alarm volume, alarm pause) or Alerts on
+  an NVR (recording, email, push and buzzer per camera), Users (the
+  accounts, shared access, login lockout) and Maintenance (auto reboot).
+  A tab is read when it is first shown and again on Reload; while a
+  download holds the connection it says so and reads once that is over.
 - Snapshot (PNG in `~/Pictures/Reoling`) and recording (MKV in
   `~/Videos/Reoling`, where Playback's downloads go too).
 - Settings ("Client Settings", laid out after the official app's window):
@@ -108,6 +137,11 @@ official client does.
 
 **Not done yet**
 
+- Changing the settings on the new pages: only Encoding is editable; the
+  camera and device pages are read-only.
+- Playback of several cameras at once (one camera per page today), and
+  thumbnails: the device list and the recordings show names and times,
+  no pictures.
 - Split View, zoom on cameras behind an NVR's sub-channel numbering.
 - Playback: one download at a time per device, and the device's playback
   and live video wait while it runs; no download of several cameras or of
@@ -118,7 +152,6 @@ official client does.
 - Deleting a PTZ preset sends `delPos` (this project's best guess when it
   was first written, matched only against message counts in a capture; now
   confirmed working against a real camera).
-- Packaging (see [Installation](#installation)).
 - Talk has been built from the official app's captured messages but is the
   least tested part.
 - Presets saved by an older Reoling (before 0.1.13) have no picture until
@@ -126,6 +159,31 @@ official client does.
 
 **Version history**
 
+- 1.0.0 — the first release with packages: `reoling_1.0.0-1_amd64.deb`
+  for Ubuntu 24.04 LTS and later (Debian 13 and later too) and
+  `Reoling-1.0.0-x86_64.AppImage` for other distributions, both built on
+  Ubuntu 24.04 by a GitHub Actions workflow and attached to every release
+  (see [Installation](#installation)); `reoling --version` prints the
+  version.
+  - Settings pages, read-only, with the values as the device reports
+    them: the camera settings window gets Info, Image, Display,
+    Detection, Light & sound, Schedules and Network tabs beside Encoding,
+    and "Device settings…" in a Home Hub's or NVR's card menu opens the
+    device's own window — Info, Storage, Network, Time, Light & sound
+    (Hub) or Alerts (NVR), Users, Maintenance. Rows a model does not have
+    are left out, after the camera's own ability table. Only Encoding can
+    be changed.
+  - Playback downloads: a range whose first recording is silent still
+    gets the sound of a later recording it covers; two downloads started
+    together never write into one file; a download the device does not
+    answer in time is ended on the device and the connection stays
+    usable; when the disk cannot keep up, the download fails instead of
+    holding the recording in memory; and a damaged frame header in
+    recorded footage no longer makes playback or a download wait (and
+    grow in memory) for a frame that never completes — the stream resyncs
+    at the next frame.
+  - Requests that arrive while a download holds the connection, the
+    settings reads among them, wait and go out once it is over.
 - 0.1.27 — Playback: a Download button saves a chosen time range (a start,
   a length from 30 s to 15 min or the whole recording, main or sub stream)
   as an MP4 with the recording's sound into the recordings folder, as one
@@ -280,7 +338,7 @@ src/
 │                and the reliable BCUDP connection.
 ├── client.rs    Client/session API: login and live video;
 │                `client/replay.rs`: recordings, events, playback and
-│                downloads.
+│                downloads; `client/settings.rs`: the settings pages.
 ├── talk.rs      ADPCM encoding for Talk.
 ├── ui/          GTK4 + GStreamer desktop app (main window, sidebar,
 │                dialogs, settings, playback, downloads, video and audio).
@@ -288,19 +346,59 @@ src/
 examples/        Small diagnostic tools (UID probe, media trace analysis).
 data/            Icons and the desktop entry.
 docs/            Screenshots used by this README.
+scripts/         Packaging: the GTK 4 sink build, the AppImage tools and
+                 build, and a rehearsal of the release in a container.
 ```
 
 Reoling is a Linux-only desktop application.
 
 ## Installation
 
-Not yet packaged. Planned distribution once the app reaches a usable
-state:
+Every release on GitHub — <https://github.com/derSobi/Reoling/releases> —
+carries two packages for x86_64 Linux, both built on Ubuntu 24.04 LTS by
+the release workflow (`.github/workflows/release.yml`) so that they run on
+24.04 and everything newer:
 
-- **Ubuntu / Debian**: a `reoling_<version>_amd64.deb` package.
-- **Linux, distro-independent**: a `Reoling.AppImage` build.
+- **`reoling_<version>-1_amd64.deb`** for Ubuntu 24.04 LTS or newer and
+  Debian 13 or newer (and derivatives with at least those library
+  versions): `sudo apt install ./reoling_<version>-1_amd64.deb`. apt
+  installs the GTK 4 and GStreamer runtime with it — the base, good and
+  bad plugin sets (parsers, muxers, the va hardware decoders), the libav
+  software decoders and a PulseAudio, PipeWire or ALSA sink — and
+  recommends a VA-API driver (`va-driver-all`, or the one for your GPU)
+  for hardware decoding and a keyring (GNOME Keyring or KWallet) for the
+  device passwords. Ubuntu 24.04 has no `gstreamer1.0-gtk4` package, so
+  the .deb carries GStreamer's GTK 4 paintable sink itself, in
+  `/usr/lib/reoling/gstreamer-1.0`, a directory `reoling` adds to its
+  plugin registry when it starts. Reoling then appears in the
+  applications menu; `reoling --version` prints the installed version.
+- **`Reoling-<version>-x86_64.AppImage`** for any other distribution with
+  glibc 2.39 or newer: `chmod +x Reoling-<version>-x86_64.AppImage` and
+  run it. The AppImage mounts itself with FUSE 2 (`libfuse2` or
+  `libfuse2t64`); without it, `--appimage-extract-and-run` unpacks it to a
+  temporary directory for that run, and `--appimage-extract` unpacks it
+  for good. Inside are GTK 4, GStreamer with the parsers, muxers, decoders
+  (libav in software, the va plugin for hardware) and sound sinks the app
+  uses, its GTK 4 sink, librsvg and the icons it draws. From the system it
+  takes glibc, Mesa (OpenGL/EGL), the X11 or Wayland client libraries,
+  fontconfig and the fonts, PulseAudio or PipeWire (`pipewire-pulse`) or
+  ALSA for sound, a VA-API driver for hardware decoding (looked for in
+  `/usr/lib/x86_64-linux-gnu/dri`, `/usr/lib64/dri` and `/usr/lib/dri`;
+  software decoding otherwise) and a Secret Service keyring (GNOME
+  Keyring, KWallet) for the device passwords. It keeps its own GStreamer
+  registry under `~/.cache/reoling`.
 
-Until then, build from source (see below).
+The workflow installs the .deb and starts both packages (`--version`) on
+Ubuntu 24.04 before it uploads them. To build them yourself — the sink
+build needs a current stable Rust, and `scripts/validate-in-docker.sh`
+rehearses the whole release in an `ubuntu:24.04` container:
+
+```bash
+scripts/build-gst-gtk4-plugin.sh target/gst-gtk4   # the GTK 4 sink, where the distribution has none
+cargo install cargo-deb && cargo deb                # target/debian/reoling_<version>-1_amd64.deb
+scripts/fetch-appimage-tools.sh ~/appimage-tools    # linuxdeploy, its plugins, appimagetool (pinned)
+APPIMAGE_TOOLS=~/appimage-tools scripts/build-appimage.sh target/release/reoling dist
+```
 
 ## Building from source
 
@@ -309,8 +407,10 @@ Requires:
 - Rust (edition 2021, `rust-version` 1.75+ — see `Cargo.toml`)
 - GTK4 (`>= 4.6`, Ubuntu 22.04's baseline) and its development headers
 - GStreamer, including `gstreamer-app`, the GTK4 paintable sink
-  (`gstreamer1.0-gtk4`) and a decoder plugin (`gstreamer-libav` for
-  software decoding; VA-API/NVDEC plugins for hardware decoding)
+  (`gstreamer1.0-gtk4`, or `scripts/build-gst-gtk4-plugin.sh` where the
+  distribution has none) and a decoder plugin (`gstreamer1.0-libav` for
+  software decoding; the va plugin from `gstreamer1.0-plugins-bad` for
+  hardware decoding)
 
 ```bash
 cargo build --release
@@ -318,9 +418,7 @@ cargo run --release
 ```
 
 Add a device with the **+** in the device list (its UID, or IP and port),
-then log in with the device's username and password. `--prefer-tcp` is a diagnostic-only flag that tries a
-direct TCP connection when the device is reachable that way; the normal
-path is always UDP/P2P.
+then log in with the device's username and password.
 
 To run the full test suite (protocol codec, transport and session logic —
 no real hardware required):

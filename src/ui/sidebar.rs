@@ -33,6 +33,8 @@ pub struct Handlers {
     pub on_select: Box<dyn Fn(&str)>,
     /// Click on one of its channels.
     pub on_channel: ChannelHandler,
+    /// "Device settings…" in the card's menu (an NVR or Home Hub).
+    pub on_settings: Box<dyn Fn(&str)>,
     pub on_relogin: Box<dyn Fn(&str)>,
     pub on_remove: Box<dyn Fn(&str)>,
 }
@@ -42,6 +44,9 @@ struct Card {
     name: Label,
     dot: Label,
     status: Label,
+    /// The menu's "Device settings…" entry, sensitive only while the
+    /// device is a connected NVR or Home Hub.
+    settings: Button,
     unfold: ToggleButton,
     channel_list: GtkBox,
     /// The channel buttons, in list order, with their channel numbers.
@@ -162,10 +167,15 @@ impl Sidebar {
         menu.add_css_class("flat");
         let popover = Popover::new();
         let menu_box = GtkBox::new(Orientation::Vertical, 2);
+        let settings = Button::with_label("Device settings…");
         let relogin = Button::with_label("Change login…");
         let remove = Button::with_label("Remove device");
+        settings.add_css_class("flat");
+        settings.set_sensitive(false);
+        settings.set_tooltip_text(Some("The settings of a connected NVR or Home Hub"));
         relogin.add_css_class("flat");
         remove.add_css_class("flat");
+        menu_box.append(&settings);
         menu_box.append(&relogin);
         menu_box.append(&remove);
         popover.set_child(Some(&menu_box));
@@ -220,6 +230,15 @@ impl Sidebar {
         let key = device.key.clone();
         let weak = Rc::downgrade(self);
         let pop = popover.clone();
+        settings.connect_clicked(move |_| {
+            pop.popdown();
+            if let Some(s) = weak.upgrade() {
+                (s.handlers.on_settings)(&key);
+            }
+        });
+        let key = device.key.clone();
+        let weak = Rc::downgrade(self);
+        let pop = popover.clone();
         relogin.connect_clicked(move |_| {
             pop.popdown();
             if let Some(s) = weak.upgrade() {
@@ -241,6 +260,7 @@ impl Sidebar {
                 name,
                 dot,
                 status,
+                settings,
                 unfold,
                 channel_list,
                 channel_buttons,
@@ -266,6 +286,14 @@ impl Sidebar {
     pub fn set_name(&self, key: &str, name: &str) {
         if let Some(card) = self.cards.borrow().get(key) {
             card.name.set_text(name);
+        }
+    }
+
+    /// Whether the card's menu offers the device's own settings (a
+    /// connected NVR or Home Hub).
+    pub fn set_settings_available(&self, key: &str, available: bool) {
+        if let Some(card) = self.cards.borrow().get(key) {
+            card.settings.set_sensitive(available);
         }
     }
 
