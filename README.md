@@ -196,7 +196,12 @@ answers first.
     the VA-API driver matches its library), and gives its own file the
     Reoling icon in GNOME Files from the first run on — the file's custom
     icon, set per user; other file managers may still show the generic
-    icon.
+    icon. Where the .deb is not installed it also adds Reoling to the
+    applications menu (a per-user desktop entry that starts the file), so
+    the dock shows the Reoling icon for its window; once the .deb is
+    installed, the next start of either package removes that entry and the
+    .deb's takes over. It does this only for the AppImage file it was
+    started from, and its SVG icons load on systems without librsvg too.
 - 0.1.27 — Playback: a Download button saves a chosen time range (a start,
   a length from 30 s to 15 min or the whole recording, main or sub stream)
   as an MP4 with the recording's sound into the recordings folder, as one
@@ -418,9 +423,20 @@ the release workflow (`.github/workflows/release.yml`) so that they run on
   managers and dialogs that read the cache but no custom icon. Both are
   checked at every start, so a replaced file (a new download) or a moved
   one gets its icon back the next time it runs. Other file managers
-  (Dolphin among them) may still show the generic icon. That is all it
-  touches: it installs no thumbnailer, so nothing of Reoling's runs on
-  other AppImage files.
+  (Dolphin among them) may still show the generic icon. Where the .deb is
+  not installed, it also writes the per-user desktop entry
+  `~/.local/share/applications/de.dersobi.reoling.desktop`, which starts
+  the AppImage file: Reoling then appears in the applications menu and the
+  dock shows its icon. The entry names the copy started last (a source
+  build writes the same entry for itself), and the menu hides it once that
+  file is gone. A per-user entry hides the .deb's of the same name, so
+  once the .deb is installed, the next start of either package (the menu
+  still starts the AppImage until then) removes the entry Reoling wrote,
+  and the .deb's takes over. If the AppImage file is deleted before that,
+  Reoling is missing from the menu until `reoling` is started once from a
+  terminal. That is all it touches, and only for the AppImage file it was
+  started from: it installs no thumbnailer and no file type association,
+  so nothing of Reoling's runs on other files.
 
 Both packages decode video in hardware where they can: with Decoding set
 to Auto (the default) GStreamer takes the highest-ranked decoder it has,
@@ -433,10 +449,11 @@ use. Hardware on a machine without a usable hardware decoder decodes in
 software instead of leaving the picture black, and the Decoding row says
 so.
 
-The workflow installs the .deb and starts both packages (`--version`) on
-Ubuntu 24.04 before it uploads them. To build them yourself — the sink
-build needs a current stable Rust, and `scripts/validate-in-docker.sh`
-rehearses the whole release in an `ubuntu:24.04` container:
+The workflow installs the .deb and starts both packages (`--version`, then
+20 s on a virtual display) on Ubuntu 24.04 before it uploads them. To build
+them yourself — the sink build needs a current stable Rust, and
+`scripts/validate-in-docker.sh` rehearses the whole release in an
+`ubuntu:24.04` container:
 
 ```bash
 scripts/build-gst-gtk4-plugin.sh target/gst-gtk4   # the GTK 4 sink, where the distribution has none

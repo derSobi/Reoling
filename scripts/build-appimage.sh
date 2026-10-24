@@ -154,6 +154,27 @@ rm -f "$appdir"/usr/lib/libglib-2.0.so* "$appdir"/usr/lib/libgobject-2.0.so* \
       "$appdir"/usr/lib/libgio-2.0.so* "$appdir"/usr/lib/libgmodule-2.0.so* \
       "$appdir"/usr/lib/libgthread-2.0.so*
 
+# The SVG pixbuf loader (libpixbufloader-svg.so, or libpixbufloader_svg.so
+# on newer distributions) links librsvg, which linuxdeploy bundles in
+# usr/lib, but gets the RUNPATH $ORIGIN, its own directory, alone: the
+# loader then took the host's librsvg, and on a host without one failed to
+# load ("librsvg-2.so.2: cannot open shared object file"), leaving GTK
+# without the symbolic icons. Its RUNPATH covers usr/lib as well, and the
+# loader must resolve the bundled librsvg through it, ahead of the host's
+# (the build machine has one, so the smoke tests would not notice).
+svg_loaders=("$appdir"/usr/lib/gdk-pixbuf-2.0/*/loaders/libpixbufloader[-_]svg.so)
+[ -f "${svg_loaders[0]}" ] || { echo "linuxdeploy bundled no SVG pixbuf loader" >&2; exit 1; }
+[ -f "$appdir/usr/lib/librsvg-2.so.2" ] || { echo "linuxdeploy bundled no librsvg-2.so.2 for the SVG loader" >&2; exit 1; }
+for loader in "${svg_loaders[@]}"; do
+    patchelf --set-rpath '$ORIGIN:$ORIGIN/../../..' "$loader"
+    echo "SVG pixbuf loader: ${loader#"$appdir"/}, RUNPATH $(patchelf --print-rpath "$loader")"
+    rsvg=$(env -u LD_LIBRARY_PATH ldd "$loader" | awk '$1 == "librsvg-2.so.2" { print $3 }' || true)
+    if [ -z "$rsvg" ] || [ "$(realpath -e "$rsvg" || true)" != "$(realpath -e "$appdir/usr/lib/librsvg-2.so.2")" ]; then
+        echo "${loader#"$appdir"/} takes librsvg-2.so.2 from ${rsvg:-nowhere}, not from usr/lib" >&2
+        exit 1
+    fi
+done
+
 # The symbolic icons the UI asks for, as a fallback for a desktop whose
 # icon theme lacks some of them: GTK tries the theme first and these last
 # (the app adds REOLING_ICON_PATH to its icon search path).
@@ -217,16 +238,23 @@ HOOK
 
 # linuxdeploy's AppRun names the hooks it knows; this one sources every hook
 # present (the two plugins' and ours, in name order) and runs the app. APPDIR
-# is set first: the AppImage runtime provides it, but an extracted AppRun
-# (--appimage-extract) does not, and the gstreamer hook, sourced before the
-# gtk one (which sets it), would otherwise point the bundled GStreamer at
-# the host's plugins.
+# is set first, to the directory AppRun is in: the AppImage runtime sets it
+# to just that, but an extracted AppRun (--appimage-extract) gets no APPDIR,
+# or one inherited from another AppImage (a runtime's APPDIR and APPIMAGE
+# reach every process its app starts), and the gstreamer hook, sourced
+# before the gtk one, would otherwise point the bundled GStreamer at the
+# host's plugins, or at the other image's. An APPIMAGE that did not come
+# with this directory names another AppImage's file and is dropped: the app
+# gives the file named by APPIMAGE its icon.
 cat > "$appdir/AppRun" <<'APPRUN'
 #! /usr/bin/env bash
 # Reoling's AppRun: environment from apprun-hooks/*.sh, then the app.
 set -e
 this_dir="$(readlink -f "$(dirname "$0")")"
-export APPDIR="${APPDIR:-$this_dir}"
+if [ -z "${APPDIR:-}" ] || [ "$(readlink -f "$APPDIR" || true)" != "$this_dir" ]; then
+    unset APPIMAGE
+fi
+export APPDIR="$this_dir"
 for hook in "$this_dir"/apprun-hooks/*.sh; do
     source "$hook"
 done
@@ -260,6 +288,11 @@ cp "$icon_src" "$appdir/.DirIcon"
 cp "$icon_src" "$appdir/$icon_name.png"
 file -b "$appdir/.DirIcon" | grep -q '^PNG image data' || { echo "$icon_src is not a PNG" >&2; exit 1; }
 echo "AppImage icon: $(file -b "$appdir/.DirIcon" | cut -d, -f1,2) from $icon_src"
+# Where no package installed Reoling's desktop entry, the app writes a
+# per-user one for the AppImage file from the bundled one, which it reads
+# from usr/share/applications (the copy at the root is a link to it).
+[ -f "$appdir/usr/share/applications/de.dersobi.reoling.desktop" ] \
+    || { echo "linuxdeploy put no desktop entry in usr/share/applications" >&2; exit 1; }
 
 # --- Check the bundle before packing it ---------------------------------------
 # Every element the app creates must register from the bundled plugins

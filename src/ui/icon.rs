@@ -1,7 +1,8 @@
 //! The app icon. Colours and widget styling are left entirely to the
 //! active GTK theme (including its accent colour); Reoling ships no
 //! stylesheet of its own. For the AppImage, this is also where the
-//! `.AppImage` file itself gets its icon in the file manager.
+//! `.AppImage` file itself gets its icon in the file manager, and the
+//! desktop its entry when no package installed one.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
@@ -46,15 +47,41 @@ pub fn install() {
     gtk4::Window::set_default_icon_name(ICON_NAME);
 }
 
+/// The desktop entry's file name: the application id, by which the desktop
+/// matches the window to the entry and its icon.
+const DESKTOP_FILE: &str = "de.dersobi.reoling.desktop";
+
+/// The key in `[Desktop Entry]` that marks a per-user entry as one Reoling
+/// wrote (for a source build or an AppImage); only such an entry is removed
+/// again once a package has installed its own.
+const GENERATED_KEY: &str = "X-Reoling-Generated";
+
 /// A source checkout (`cargo run`) has no installed desktop entry, and the
 /// dock then shows the bare application id and no icon. Writes a per-user
 /// entry (named "Reoling", pointing at this executable and the checkout's
 /// icon) unless the system already has one; an installed build ships its own.
+/// The AppImage writes the same per-user entry for itself (see
+/// [`install_appimage_integration`]): there is one such entry, and it points
+/// at the build started last.
+///
+/// A per-user entry hides the system's of the same name, from the menu as
+/// well once the file it starts is gone. So where the system has the entry
+/// (the .deb is installed), every build, the .deb too, removes at its start
+/// the per-user one Reoling wrote (see [`retire_generated_desktop_entry`]).
 pub fn install_desktop_entry() {
-    let file = "de.dersobi.reoling.desktop";
-    let system_has_it = glib::system_data_dirs().iter().any(|d| d.join("applications").join(file).is_file());
+    let user_data = glib::user_data_dir();
+    // The mounted AppImage's data directory is on the path too, with the
+    // entry it bundles; that one is no package's, nor is the directory of an
+    // AppImage whose `APPDIR` this process inherited.
+    let appdir = std::env::var_os("APPDIR").map(PathBuf::from).filter(|appdir| appdir.is_absolute());
+    if has_desktop_entry(&outside_appdir(glib::system_data_dirs(), appdir.as_deref())) {
+        if let Err(e) = retire_generated_desktop_entry(&user_data) {
+            eprintln!("could not remove the per-user desktop entry: {e}");
+        }
+        return;
+    }
     let Ok(exe) = std::env::current_exe() else { return };
-    if system_has_it || !exe.ancestors().any(|a| a.join("data/icons/hicolor").is_dir()) {
+    if !exe.ancestors().any(|a| a.join("data/icons/hicolor").is_dir()) {
         return;
     }
     let icon = exe
@@ -62,20 +89,84 @@ pub fn install_desktop_entry() {
         .map(|a| a.join("data/icons/hicolor/256x256/apps/de.dersobi.reoling.png"))
         .find(|p| p.is_file())
         .map_or_else(|| ICON_NAME.to_string(), |p| p.display().to_string());
-    let entry = format!(
-        "[Desktop Entry]\nType=Application\nName=Reoling\nGenericName=Reolink client\nComment=Unofficial client for Reolink cameras, NVRs and Home Hubs\nExec=\"{}\"\nIcon={icon}\nTerminal=false\nCategories=AudioVideo;Video;\nStartupWMClass={ICON_NAME}\n",
-        exe.display()
-    );
-    let path = glib::user_data_dir().join("applications").join(file);
-    if std::fs::read_to_string(&path).is_ok_and(|current| current == entry) {
+    let Some(exec) = exec_quoted(&exe) else {
+        eprintln!("no desktop entry: {} cannot be written into one", exe.display());
         return;
-    }
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Err(e) = std::fs::write(&path, entry) {
+    };
+    let entry = format!(
+        "[Desktop Entry]\nType=Application\nName=Reoling\nGenericName=Reolink client\nComment=Unofficial client for Reolink cameras, NVRs and Home Hubs\nExec={exec}\nIcon={icon}\nTerminal=false\nCategories=AudioVideo;Video;\nStartupWMClass={ICON_NAME}\n{GENERATED_KEY}=true\n"
+    );
+    if let Err(e) = write_user_desktop_entry(&user_data, &entry) {
         eprintln!("could not write the desktop entry: {e}");
     }
+}
+
+/// Whether one of the data directories `dirs` has Reoling's desktop entry.
+fn has_desktop_entry(dirs: &[PathBuf]) -> bool {
+    dirs.iter().any(|dir| dir.join("applications").join(DESKTOP_FILE).is_file())
+}
+
+/// Removes the per-user desktop entry under `user_data` (`~/.local/share`)
+/// if Reoling wrote it, that is, it sets [`GENERATED_KEY`]; one that does
+/// not, or does not parse, stays. For when the system has Reoling's entry.
+/// Returns whether it removed the entry.
+fn retire_generated_desktop_entry(user_data: &Path) -> io::Result<bool> {
+    let path = user_data.join("applications").join(DESKTOP_FILE);
+    let entry = glib::KeyFile::new();
+    if entry.load_from_file(&path, glib::KeyFileFlags::NONE).is_err()
+        || !entry.boolean("Desktop Entry", GENERATED_KEY).unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        // Gone meanwhile: the AppImage's integration does the same.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Writes `entry` as the per-user desktop entry
+/// (`<user_data>/applications/de.dersobi.reoling.desktop`, 0644) unless the
+/// file says that already; it replaces whatever entry was there, through a
+/// temporary file. Returns whether it wrote.
+fn write_user_desktop_entry(user_data: &Path, entry: &str) -> io::Result<bool> {
+    let path = user_data.join("applications").join(DESKTOP_FILE);
+    if fs::read(&path).is_ok_and(|current| current == entry.as_bytes()) {
+        return Ok(false);
+    }
+    write_atomically(&path, entry.as_bytes(), 0o755, 0o644).map(|()| true)
+}
+
+/// `path` as the program of a desktop entry's `Exec` key: in double quotes,
+/// with `"`, `` ` ``, `$` and `\` escaped by a backslash for the quoting and
+/// every backslash escaped once more for the key file. `None` for a path
+/// that is not UTF-8, holds a control character, or a `%`: GLib looks the
+/// program up before it expands the field codes and runs it after, so
+/// neither `%` nor `%%` names the file both times.
+fn exec_quoted(path: &Path) -> Option<String> {
+    let path = path.to_str().filter(|path| !path.chars().any(|c| c.is_control() || c == '%'))?;
+    let mut quoted = String::with_capacity(path.len() + 2);
+    quoted.push('"');
+    for c in path.chars() {
+        match c {
+            '"' | '`' | '$' => {
+                quoted.push_str("\\\\");
+                quoted.push(c);
+            }
+            '\\' => quoted.push_str("\\\\\\\\"),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    Some(quoted)
+}
+
+/// `path` as a desktop entry string value (`TryExec`): backslashes escaped.
+/// `None` as for [`exec_quoted`].
+fn desktop_string(path: &Path) -> Option<String> {
+    let path = path.to_str().filter(|path| !path.chars().any(char::is_control))?;
+    Some(path.replace('\\', "\\\\"))
 }
 
 /// Started from an AppImage, the file manager shows the `.AppImage` file
@@ -101,18 +192,33 @@ pub fn install_desktop_entry() {
 /// Reoling installs no thumbnailer, which the desktop would run on every
 /// AppImage the user so much as views in a folder.
 ///
+/// Where no system data directory has Reoling's desktop entry (no .deb is
+/// installed), the desktop has nothing to match the window to either, and
+/// the dock and the overview show it with a generic icon. The AppImage then
+/// writes the per-user entry `~/.local/share/applications/
+/// de.dersobi.reoling.desktop`, which starts the file (see
+/// [`appimage_desktop_entry`]); as with a source build's, the entry points
+/// at the build started last.
+///
 /// This runs only when the AppImage runtime set `APPIMAGE` (the file's
-/// path) and `APPDIR` (its mount point), so the .deb and a source build
-/// never do it. A second start rewrites nothing unless the file was
-/// replaced (the thumbnails are keyed by its modification time) or moved
-/// (both are keyed by the path: a plain `mv` leaves the icon behind until
-/// the next start, a move in Files carries it). Errors are printed and
-/// otherwise ignored; the worst case is today's generic icon.
+/// path) and `APPDIR` (its mount point) for this very process: the runtime
+/// exports both to everything the app starts as well, so the .deb or a
+/// source build started from a shell that some AppImage started finds them
+/// set for that other file, and leaves it alone (see
+/// [`runs_from_own_appdir`]). A second start rewrites nothing unless the
+/// file was replaced (the thumbnails are keyed by its modification time) or
+/// moved (the file's icon, its thumbnails and the desktop entry go by its
+/// path: a plain `mv` leaves them behind until the next start, a move in
+/// Files carries the icon). Errors are printed and otherwise ignored; the
+/// worst case is today's generic icon.
 pub fn install_appimage_integration() {
     let (Some(appimage), Some(appdir)) = (std::env::var_os("APPIMAGE"), std::env::var_os("APPDIR")) else {
         return;
     };
     let (appimage, appdir) = (PathBuf::from(appimage), PathBuf::from(appdir));
+    if !std::env::current_exe().is_ok_and(|exe| runs_from_own_appdir(&exe, &appimage, &appdir)) {
+        return;
+    }
     // The runtime resolves every symbolic link for `APPIMAGE`, but the file
     // manager names the file by the path it shows. A file started through
     // another path (a folder reached through a link) is treated under that
@@ -132,12 +238,32 @@ pub fn install_appimage_integration() {
     }
 }
 
+/// Whether this process is the one an AppImage runtime started for the file
+/// `appimage` it mounted (or unpacked) at `appdir`: the running executable
+/// `exe` is that directory's `usr/bin/reoling` (links resolved), and
+/// `appimage` is a regular file. An `APPDIR` inherited from another
+/// AppImage's process holds no such executable, or not the one running.
+fn runs_from_own_appdir(exe: &Path, appimage: &Path, appdir: &Path) -> bool {
+    let (Ok(exe), Ok(appdir)) = (fs::canonicalize(exe), fs::canonicalize(appdir)) else {
+        return false;
+    };
+    exe.starts_with(&appdir)
+        && same_file(&exe, &appdir.join("usr/bin/reoling"))
+        && fs::metadata(appimage).is_ok_and(|meta| meta.is_file())
+}
+
 /// The work of [`install_appimage_integration`], for the AppImage mounted
-/// at `appdir` that the file manager shows under `paths`.
+/// at `appdir` that the file manager shows under `paths` (the first being
+/// `APPIMAGE`).
 fn integrate_appimage(paths: &[PathBuf], appdir: &Path) {
     let user_data = glib::user_data_dir();
-    let system_data = outside_appdir(glib::system_data_dirs(), appdir);
+    let system_data = outside_appdir(glib::system_data_dirs(), Some(appdir));
     install_user_icons(appdir, &system_data, &user_data);
+    if let Some(appimage) = paths.first() {
+        if let Err(e) = install_appimage_desktop_entry(appimage, appdir, &system_data, &user_data) {
+            eprintln!("could not update the desktop entry for {}: {e}", appimage.display());
+        }
+    }
     let icon = find_theme_icon(&user_data, &system_data);
     if icon.is_none() {
         eprintln!("no Reoling icon in the icon themes; the AppImage file keeps the generic icon in GNOME Files");
@@ -189,12 +315,17 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// `dirs` without those inside `appdir`. The AppImage's start-up hooks put
-/// its own `usr/share` first on `XDG_DATA_DIRS`, so to GLib the mounted
-/// image is a system data directory; an icon found there is gone with the
-/// mount when the app exits.
-fn outside_appdir(dirs: Vec<PathBuf>, appdir: &Path) -> Vec<PathBuf> {
-    dirs.into_iter().filter(|dir| !dir.starts_with(appdir)).collect()
+/// `dirs` without those inside `appdir` (if given) and without relative
+/// ones. The AppImage's start-up hooks put its own `usr/share` first on
+/// `XDG_DATA_DIRS`, so to GLib the mounted image is a system data
+/// directory; an icon found there is gone with the mount when the app
+/// exits, and the desktop entry there is no package's. They also append
+/// the variable as it was, which leaves an empty directory where it was
+/// unset (`…:/usr/share:`): that, as any relative one, would name a place
+/// in the working directory.
+fn outside_appdir(dirs: Vec<PathBuf>, appdir: Option<&Path>) -> Vec<PathBuf> {
+    let inside = |dir: &Path| appdir.is_some_and(|appdir| dir.starts_with(appdir));
+    dirs.into_iter().filter(|dir| dir.is_absolute() && !inside(dir)).collect()
 }
 
 /// The sizes `data/icons/hicolor` has the icon in.
@@ -256,6 +387,78 @@ fn find_theme_icon(user_data: &Path, system_data: &[PathBuf]) -> Option<PathBuf>
             .map(|dir| dir.join(&icon))
             .find(|path| path.is_file())
     })
+}
+
+/// Writes the per-user desktop entry for the AppImage file `appimage` into
+/// `user_data` (`~/.local/share`), made from the one bundled in `appdir`
+/// (see [`appimage_desktop_entry`]), unless one of `system_data` (the data
+/// directories outside the image) has Reoling's entry: the .deb's then
+/// names the window, and the per-user entry Reoling wrote before the .deb
+/// was installed is removed (see [`retire_generated_desktop_entry`]).
+/// Returns whether it wrote.
+fn install_appimage_desktop_entry(
+    appimage: &Path,
+    appdir: &Path,
+    system_data: &[PathBuf],
+    user_data: &Path,
+) -> io::Result<bool> {
+    if has_desktop_entry(system_data) {
+        retire_generated_desktop_entry(user_data)?;
+        return Ok(false);
+    }
+    let bundled = fs::read_to_string(appdir.join("usr/share/applications").join(DESKTOP_FILE))?;
+    let entry = appimage_desktop_entry(&bundled, appimage)
+        .ok_or_else(|| io::Error::other("the path cannot be written into a desktop entry"))?;
+    write_user_desktop_entry(user_data, &entry)
+}
+
+/// The desktop entry that starts the AppImage file `appimage`: the bundled
+/// entry `bundled` with every `Exec` running the file (in place of the
+/// program, its arguments and field codes kept), a `TryExec` naming the
+/// file, on which the desktop hides the entry once the file is gone,
+/// [`GENERATED_KEY`], and `Icon` the icon's theme name (the copies in the
+/// user's theme, see [`install_user_icons`]). A `MimeType` key is left out,
+/// so the desktop offers the AppImage for no file. `None` when the path
+/// cannot be written into an entry (see [`exec_quoted`]) or the bundled
+/// entry has no `Exec`.
+fn appimage_desktop_entry(bundled: &str, appimage: &Path) -> Option<String> {
+    let (exec, try_exec) = (exec_quoted(appimage)?, desktop_string(appimage)?);
+    let mut entry = String::with_capacity(bundled.len() + 2 * exec.len());
+    let (mut main_group, mut started) = (false, false);
+    for line in bundled.lines() {
+        if line.starts_with('[') {
+            main_group = line.trim_end() == "[Desktop Entry]";
+        }
+        let (key, value) = line.split_once('=').map_or((line, ""), |(key, value)| (key.trim_end(), value.trim_start()));
+        match key {
+            "Exec" => {
+                // The program is the first word: the bundled entry names it
+                // bare (`reoling`).
+                entry.push_str("Exec=");
+                entry.push_str(&exec);
+                if let Some((_, args)) = value.split_once([' ', '\t']) {
+                    entry.push(' ');
+                    entry.push_str(args.trim_start());
+                }
+                if main_group {
+                    entry.push_str("\nTryExec=");
+                    entry.push_str(&try_exec);
+                    entry.push('\n');
+                    entry.push_str(GENERATED_KEY);
+                    entry.push_str("=true");
+                    started = true;
+                }
+            }
+            "Icon" => {
+                entry.push_str("Icon=");
+                entry.push_str(ICON_NAME);
+            }
+            "TryExec" | "MimeType" | GENERATED_KEY => continue,
+            _ => entry.push_str(line),
+        }
+        entry.push('\n');
+    }
+    started.then_some(entry)
 }
 
 /// The attribute GNOME Files reads before anything else when it chooses a
@@ -688,7 +891,14 @@ mod tests {
         // The mounted image is on the data path too, and is not "the system".
         let mount = PathBuf::from("/tmp/.mount_Reolinab12cd");
         let dirs = vec![mount.join("usr/share"), PathBuf::from("/usr/share"), PathBuf::from("/usr/local/share")];
-        assert_eq!(outside_appdir(dirs, &mount), [PathBuf::from("/usr/share"), PathBuf::from("/usr/local/share")]);
+        let outside = [PathBuf::from("/usr/share"), PathBuf::from("/usr/local/share")];
+        assert_eq!(outside_appdir(dirs.clone(), Some(&mount)), outside);
+        assert_eq!(outside_appdir(dirs.clone(), None), dirs);
+        // An empty directory (from `XDG_DATA_DIRS=…:/usr/share:`) or a
+        // relative one is no system directory either.
+        let mut with_relative = dirs;
+        with_relative.extend([PathBuf::new(), PathBuf::from("share")]);
+        assert_eq!(outside_appdir(with_relative, Some(&mount)), outside);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -749,6 +959,157 @@ mod tests {
         assert_eq!(through_link, dir.join("link/R.AppImage"));
         assert!(same_file(&through_link, &real.join("R.AppImage")));
         assert!(!same_file(&through_link, &dir.join("missing")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_appimage_that_started_the_app_is_integrated() {
+        let dir = scratch("own-appdir");
+        let appimage = dir.join("Reoling-1.0.0-x86_64.AppImage");
+        fs::write(&appimage, b"\x7fELF").unwrap();
+        // Reoling's image as the runtime mounted it, another AppImage's
+        // mount, and the .deb's (or a source build's) executable.
+        let (own, foreign, installed) = (dir.join(".mount_Reolin"), dir.join(".mount_Other"), dir.join("bin/reoling"));
+        for exe in [own.join("usr/bin/reoling"), foreign.join("usr/bin/reoling"), installed.clone()] {
+            fs::create_dir_all(exe.parent().unwrap()).unwrap();
+            fs::write(&exe, b"\x7fELF").unwrap();
+        }
+        let exe = own.join("usr/bin/reoling");
+        assert!(runs_from_own_appdir(&exe, &appimage, &own));
+        // The mount point named through a link is still the one.
+        std::os::unix::fs::symlink(&own, dir.join("link")).unwrap();
+        assert!(runs_from_own_appdir(&exe, &appimage, &dir.join("link")));
+        // Started from a shell another AppImage started, with its APPIMAGE
+        // and APPDIR: the running executable is not in that directory.
+        assert!(!runs_from_own_appdir(&installed, &appimage, &foreign));
+        assert!(!runs_from_own_appdir(&exe, &appimage, &foreign));
+        // In the directory, but not its executable.
+        assert!(!runs_from_own_appdir(&own.join("usr/bin"), &appimage, &own));
+        // APPIMAGE is a regular file; APPDIR exists.
+        assert!(!runs_from_own_appdir(&exe, &dir, &own));
+        assert!(!runs_from_own_appdir(&exe, &dir.join("missing"), &own));
+        assert!(!runs_from_own_appdir(&exe, &appimage, &dir.join("missing")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The desktop entry in `data/`, the one the AppImage bundles.
+    const BUNDLED_ENTRY: &str = include_str!("../../data/de.dersobi.reoling.desktop");
+
+    #[test]
+    fn appimage_entry_starts_the_file() {
+        let dir = scratch("appimage-entry");
+        // A folder name with all that needs escaping in an entry.
+        let folder = dir.join("My Apps \"new\" $HOME `x` back\\slash");
+        fs::create_dir_all(&folder).unwrap();
+        let appimage = folder.join("Reoling-1.0.0-x86_64.AppImage");
+        fs::write(&appimage, b"\x7fELF").unwrap();
+        fs::set_permissions(&appimage, fs::Permissions::from_mode(0o755)).unwrap();
+        let action = "[Desktop Action window]\nName=Window\nExec=reoling --window %u\n";
+        let bundled = format!("{BUNDLED_ENTRY}MimeType=video/mp4;\n\n{action}");
+        let entry = appimage_desktop_entry(&bundled, &appimage).unwrap();
+        let keyfile = glib::KeyFile::new();
+        keyfile.load_from_data(&entry, glib::KeyFileFlags::NONE).unwrap();
+        let get = |group: &str, key: &str| keyfile.string(group, key).ok().map(|value| value.to_string());
+        let argv = |group: &str| glib::shell_parse_argv(get(group, "Exec").unwrap()).unwrap();
+        let path = appimage.clone().into_os_string();
+        assert_eq!(argv("Desktop Entry"), [path.clone()]);
+        assert_eq!(argv("Desktop Action window"), [path, "--window".into(), "%u".into()]);
+        assert_eq!(get("Desktop Entry", "TryExec").map(PathBuf::from), Some(appimage.clone()));
+        assert_eq!(get("Desktop Action window", "TryExec"), None);
+        assert_eq!(get("Desktop Entry", "Icon").as_deref(), Some(ICON_NAME));
+        assert_eq!(get("Desktop Entry", "MimeType"), None);
+        assert!(keyfile.boolean("Desktop Entry", GENERATED_KEY).unwrap());
+        assert_eq!(get("Desktop Action window", GENERATED_KEY), None);
+        // The rest is the bundled entry's.
+        assert_eq!(get("Desktop Entry", "Name").as_deref(), Some("Reoling"));
+        assert_eq!(get("Desktop Entry", "StartupWMClass").as_deref(), Some(ICON_NAME));
+        assert_eq!(get("Desktop Entry", "Categories").as_deref(), Some("AudioVideo;Video;"));
+        // GLib takes the entry while the file is there, and drops it after.
+        assert!(gio::DesktopAppInfo::from_keyfile(&keyfile).is_some());
+        fs::remove_file(&appimage).unwrap();
+        assert!(gio::DesktopAppInfo::from_keyfile(&keyfile).is_none());
+
+        // Paths no entry can name, and a bundled entry that starts nothing.
+        assert_eq!(appimage_desktop_entry(BUNDLED_ENTRY, Path::new("/home/user/100% done/R.AppImage")), None);
+        assert_eq!(appimage_desktop_entry(BUNDLED_ENTRY, Path::new("/home/user/a\nb/R.AppImage")), None);
+        assert_eq!(appimage_desktop_entry("[Desktop Entry]\nName=Reoling\n", Path::new("/opt/R.AppImage")), None);
+        // A source build's entry is spelled as before for a plain path.
+        let exe = "/home/user/Reoling/target/release/reoling";
+        assert_eq!(exec_quoted(Path::new(exe)), Some(format!("\"{exe}\"")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appimage_entry_is_written_once_and_only_without_the_package() {
+        let dir = scratch("appimage-entry-install");
+        let appdir = dir.join("appdir");
+        let bundled = appdir.join("usr/share/applications").join(DESKTOP_FILE);
+        fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        fs::write(&bundled, BUNDLED_ENTRY).unwrap();
+        let appimage = dir.join("Reoling-1.0.0-x86_64.AppImage");
+        fs::write(&appimage, b"\x7fELF").unwrap();
+        let (system, user) = (dir.join("system"), dir.join("user"));
+        let system_dirs = [system.clone()];
+        let entry = user.join("applications").join(DESKTOP_FILE);
+        let install = |appimage: &Path| install_appimage_desktop_entry(appimage, &appdir, &system_dirs, &user).unwrap();
+
+        assert!(install(&appimage));
+        assert_eq!(fs::read_to_string(&entry).unwrap(), appimage_desktop_entry(BUNDLED_ENTRY, &appimage).unwrap());
+        assert_eq!(mode(&entry), 0o644);
+        assert_eq!(fs::read_dir(entry.parent().unwrap()).unwrap().count(), 1);
+        // A second start rewrites nothing.
+        let first = inode(&entry);
+        assert!(!install(&appimage));
+        assert_eq!(inode(&entry), first);
+        // Started from another path, it points there: the build started
+        // last has the entry.
+        let moved = dir.join("Reoling.AppImage");
+        fs::rename(&appimage, &moved).unwrap();
+        assert!(install(&moved));
+        assert_eq!(fs::read_to_string(&entry).unwrap(), appimage_desktop_entry(BUNDLED_ENTRY, &moved).unwrap());
+        // With the .deb installed its entry names the window: none written,
+        // and the one written before, which would hide the .deb's, removed.
+        fs::create_dir_all(system.join("applications")).unwrap();
+        fs::write(system.join("applications").join(DESKTOP_FILE), BUNDLED_ENTRY).unwrap();
+        assert!(!install(&moved));
+        assert!(!entry.exists());
+        // An entry Reoling did not write stays.
+        fs::write(&entry, BUNDLED_ENTRY).unwrap();
+        assert!(!install(&moved));
+        assert_eq!(fs::read_to_string(&entry).unwrap(), BUNDLED_ENTRY);
+        fs::remove_file(&entry).unwrap();
+        // An image without the bundled entry is an error, and writes nothing.
+        fs::remove_file(system.join("applications").join(DESKTOP_FILE)).unwrap();
+        fs::remove_file(&bundled).unwrap();
+        assert!(install_appimage_desktop_entry(&moved, &appdir, &system_dirs, &user).is_err());
+        assert!(!entry.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_an_entry_reoling_wrote_is_retired() {
+        let dir = scratch("retire-entry");
+        let entry = dir.join("applications").join(DESKTOP_FILE);
+        fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        // None there: nothing to do.
+        assert!(!retire_generated_desktop_entry(&dir).unwrap());
+        let action = "\n[Desktop Action window]\nName=Window\nExec=reoling --window\n";
+        for (text, generated) in [
+            (format!("{BUNDLED_ENTRY}{GENERATED_KEY}=true\n"), true),
+            (format!("{BUNDLED_ENTRY}{GENERATED_KEY}=false\n"), false),
+            (BUNDLED_ENTRY.to_string(), false),
+            // The key in another group, and a file that is no entry at all.
+            (format!("{BUNDLED_ENTRY}{action}{GENERATED_KEY}=true\n"), false),
+            ("Reoling\n".to_string(), false),
+        ] {
+            fs::write(&entry, &text).unwrap();
+            assert_eq!(retire_generated_desktop_entry(&dir).unwrap(), generated, "{text}");
+            assert_eq!(entry.exists(), !generated, "{text}");
+        }
+        // The entries Reoling writes are marked.
+        let appimage = appimage_desktop_entry(BUNDLED_ENTRY, Path::new("/opt/Reoling.AppImage")).unwrap();
+        fs::write(&entry, appimage).unwrap();
+        assert!(retire_generated_desktop_entry(&dir).unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 }
