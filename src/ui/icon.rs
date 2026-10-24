@@ -6,11 +6,12 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use gtk4::gdk::Display;
+use gtk4::gio::{self, prelude::*};
 use md5::{Digest, Md5};
 
 /// The icon name shipped in `data/icons/hicolor/*/apps/`; also the
@@ -80,42 +81,82 @@ pub fn install_desktop_entry() {
 /// Started from an AppImage, the file manager shows the `.AppImage` file
 /// with the generic "executable" icon: nothing on a stock desktop reads the
 /// icon an AppImage embeds, and the icon themes have none for its MIME
-/// type. This writes the thumbnail-cache entries for this very file
-/// (`~/.cache/thumbnails/{large,x-large}/<md5 of the file URI>.png`, see
-/// [`thumbnail_sources`]) from the icons inside the mounted AppImage, and
-/// drops a thumbnailing failure the desktop recorded for it. GNOME Files,
-/// and every file manager that reads the shared cache, then shows the
-/// Reoling icon for the file from the first run on, with no thumbnailer
-/// involved. For this file only: Reoling installs no thumbnailer, which
-/// the desktop would run on every AppImage the user so much as views in a
-/// folder.
+/// type. At every start from an AppImage this gives the file its own icon,
+/// through two channels that touch nothing but Reoling's own files:
 ///
-/// The entries are written only when the AppImage runtime set `APPIMAGE`
-/// (the file's path) and `APPDIR` (its mount point), so the .deb and a
-/// source build never do this, and again when the file was replaced (its
-/// modification time changed) or moved (the entries are keyed by the
-/// path); otherwise a second start rewrites nothing. Errors are printed
-/// and otherwise ignored; the worst case is today's generic icon.
+/// - The Reoling icon goes into the user's icon theme
+///   (`~/.local/share/icons/hicolor/<size>/apps/de.dersobi.reoling.png`,
+///   copied from the mounted AppImage) for every size the system theme
+///   lacks, and the file gets the GIO attribute `metadata::custom-icon`
+///   with that icon's URI. GNOME Files (and the file managers that share
+///   its code) shows a file's custom icon before any MIME icon, at every
+///   zoom level; gvfs keeps the attribute per user and per path. By hand:
+///   `gio set <file> metadata::custom-icon file://<icon>`.
+/// - The thumbnail-cache entries for the file
+///   (`~/.cache/thumbnails/{large,x-large}/<md5 of the file URI>.png`, see
+///   [`thumbnail_sources`]), which the GTK file chooser and the file
+///   managers that read the shared cache but no gvfs metadata show; a
+///   thumbnailing failure the desktop recorded for the file is dropped.
+///
+/// Reoling installs no thumbnailer, which the desktop would run on every
+/// AppImage the user so much as views in a folder.
+///
+/// This runs only when the AppImage runtime set `APPIMAGE` (the file's
+/// path) and `APPDIR` (its mount point), so the .deb and a source build
+/// never do it. A second start rewrites nothing unless the file was
+/// replaced (the thumbnails are keyed by its modification time) or moved
+/// (both are keyed by the path: a plain `mv` leaves the icon behind until
+/// the next start, a move in Files carries it). Errors are printed and
+/// otherwise ignored; the worst case is today's generic icon.
 pub fn install_appimage_integration() {
     let (Some(appimage), Some(appdir)) = (std::env::var_os("APPIMAGE"), std::env::var_os("APPDIR")) else {
         return;
     };
     let (appimage, appdir) = (PathBuf::from(appimage), PathBuf::from(appdir));
-    let thumbnails = glib::user_cache_dir().join("thumbnails");
     // The runtime resolves every symbolic link for `APPIMAGE`, but the file
-    // manager keys the thumbnail by the path it shows. A file started
-    // through another path (a folder reached through a link) gets an entry
-    // for that path too: `ARGV0` is the path as invoked, `OWD` the
-    // directory it is relative to.
+    // manager names the file by the path it shows. A file started through
+    // another path (a folder reached through a link) is treated under that
+    // path too: `ARGV0` is the path as invoked, `OWD` the directory it is
+    // relative to.
     let mut paths = vec![appimage.clone()];
     if let Some(invoked) = std::env::var_os("ARGV0").and_then(|argv0| invoked_path(&argv0, std::env::var_os("OWD"))) {
         if invoked != appimage && same_file(&invoked, &appimage) {
             paths.push(invoked);
         }
     }
-    for path in &paths {
-        if let Err(e) = seed_own_thumbnail(path, &appdir, &thumbnails) {
-            eprintln!("could not write the AppImage's file icon to {}: {e}", thumbnails.display());
+    // Off the GTK thread: the attribute is a round trip to the gvfs
+    // metadata daemon, which the session may still have to start.
+    let thread = std::thread::Builder::new().name("appimage-icon".into());
+    if let Err(e) = thread.spawn(move || integrate_appimage(&paths, &appdir)) {
+        eprintln!("could not start giving the AppImage file its icon: {e}");
+    }
+}
+
+/// The work of [`install_appimage_integration`], for the AppImage mounted
+/// at `appdir` that the file manager shows under `paths`.
+fn integrate_appimage(paths: &[PathBuf], appdir: &Path) {
+    let user_data = glib::user_data_dir();
+    let system_data = outside_appdir(glib::system_data_dirs(), appdir);
+    install_user_icons(appdir, &system_data, &user_data);
+    let icon = find_theme_icon(&user_data, &system_data);
+    if icon.is_none() {
+        eprintln!("no Reoling icon in the icon themes; the AppImage file keeps the generic icon in GNOME Files");
+    }
+    let thumbnails = glib::user_cache_dir().join("thumbnails");
+    for path in paths {
+        let mut changed = false;
+        if let Some(icon) = &icon {
+            match set_custom_icon(path, icon) {
+                Ok(set) => changed |= set,
+                Err(e) => eprintln!("could not set the file icon of {}: {e}", path.display()),
+            }
+        }
+        match seed_own_thumbnail(path, appdir, &thumbnails) {
+            Ok(written) => changed |= written,
+            Err(e) => eprintln!("could not write the thumbnail of {} to {}: {e}", path.display(), thumbnails.display()),
+        }
+        if changed {
+            nudge(path);
         }
     }
 }
@@ -148,6 +189,110 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// `dirs` without those inside `appdir`. The AppImage's start-up hooks put
+/// its own `usr/share` first on `XDG_DATA_DIRS`, so to GLib the mounted
+/// image is a system data directory; an icon found there is gone with the
+/// mount when the app exits.
+fn outside_appdir(dirs: Vec<PathBuf>, appdir: &Path) -> Vec<PathBuf> {
+    dirs.into_iter().filter(|dir| !dir.starts_with(appdir)).collect()
+}
+
+/// The sizes `data/icons/hicolor` has the icon in.
+const ICON_SIZES: [u32; 9] = [16, 22, 24, 32, 48, 64, 128, 256, 512];
+
+/// The icon's path inside a data directory (`/usr/share`, `~/.local/share`,
+/// the AppDir's `usr/share`) for one size.
+fn theme_icon(size: u32) -> PathBuf {
+    PathBuf::from(format!("icons/hicolor/{size}x{size}/apps/{ICON_NAME}.png"))
+}
+
+/// Copies the icons under `appdir/usr/share/icons/hicolor` into the user's
+/// icon theme under `user_data` (`~/.local/share`): each size that no
+/// system data directory has and whose per-user copy is missing or
+/// differs. The copies are world-readable (0644, in directories created
+/// 0755; existing directories keep their mode). When one was written, the
+/// theme directory's modification time is set to now, on which running GTK
+/// applications rescan it (as `xdg-icon-resource` does). An icon that
+/// cannot be written is reported and leaves the rest to go on, and so is
+/// a theme directory whose time cannot be set (the icons are in place all
+/// the same). Returns whether anything was written.
+fn install_user_icons(appdir: &Path, system_data: &[PathBuf], user_data: &Path) -> bool {
+    let mut written = false;
+    for size in ICON_SIZES {
+        let icon = theme_icon(size);
+        let source = appdir.join("usr/share").join(&icon);
+        if !source.is_file() || system_data.iter().any(|dir| dir.join(&icon).is_file()) {
+            continue;
+        }
+        let target = user_data.join(&icon);
+        let result = fs::read(&source).and_then(|png| {
+            if fs::read(&target).is_ok_and(|current| current == png) {
+                return Ok(false);
+            }
+            write_atomically(&target, &png, 0o755, 0o644).map(|()| true)
+        });
+        match result {
+            Ok(wrote) => written |= wrote,
+            Err(e) => eprintln!("could not write {}: {e}", target.display()),
+        }
+    }
+    if written {
+        let hicolor = user_data.join("icons/hicolor");
+        if let Err(e) = File::open(&hicolor).and_then(|dir| dir.set_modified(SystemTime::now())) {
+            eprintln!("could not mark {} as changed: {e}", hicolor.display());
+        }
+    }
+    written
+}
+
+/// The installed icon the file manager is pointed at: the 512 px one,
+/// else the 256 px one (it scales either to its icon sizes), in the user's
+/// theme first, then the system's; `None` when neither has it.
+fn find_theme_icon(user_data: &Path, system_data: &[PathBuf]) -> Option<PathBuf> {
+    [512, 256].into_iter().find_map(|size| {
+        let icon = theme_icon(size);
+        std::iter::once(user_data)
+            .chain(system_data.iter().map(PathBuf::as_path))
+            .map(|dir| dir.join(&icon))
+            .find(|path| path.is_file())
+    })
+}
+
+/// The attribute GNOME Files reads before anything else when it chooses a
+/// file's icon: a file URI, kept per user and per path by gvfs.
+const CUSTOM_ICON: &str = "metadata::custom-icon";
+
+/// Sets `icon` as the file manager's icon for `file`, through the
+/// `metadata::custom-icon` attribute (as `gio set` would), unless it is set
+/// so already. Returns whether it changed. Fails where no gvfs serves the
+/// session (`NOT_SUPPORTED`).
+fn set_custom_icon(file: &Path, icon: &Path) -> Result<bool, glib::Error> {
+    let uri = glib::filename_to_uri(icon, None)?;
+    let file = gio::File::for_path(file);
+    let current = file
+        .query_info(CUSTOM_ICON, gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
+        .ok()
+        .and_then(|info| info.attribute_string(CUSTOM_ICON));
+    if current.is_some_and(|current| current == uri) {
+        return Ok(false);
+    }
+    file.set_attribute_string(CUSTOM_ICON, &uri, gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)?;
+    Ok(true)
+}
+
+/// Sets the file's modification time to what it is. That changes nothing
+/// about the file but raises a change notification, on which a file
+/// manager showing it re-reads its icon and metadata at once; without it
+/// the new icon appears when the folder is next read. The file is opened
+/// read-only: a running executable cannot be opened for writing.
+fn nudge(path: &Path) {
+    if let Ok(file) = File::open(path) {
+        if let Ok(modified) = file.metadata().and_then(|meta| meta.modified()) {
+            let _ = file.set_modified(modified);
+        }
+    }
+}
+
 /// The icon inside the AppDir for each thumbnail size: the cache directory
 /// name and the source, relative to `APPDIR`. Of the sizes the thumbnail
 /// spec names (normal 128 px, large 256, x-large 512, xx-large 1024), the
@@ -166,11 +311,10 @@ fn thumbnail_sources() -> [(&'static str, PathBuf); 2] {
 /// Writes the thumbnail-cache entries for the AppImage file at `appimage`
 /// into `thumbnails` (`~/.cache/thumbnails`) from the icons in `appdir`,
 /// unless they are already there for the file's current modification
-/// time; drops a thumbnailing failure recorded for the file; and, when
-/// something was written, re-sets the file's own modification time so a
-/// file manager showing it re-reads its icon at once. An entry that cannot
-/// be written is reported and leaves the rest to go on.
-fn seed_own_thumbnail(appimage: &Path, appdir: &Path, thumbnails: &Path) -> io::Result<()> {
+/// time, and drops a thumbnailing failure recorded for the file. An entry
+/// that cannot be written is reported and leaves the rest to go on.
+/// Returns whether an entry was written.
+fn seed_own_thumbnail(appimage: &Path, appdir: &Path, thumbnails: &Path) -> io::Result<bool> {
     let uri = glib::filename_to_uri(appimage, None).map_err(io::Error::other)?;
     let key = thumbnail_key(&uri);
     let modified = fs::metadata(appimage)?.modified()?;
@@ -187,7 +331,7 @@ fn seed_own_thumbnail(appimage: &Path, appdir: &Path, thumbnails: &Path) -> io::
         }
         let result = fs::read(&source)
             .and_then(|icon| thumbnail_png(&icon, &uri, mtime))
-            .and_then(|png| write_private(&entry, &png));
+            .and_then(|png| write_atomically(&entry, &png, 0o700, 0o600));
         match result {
             Ok(()) => written = true,
             Err(e) => eprintln!("could not write {}: {e}", entry.display()),
@@ -197,17 +341,7 @@ fn seed_own_thumbnail(appimage: &Path, appdir: &Path, thumbnails: &Path) -> io::
     // time would keep the file manager from looking again; the entries
     // above are the answer.
     let _ = fs::remove_file(thumbnails.join("fail/gnome-thumbnail-factory").join(format!("{key}.png")));
-    if written {
-        // Setting the modification time to its current value changes
-        // nothing about the file but raises a change notification, on
-        // which the file manager re-queries the file and finds the entry;
-        // without it the icon appears when the folder is next read. Opened
-        // read-only: a running executable cannot be opened for writing.
-        if let Ok(file) = File::open(appimage) {
-            let _ = file.set_modified(modified);
-        }
-    }
-    Ok(())
+    Ok(written)
 }
 
 /// The name of a file's thumbnail-cache entry: the MD5 of its URI, as
@@ -216,19 +350,22 @@ fn thumbnail_key(uri: &str) -> String {
     format!("{:x}", Md5::digest(uri.as_bytes()))
 }
 
-/// Creates `path`'s directories as the thumbnail spec asks (0700) and the
-/// file (0600) through a temporary name in the same directory, so a reader
-/// never sees a half-written entry.
-fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Creates `path`'s directories (those missing, with `dir_mode`) and the
+/// file (`file_mode`, whatever the umask) through a temporary name in the
+/// same directory, so a reader never sees a half-written file.
+fn write_atomically(path: &Path, bytes: &[u8], dir_mode: u32, file_mode: u32) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| io::Error::other("no parent directory"))?;
-    fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    fs::DirBuilder::new().recursive(true).mode(dir_mode).create(dir)?;
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     let result = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .mode(file_mode)
         .open(&tmp)
-        .and_then(|mut file| file.write_all(bytes))
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.set_permissions(fs::Permissions::from_mode(file_mode))
+        })
         .and_then(|()| fs::rename(&tmp, path));
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -310,7 +447,6 @@ fn thumbnail_is_current(png: &[u8], uri: &str, mtime: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     /// A 1x1 transparent RGBA PNG: signature, IHDR, IDAT, IEND.
@@ -329,6 +465,18 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn mtime(path: &Path) -> SystemTime {
+        fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn inode(path: &Path) -> u64 {
+        fs::metadata(path).unwrap().ino()
     }
 
     /// The chunks (type, data) of a PNG, each one's CRC checked.
@@ -405,39 +553,33 @@ mod tests {
         fs::create_dir_all(failed.parent().unwrap()).unwrap();
         fs::write(&failed, TINY_PNG).unwrap();
 
-        let mtime = |path: &Path| fs::metadata(path).unwrap().modified().unwrap();
         let seconds = |path: &Path| mtime(path).duration_since(UNIX_EPOCH).unwrap().as_secs();
         let entries = || thumbnail_sources().map(|(size, _)| thumbnails.join(size).join(format!("{key}.png")));
-        let inodes = || entries().map(|entry| fs::metadata(entry).unwrap().ino());
-        let before = mtime(&appimage);
+        let inodes = || entries().map(|entry| inode(&entry));
 
-        seed_own_thumbnail(&appimage, &appdir, &thumbnails).unwrap();
+        assert!(seed_own_thumbnail(&appimage, &appdir, &thumbnails).unwrap());
         for entry in entries() {
-            let meta = fs::metadata(&entry).unwrap();
-            assert_eq!(meta.permissions().mode() & 0o777, 0o600, "{}", entry.display());
-            assert_eq!(fs::metadata(entry.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(mode(&entry), 0o600, "{}", entry.display());
+            assert_eq!(mode(entry.parent().unwrap()), 0o700);
             assert!(thumbnail_is_current(&fs::read(&entry).unwrap(), &uri, seconds(&appimage)));
             // Only the entry: no temporary file left behind.
             assert_eq!(fs::read_dir(entry.parent().unwrap()).unwrap().count(), 1);
         }
         assert!(!failed.exists());
-        // The nudge keeps the file's modification time as it was.
-        assert_eq!(mtime(&appimage), before);
 
         // A second start rewrites nothing.
         let first = inodes();
-        seed_own_thumbnail(&appimage, &appdir, &thumbnails).unwrap();
+        assert!(!seed_own_thumbnail(&appimage, &appdir, &thumbnails).unwrap());
         assert_eq!(inodes(), first);
 
         // The file changed (a new download under the same name): new entries.
         let later = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         File::open(&appimage).unwrap().set_modified(later).unwrap();
-        seed_own_thumbnail(&appimage, &appdir, &thumbnails).unwrap();
+        assert!(seed_own_thumbnail(&appimage, &appdir, &thumbnails).unwrap());
         assert_ne!(inodes(), first);
         for entry in entries() {
             assert!(thumbnail_is_current(&fs::read(&entry).unwrap(), &uri, 1_700_000_000));
         }
-        assert_eq!(mtime(&appimage), later);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -458,10 +600,132 @@ mod tests {
         fs::create_dir_all(failed.parent().unwrap()).unwrap();
         fs::write(&failed, TINY_PNG).unwrap();
 
-        seed_own_thumbnail(&appimage, &appdir, &thumbnails).unwrap();
+        assert!(seed_own_thumbnail(&appimage, &appdir, &thumbnails).unwrap());
         assert!(!thumbnails.join(large).exists());
         assert!(thumbnails.join(x_large).join(format!("{key}.png")).is_file());
         assert!(!failed.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nudge_keeps_the_modification_time() {
+        let dir = scratch("nudge");
+        let file = dir.join("Reoling-1.0.0-x86_64.AppImage");
+        fs::write(&file, b"\x7fELF").unwrap();
+        let then = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        File::open(&file).unwrap().set_modified(then).unwrap();
+        nudge(&file);
+        assert_eq!(mtime(&file), then);
+        // A file that is gone is no error.
+        nudge(&dir.join("missing"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_icons_go_into_the_user_theme_once() {
+        let dir = scratch("user-icons");
+        let appdir = dir.join("appdir");
+        let (system, user) = (dir.join("system"), dir.join("user"));
+        // A second picture, to tell the sizes apart.
+        let other = thumbnail_png(TINY_PNG, URI, 1).unwrap();
+        let in_appdir = |size: u32| appdir.join("usr/share").join(theme_icon(size));
+        for size in [16, 256, 512] {
+            fs::create_dir_all(in_appdir(size).parent().unwrap()).unwrap();
+            fs::write(in_appdir(size), if size == 512 { &other[..] } else { TINY_PNG }).unwrap();
+        }
+        // The system theme has the 16 px one.
+        fs::create_dir_all(system.join(theme_icon(16)).parent().unwrap()).unwrap();
+        fs::write(system.join(theme_icon(16)), TINY_PNG).unwrap();
+        // The user's theme directory exists already, private, from some
+        // other application.
+        let hicolor = user.join("icons/hicolor");
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(&hicolor).unwrap();
+        let then = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let date_back = || File::open(&hicolor).unwrap().set_modified(then).unwrap();
+        let system_dirs = [system.clone()];
+        date_back();
+
+        assert!(install_user_icons(&appdir, &system_dirs, &user));
+        assert!(!user.join(theme_icon(16)).exists());
+        assert_eq!(fs::read(user.join(theme_icon(256))).unwrap(), TINY_PNG);
+        assert_eq!(fs::read(user.join(theme_icon(512))).unwrap(), other);
+        for size in [256, 512] {
+            let icon = user.join(theme_icon(size));
+            assert_eq!(mode(&icon), 0o644, "{}", icon.display());
+            // Created directories are the user's to read and search, and
+            // hold the icon alone (no temporary file left behind).
+            let apps = icon.parent().unwrap();
+            assert_eq!(mode(apps) & 0o700, 0o700);
+            assert_eq!(mode(apps.parent().unwrap()) & 0o700, 0o700);
+            assert_eq!(fs::read_dir(apps).unwrap().count(), 1);
+        }
+        // The existing directory keeps its mode; its time says "rescan".
+        assert_eq!(mode(&hicolor), 0o700);
+        assert!(mtime(&hicolor) > then);
+
+        // A second start writes nothing and leaves the theme alone.
+        date_back();
+        let first = [inode(&user.join(theme_icon(256))), inode(&user.join(theme_icon(512)))];
+        assert!(!install_user_icons(&appdir, &system_dirs, &user));
+        assert_eq!([inode(&user.join(theme_icon(256))), inode(&user.join(theme_icon(512)))], first);
+        assert_eq!(mtime(&hicolor), then);
+
+        // A newer AppImage with another icon replaces the copy.
+        fs::write(in_appdir(256), &other).unwrap();
+        assert!(install_user_icons(&appdir, &system_dirs, &user));
+        assert_eq!(fs::read(user.join(theme_icon(256))).unwrap(), other);
+        assert!(mtime(&hicolor) > then);
+
+        // The file manager is pointed at the largest icon installed: the
+        // user's 512 px one here, the system's 256 px one where that is
+        // all there is, none without any.
+        assert_eq!(find_theme_icon(&user, &system_dirs), Some(user.join(theme_icon(512))));
+        fs::create_dir_all(system.join(theme_icon(256)).parent().unwrap()).unwrap();
+        fs::write(system.join(theme_icon(256)), TINY_PNG).unwrap();
+        assert_eq!(find_theme_icon(&dir.join("nobody"), &system_dirs), Some(system.join(theme_icon(256))));
+        assert_eq!(find_theme_icon(&dir.join("nobody"), &[]), None);
+
+        // The mounted image is on the data path too, and is not "the system".
+        let mount = PathBuf::from("/tmp/.mount_Reolinab12cd");
+        let dirs = vec![mount.join("usr/share"), PathBuf::from("/usr/share"), PathBuf::from("/usr/local/share")];
+        assert_eq!(outside_appdir(dirs, &mount), [PathBuf::from("/usr/share"), PathBuf::from("/usr/local/share")]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn custom_icon_is_set_once() {
+        let dir = scratch("custom-icon");
+        let (file, icon) = (dir.join("Reoling-1.0.0-x86_64.AppImage"), dir.join("icon.png"));
+        fs::write(&file, b"\x7fELF").unwrap();
+        fs::write(&icon, TINY_PNG).unwrap();
+        match set_custom_icon(&file, &icon) {
+            Ok(changed) => assert!(changed),
+            Err(e) => {
+                // No gvfs serves this session (a bare test runner): the
+                // attribute cannot be stored, which the app reports and
+                // lives with. Nothing to check here then.
+                eprintln!("custom_icon_is_set_once: skipped, file metadata cannot be written here: {e}");
+                let _ = fs::remove_dir_all(&dir);
+                return;
+            }
+        }
+        let stored = || {
+            gio::File::for_path(&file)
+                .query_info(CUSTOM_ICON, gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
+                .unwrap()
+                .attribute_string(CUSTOM_ICON)
+        };
+        assert_eq!(stored(), glib::filename_to_uri(&icon, None).ok());
+        // Set already: nothing to do.
+        assert!(!set_custom_icon(&file, &icon).unwrap());
+        // Another icon replaces it.
+        let moved = dir.join("moved.png");
+        fs::rename(&icon, &moved).unwrap();
+        assert!(set_custom_icon(&file, &moved).unwrap());
+        assert_eq!(stored(), glib::filename_to_uri(&moved, None).ok());
+        // Deleting through GIO drops the metadata with the file (a plain
+        // unlink would leave it in the user's metadata store).
+        gio::File::for_path(&file).delete(gio::Cancellable::NONE).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 

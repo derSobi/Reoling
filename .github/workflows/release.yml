@@ -87,10 +87,6 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          sudo apt-get install -y ./dist/reoling_*.deb
-          test "$(xvfb-run -a reoling --version)" = "reoling $VERSION"
-          chmod +x dist/Reoling-*.AppImage
-          test "$(xvfb-run -a dist/Reoling-*.AppImage --version)" = "reoling $VERSION"
           # --version answers before GTK and GStreamer come up, so each
           # package also runs for 20 s on a virtual display with a session
           # bus and an empty configuration (no devices to reach): it must
@@ -98,35 +94,52 @@ jobs:
           # nothing it loads may have failed to (a module, a pixbuf loader,
           # a symbol, a decoder).
           export XDG_CONFIG_HOME="$RUNNER_TEMP/smoke-config" XDG_CACHE_HOME="$RUNNER_TEMP/smoke-cache" XDG_DATA_HOME="$RUNNER_TEMP/smoke-data"
-          for app in reoling dist/Reoling-*.AppImage; do
+          smoke() {
             rc=0
-            dbus-run-session -- xvfb-run -a timeout 20 "$app" 2> "$RUNNER_TEMP/smoke-stderr.log" || rc=$?
+            dbus-run-session -- xvfb-run -a timeout 20 "$1" 2> "$RUNNER_TEMP/smoke-stderr.log" || rc=$?
             cat "$RUNNER_TEMP/smoke-stderr.log"
             if [ "$rc" -ne 124 ]; then
-              echo "::error::$app ended early with status $rc"
+              echo "::error::$1 ended early with status $rc"
               exit 1
             fi
             if grep -E 'Unable to load image-loading module|Failed to load module|symbol lookup error|undefined symbol|Missing decoder' "$RUNNER_TEMP/smoke-stderr.log"; then
-              echo "::error::$app printed a loading failure (above)"
+              echo "::error::$1 printed a loading failure (above)"
               exit 1
             fi
-            echo "$app ran for 20 s"
+            echo "$1 ran for 20 s"
             # No build installs a thumbnailer (a program the desktop would
             # run on every AppImage file the user views).
             if [ -e "$XDG_DATA_HOME/thumbnailers" ]; then
-              echo "::error::$app wrote a thumbnailer entry; Reoling installs none"
+              echo "::error::$1 wrote a thumbnailer entry; Reoling installs none"
               exit 1
             fi
+          }
+          # The AppImage runs first, before the .deb is installed, as on a
+          # machine that has only the AppImage. At its start it (and only
+          # it) gives its own file an icon in the file manager: the Reoling
+          # icon copied into the user's icon theme for the sizes the system
+          # theme lacks (all of them here) and set as the file's custom icon
+          # (an attribute the session's gvfs keeps; not checked here), and
+          # thumbnail-cache entries for the file's URI (the runtime names
+          # the file by its real path).
+          chmod +x dist/Reoling-*.AppImage
+          test "$(xvfb-run -a dist/Reoling-*.AppImage --version)" = "reoling $VERSION"
+          smoke dist/Reoling-*.AppImage
+          for size in 16 22 24 32 48 64 128 256 512; do
+            png="$XDG_DATA_HOME/icons/hicolor/${size}x${size}/apps/de.dersobi.reoling.png"
+            test -s "$png" || { echo "::error::the AppImage did not copy its $size px icon into the user icon theme ($png)"; exit 1; }
+            cmp "$png" "data/icons/hicolor/${size}x${size}/apps/de.dersobi.reoling.png"
           done
-          # At its start the AppImage (and only the AppImage) gives its own
-          # file an icon in the file manager: thumbnail-cache entries for
-          # the file's URI (the runtime names the file by its real path).
           key=$(printf 'file://%s' "$(realpath dist/Reoling-*.AppImage)" | md5sum | cut -c1-32)
           for size in large x-large; do
             png="$XDG_CACHE_HOME/thumbnails/$size/$key.png"
             test -s "$png" || { echo "::error::the AppImage wrote no $size thumbnail of itself ($png)"; exit 1; }
             file "$png"
           done
+          # Then the .deb, installed; it does none of the above.
+          sudo apt-get install -y ./dist/reoling_*.deb
+          test "$(xvfb-run -a reoling --version)" = "reoling $VERSION"
+          smoke reoling
           ls -l dist
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
