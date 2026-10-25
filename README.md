@@ -73,12 +73,11 @@ answers first.
   main window — pan/tilt (hold a direction to move) and zoom/focus on its
   main page (read back from the camera after every change, since zooming
   makes it autofocus); Monitor Point and Preset Points are their own pages,
-  reached from there and left with "back", the same drill-down the official
-  app uses. Monitor Point: a saved home position with its own thumbnail
-  (click it to refresh — a point saved from Reoling has none until this is
-  pressed once), Auto Return on/off and its timeout in 1-second steps,
-  "Return to Monitor Point", "Reset Monitor Point" to save the current
-  position. Presets: laid out like the official app's Preset Points — a
+  reached from there and left with "back". Monitor Point: a saved home
+  position with its own thumbnail (click it to refresh — a point saved
+  from Reoling has none until this is pressed once), Auto Return on/off
+  and its timeout in 1-second steps, "Return to Monitor Point", "Reset
+  Monitor Point" to save the current position. Presets: a
   thumbnail card per preset (or a plain list, via the toggle), a click
   anywhere on it moves the camera there, Edit (name and picture; click the
   picture to refresh it) and Delete beside it, "refresh all" and "add" on
@@ -123,14 +122,14 @@ answers first.
   download holds the connection it says so and reads once that is over.
 - Snapshot (PNG in `~/Pictures/Reoling`) and recording (MKV in
   `~/Videos/Reoling`, where Playback's downloads go too).
-- Settings ("Client Settings", laid out after the official app's window):
+- Settings (the "Client Settings" window):
   System Settings (General, Live View & Playback, Alarm), Download Settings,
   Local Record and About. Working: Run at Startup (an XDG autostart entry),
   Theme, System Status (versions, the hardware decoders and the decoders in
   use), Auto Live View, Stretch Mode, decoding (Auto with the integrated or
   the dedicated GPU first / Hardware — with the decoder to use if there are
   several — / Software), latency, and the folders for screenshots and
-  recordings. The official app's rows Reoling cannot act on yet (client
+  recordings. The window's rows Reoling cannot act on yet (client
   update, add devices automatically, lockscreen password, date format,
   language, detection overlays, scrollview time, alarm beep, temporary and
   download folders, local record) are shown greyed out. Colours are the
@@ -148,13 +147,12 @@ answers first.
   and live video wait while it runs; no download of several cameras or of
   a whole day at once.
 - PTZ calibration has no separate "finished" signal from the camera — the
-  app only knows the request was accepted, matching what's documented for
-  Baichuan generally, not a limitation specific to this capture.
+  app only knows the request was accepted.
 - Deleting a PTZ preset sends `delPos` (this project's best guess when it
   was first written, matched only against message counts in a capture; now
   confirmed working against a real camera).
-- Talk has been built from the official app's captured messages but is the
-  least tested part.
+- Talk has been built from this project's packet captures but is the least
+  tested part.
 - Presets saved by an older Reoling (before 0.1.13) have no picture until
   one is taken in their Edit dialog.
 
@@ -192,9 +190,9 @@ The full history, with the date of every version, is in
 ## How it works
 
 Reoling implements the Baichuan protocol from scratch, in Rust, based on
-observed wire behavior (see [Acknowledgments](#acknowledgments)). It never
-requires the official Reolink cloud account or app — you connect directly
-to a device by its UID, and Reoling resolves the P2P path itself.
+observed wire behavior (see [Protocol](#protocol)). It needs no Reolink
+cloud account and no other software — you connect directly to a device by
+its UID, and Reoling resolves the P2P path itself.
 
 A UDP receive task keeps draining the socket and acknowledging packets
 independently of the video pipeline, and every video frame is pushed
@@ -368,11 +366,8 @@ AGPL-3.0-or-later — see [LICENSE](LICENSE) for the full text and
 third-party component notices (GTK4, GStreamer, and the Rust crates
 Reoling depends on).
 
-## Acknowledgments
+## Protocol
 
-Reoling's understanding of the Baichuan protocol was built by reading
-(never copying code from) other reverse-engineering efforts, most notably
-[neolink](https://github.com/QuantumEntangledAndy/neolink) and Reolink's
-own [reolink-cli](https://github.com/reolink/reolink-cli) (LAN-only,
-closed-source, documentation only). See [LICENSE](LICENSE) for the full
-list and their own licenses.
+Reoling's Baichuan implementation is checked against packet captures of the
+project's own devices and against probes run on them. Third-party licenses
+are in [LICENSE](LICENSE).
