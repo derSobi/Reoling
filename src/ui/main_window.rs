@@ -47,6 +47,46 @@ enum SnapPurpose {
     Edit(u8),
 }
 
+/// What a password typed in the login dialog does to the keyring once it
+/// has logged in ("Remember password" checked or not).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Remember {
+    Store,
+    Forget,
+}
+
+/// A login typed in the login dialog that has not logged in yet. Its user
+/// name and password stay in memory only: the device list on disk and the
+/// keyring keep the old pair until the typed one has logged in, so a restart
+/// in between never pairs the typed user name with the saved password.
+struct TypedLogin {
+    username: String,
+    remember: Remember,
+}
+
+/// What a login does to the device's saved password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyringStep {
+    Keep,
+    Store,
+    Forget,
+}
+
+/// The keyring changes only after a login: a typed password the device
+/// accepted is stored or dropped as the dialog said, and the saved password
+/// is forgotten only when the device calls it wrong (`logged_in` false is a
+/// `LoginRejected`, never any other refusal). `typed` is the dialog's choice
+/// while the password in use was typed there and has not logged in yet; a
+/// typed password the device calls wrong says nothing about the saved one.
+fn keyring_step(logged_in: bool, typed: Option<Remember>) -> KeyringStep {
+    match (logged_in, typed) {
+        (true, Some(Remember::Store)) => KeyringStep::Store,
+        (true, Some(Remember::Forget)) => KeyringStep::Forget,
+        (true, None) | (false, Some(_)) => KeyringStep::Keep,
+        (false, None) => KeyringStep::Forget,
+    }
+}
+
 /// A device's live connection. `id` tells a replaced connection's late events
 /// apart from the current one's.
 struct Link {
@@ -104,8 +144,9 @@ pub struct MainWindow {
 
     devices: RefCell<Vec<Device>>,
     passwords: RefCell<HashMap<String, String>>,
-    /// Devices whose password goes into the keyring once they log in.
-    remember: RefCell<HashSet<String>>,
+    /// Devices whose password was typed in the login dialog and has not
+    /// logged in yet.
+    typed_logins: RefCell<HashMap<String, TypedLogin>>,
     /// Every device is connected all the time; streaming is separate.
     links: RefCell<HashMap<String, Link>>,
     preset_queue: RefCell<std::collections::VecDeque<u8>>,
@@ -769,7 +810,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             refreshing_streams: Cell::new(false),
             devices: RefCell::new(Vec::new()),
             passwords: RefCell::new(HashMap::new()),
-            remember: RefCell::new(HashSet::new()),
+            typed_logins: RefCell::new(HashMap::new()),
             links: RefCell::new(HashMap::new()),
             preset_queue: RefCell::new(std::collections::VecDeque::new()),
             preset_in_flight: Cell::new(false),
@@ -1556,21 +1597,18 @@ impl MainWindow {
     fn ask_login(self: &Rc<Self>, device: Device) {
         let this = Rc::clone(self);
         let key = device.key.clone();
+        // A typed login that has not logged in yet is what the user last typed.
+        let username = self.typed_logins.borrow().get(&key).map_or(device.username.clone(), |t| t.username.clone());
         dialogs::login(
             self.window.upcast_ref(),
             &device.name,
-            &device.username,
-            move |username, password, remember| {
-                if let Some(d) = this.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
-                    d.username = username;
-                }
-                this.persist();
+            &username,
+            move |username, password, keep| {
+                // The saved user name and password stay until the typed ones
+                // have logged in.
                 this.passwords.borrow_mut().insert(key.clone(), password);
-                if remember {
-                    this.remember.borrow_mut().insert(key.clone());
-                } else {
-                    glib::spawn_future_local(secrets::forget(key.clone()));
-                }
+                let remember = if keep { Remember::Store } else { Remember::Forget };
+                this.typed_logins.borrow_mut().insert(key.clone(), TypedLogin { username, remember });
                 this.links.borrow_mut().remove(&key);
                 this.connected.borrow_mut().remove(&key);
                 this.channel_lists.borrow_mut().remove(&key);
@@ -1617,9 +1655,11 @@ impl MainWindow {
                 return; // connected or removed while the keyring answered
             }
             this.passwords.borrow_mut().insert(key.clone(), password.clone());
+            // A typed login goes with its own user name, the saved one with the device's.
+            let typed_username = this.typed_logins.borrow().get(&key).map(|t| t.username.clone());
             let link = spawn_device(
                 device.target.clone(),
-                device.username.clone(),
+                typed_username.unwrap_or_else(|| device.username.clone()),
                 password,
                 this.uid_transport,
                 this.sink_request_tx.clone(),
@@ -1639,22 +1679,40 @@ impl MainWindow {
         });
     }
 
+    fn update_keyring(&self, key: &str, step: KeyringStep) {
+        match step {
+            KeyringStep::Keep => {}
+            KeyringStep::Store => {
+                let password = self.passwords.borrow().get(key).cloned();
+                let name = self.device(key).map(|d| d.name).unwrap_or_default();
+                if let Some(password) = password {
+                    glib::spawn_future_local(secrets::store(key.to_string(), name, password));
+                }
+            }
+            KeyringStep::Forget => {
+                glib::spawn_future_local(secrets::forget(key.to_string()));
+            }
+        }
+    }
+
     fn on_event(self: &Rc<Self>, key: &str, event: DeviceEvent) {
         match event {
             DeviceEvent::Connected(identity) => {
+                // A typed user name that has logged in is the device's now;
+                // apply_identity below writes the device list to disk.
+                let typed = self.typed_logins.borrow_mut().remove(key);
+                if let Some(t) = &typed {
+                    if let Some(d) = self.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
+                        d.username = t.username.clone();
+                    }
+                }
                 self.connected.borrow_mut().insert(key.to_string());
                 self.sidebar.set_status(key, &Status::Connected);
                 self.apply_identity(key, &identity);
                 if self.device_settings.is_open_for(key) {
                     self.device_settings.reconnected();
                 }
-                if self.remember.borrow_mut().remove(key) {
-                    let password = self.passwords.borrow().get(key).cloned();
-                    let name = self.device(key).map(|d| d.name).unwrap_or_default();
-                    if let Some(password) = password {
-                        glib::spawn_future_local(secrets::store(key.to_string(), name, password));
-                    }
-                }
+                self.update_keyring(key, keyring_step(true, typed.map(|t| t.remember)));
                 self.playback.set_readiness(key, self.playback_readiness(key));
                 if self.autoplay.borrow().as_deref() == Some(key) {
                     self.autoplay.borrow_mut().take();
@@ -1867,7 +1925,8 @@ impl MainWindow {
                 self.connected.borrow_mut().remove(key);
                 self.channel_lists.borrow_mut().remove(key);
                 self.passwords.borrow_mut().remove(key);
-                glib::spawn_future_local(secrets::forget(key.to_string()));
+                let typed = self.typed_logins.borrow_mut().remove(key);
+                self.update_keyring(key, keyring_step(false, typed.map(|t| t.remember)));
                 self.sidebar.set_status(key, &Status::LoginNeeded("Incorrect password".into()));
                 self.lost_playing(key, "Incorrect password");
                 self.playback.device_lost(key, "Incorrect password");
@@ -2220,6 +2279,7 @@ impl MainWindow {
         self.devices.borrow_mut().retain(|d| d.key != key);
         self.persist();
         self.passwords.borrow_mut().remove(key);
+        self.typed_logins.borrow_mut().remove(key);
         glib::spawn_future_local(secrets::forget(key.to_string()));
     }
 
@@ -2233,5 +2293,22 @@ impl MainWindow {
         if !links.is_empty() {
             std::thread::sleep(DISCONNECT_GRACE);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{keyring_step, KeyringStep, Remember};
+
+    #[test]
+    fn the_saved_password_goes_only_when_the_device_calls_it_wrong() {
+        // The saved password: kept after a login, forgotten after a wrong-password refusal.
+        assert_eq!(keyring_step(true, None), KeyringStep::Keep);
+        assert_eq!(keyring_step(false, None), KeyringStep::Forget);
+        // A typed password: the dialog's choice once it has logged in, nothing at all when it was wrong.
+        assert_eq!(keyring_step(true, Some(Remember::Store)), KeyringStep::Store);
+        assert_eq!(keyring_step(true, Some(Remember::Forget)), KeyringStep::Forget);
+        assert_eq!(keyring_step(false, Some(Remember::Store)), KeyringStep::Keep);
+        assert_eq!(keyring_step(false, Some(Remember::Forget)), KeyringStep::Keep);
     }
 }

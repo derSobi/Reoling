@@ -17,7 +17,7 @@ pub mod media_guard;
 pub mod talk;
 pub mod encoding;
 
-pub use protocol::{login_refusal_reason, Error, Result};
+pub use protocol::{Error, LoginRefusal, Result};
 pub use client::{looks_multi_channel, ChannelAbilities, ChannelInfo, DeviceIdentity, DeviceUpdate, DeviceInfoSummary, MonitorPoint, PtzPreset, ReolinkClient, StreamProfile, VideoFrame, VideoType};
 pub use client::{
     file_for_time, next_file, sort_and_dedup_files, DownloadCancel, DownloadProgress, DownloadStream, DownloadSummary,
