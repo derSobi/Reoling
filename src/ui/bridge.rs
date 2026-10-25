@@ -54,7 +54,8 @@ pub enum DeviceEvent {
     ChannelEncodeProfiles { channel_id: u8, profiles: Vec<reoling::encoding::EncodeProfile> },
     /// The camera on a channel: its name, model and firmware.
     ChannelVersion { channel_id: u8, model: Option<String>, firmware: Option<String> },
-    /// The device refused the login.
+    /// The device refused the login because the user name or password is
+    /// wrong. Any other refusal comes as `Lost`.
     LoginRejected,
     /// The device could not be reached, or the connection
     /// died. Nothing more will come.
@@ -453,6 +454,18 @@ pub enum UidTransport {
     Udp,
 }
 
+/// What the UI hears of a refused login: `LoginRejected` (the saved password
+/// is forgotten) only for a wrong user name or password, `Lost` with the
+/// device's reason, the password kept, for every other code.
+fn login_refused(code: u16) -> DeviceEvent {
+    let refusal = reoling::LoginRefusal::from_code(code);
+    if refusal.forgets_saved_password() {
+        DeviceEvent::LoginRejected
+    } else {
+        DeviceEvent::Lost(refusal.reason())
+    }
+}
+
 /// Connects and logs in to a device on a dedicated thread with its own
 /// tokio runtime, and keeps the connection up: it listens for pushes (the
 /// channel list) and streams a channel on request. GTK is never touched from
@@ -508,13 +521,8 @@ pub fn spawn_device(
             match client.login(&username, &password).await {
                 Ok(_) => {}
                 Err(reoling::Error::LoginFailed { code }) => {
-                    // Only a password problem should make us forget the
-                    // saved password; a locked or busy device keeps it.
-                    let event = match reoling::login_refusal_reason(code) {
-                        Some(reason) => DeviceEvent::Lost(reason.to_string()),
-                        None => DeviceEvent::LoginRejected,
-                    };
-                    let _ = tx.send(event).await;
+                    eprintln!("login refused by the device: code {code}");
+                    let _ = tx.send(login_refused(code)).await;
                     return;
                 }
                 Err(e) => {
@@ -872,4 +880,26 @@ pub fn spawn_device(
     });
 
     DeviceLink { events: rx, commands, playback_gen }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{login_refused, DeviceEvent};
+
+    #[test]
+    fn only_a_wrong_password_is_a_rejected_login() {
+        assert!(matches!(login_refused(401), DeviceEvent::LoginRejected));
+        for (code, reason) in [
+            (400, "Login refused by the device (code 400)"),
+            (409, "Too many users are signed in to the device"),
+            (419, "The device is busy with another client"),
+            (0, "Login refused by the device (code 0)"),
+            (0xffff, "Login refused by the device (code 65535)"),
+        ] {
+            match login_refused(code) {
+                DeviceEvent::Lost(r) => assert_eq!(r, reason, "code {code}"),
+                _ => panic!("code {code} must keep the saved password"),
+            }
+        }
+    }
 }

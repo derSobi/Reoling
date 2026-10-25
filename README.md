@@ -180,6 +180,9 @@ answers first.
     started with.
   - Starting Reoling while it runs brings its open window to the front
     instead of logging in to every device a second time.
+  - A device refusing a login for another reason than a wrong password
+    no longer makes Reoling forget the saved password, and neither does
+    a mistyped password or user name in the login dialog.
   - With Theme set to Auto, the theme is loaded once at start instead of
     three times.
 - 1.0.0 — the first published packages: `reoling_1.0.0-1_amd64.deb` for
