@@ -9,6 +9,7 @@ pub mod dialogs;
 pub mod download_dialog;
 pub mod download_job;
 pub mod download_probe;
+pub mod gpu;
 pub mod icon;
 pub mod main_window;
 pub mod playback_driver;

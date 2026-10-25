@@ -1,7 +1,8 @@
 //! Modal dialogs: add a device, log in to a device; and the pieces the
 //! other dialogs of the app are built from (a modal window with its
 //! content box, a labelled row and its caption, the Cancel/accept button
-//! row, the folder chooser).
+//! row, the folder chooser), and opening a folder or a link in the
+//! desktop's application for it.
 
 use crate::ui::bridge::ConnectTarget;
 use gtk4::prelude::*;
@@ -10,6 +11,7 @@ use gtk4::{
     PasswordEntry, Window,
 };
 use std::cell::RefCell;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -77,6 +79,59 @@ pub(crate) fn choose_folder(parent: &Window, current: &Path, on_pick: impl Fn(Pa
         held.borrow_mut().take();
     });
     chooser.show();
+}
+
+/// Opens `uri` (a folder, a web page) in the desktop's default application
+/// for it. In the AppImage on its own GTK and GStreamer core (the "bundled"
+/// stack, see scripts/appimage-hook.sh) LD_LIBRARY_PATH names their
+/// directory, which an application started from here would load instead of
+/// its own; that one directory is left out of its environment. Everything
+/// else it inherits as before.
+pub(crate) fn open_uri(uri: &str) {
+    let context = match (std::env::var_os("APPDIR"), std::env::var_os("LD_LIBRARY_PATH")) {
+        (Some(appdir), Some(path)) => match child_library_path(&path, Path::new(&appdir)) {
+            ChildLibraryPath::Inherited => None,
+            ChildLibraryPath::Unset => {
+                let context = gtk4::gio::AppLaunchContext::new();
+                context.unsetenv("LD_LIBRARY_PATH");
+                Some(context)
+            }
+            ChildLibraryPath::Set(path) => {
+                let context = gtk4::gio::AppLaunchContext::new();
+                context.setenv("LD_LIBRARY_PATH", path);
+                Some(context)
+            }
+        },
+        _ => None,
+    };
+    let _ = gtk4::gio::AppInfo::launch_default_for_uri(uri, context.as_ref());
+}
+
+/// What an application started from the AppImage mounted at `appdir` gets
+/// as LD_LIBRARY_PATH, from this process's `path`.
+#[derive(Debug, PartialEq, Eq)]
+enum ChildLibraryPath {
+    /// `path` as it is: it names no GTK of the AppImage's.
+    Inherited,
+    /// Nothing: the AppImage's GTK was all it named.
+    Unset,
+    Set(OsString),
+}
+
+/// `path` without `appdir`'s `usr/lib/gtk-fallback`, the directory of the
+/// AppImage's own GTK and GStreamer core.
+fn child_library_path(path: &OsStr, appdir: &Path) -> ChildLibraryPath {
+    let fallback = appdir.join("usr/lib/gtk-fallback");
+    let all: Vec<PathBuf> = std::env::split_paths(path).collect();
+    let kept: Vec<&PathBuf> = all.iter().filter(|dir| **dir != fallback).collect();
+    if kept.len() == all.len() {
+        ChildLibraryPath::Inherited
+    } else if kept.is_empty() {
+        ChildLibraryPath::Unset
+    } else {
+        // The entries came from splitting at ':', so none holds one.
+        std::env::join_paths(kept).map_or(ChildLibraryPath::Inherited, ChildLibraryPath::Set)
+    }
 }
 
 /// A dialog's bottom row: `cancel` and `accept` (the suggested action)
@@ -214,4 +269,37 @@ pub fn login(
 
     window.present();
     password.grab_focus();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn applications_started_from_the_bundled_stack_do_not_get_its_gtk() {
+        let appdir = Path::new("/tmp/.mount_ReolinAbCdEf");
+        let path = |s: &str| OsString::from(s);
+        // As the hook leaves it in the bundled mode: the fallback directory
+        // first, then the pixbuf loaders and what the system had.
+        assert_eq!(
+            child_library_path(
+                &path("/tmp/.mount_ReolinAbCdEf/usr/lib/gtk-fallback:/tmp/.mount_ReolinAbCdEf/usr/lib/loaders:/opt/x"),
+                appdir
+            ),
+            ChildLibraryPath::Set(path("/tmp/.mount_ReolinAbCdEf/usr/lib/loaders:/opt/x"))
+        );
+        assert_eq!(
+            child_library_path(&path("/tmp/.mount_ReolinAbCdEf/usr/lib/gtk-fallback/"), appdir),
+            ChildLibraryPath::Unset
+        );
+        // The system's stack, or a path that is no AppImage's: unchanged.
+        for unchanged in ["", "/opt/x", "/tmp/.mount_ReolinAbCdEf/usr/lib/libva-fallback/libva-x11.so.2:/opt/x"] {
+            assert_eq!(child_library_path(&path(unchanged), appdir), ChildLibraryPath::Inherited, "{unchanged}");
+        }
+        // Another AppImage's fallback directory is that one's business.
+        assert_eq!(
+            child_library_path(&path("/tmp/.mount_OtherXyZ/usr/lib/gtk-fallback"), appdir),
+            ChildLibraryPath::Inherited
+        );
+    }
 }
