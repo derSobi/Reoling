@@ -91,5 +91,6 @@ assets = [
     ["data/icons/hicolor/256x256/apps/de.dersobi.reoling.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
     ["data/icons/hicolor/512x512/apps/de.dersobi.reoling.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
     ["README.md", "usr/share/doc/reoling/", "644"],
+    ["CHANGELOG.md", "usr/share/doc/reoling/", "644"],
     ["LICENSE", "usr/share/doc/reoling/", "644"],
 ]

@@ -10,6 +10,7 @@
 !/Cargo.lock
 !/LICENSE
 !/README.md
+!/CHANGELOG.md
 
 # Metadate GitHub (butonul Sponsor) și workflow-ul de release
 !/.github/
