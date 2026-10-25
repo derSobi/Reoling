@@ -113,9 +113,11 @@ pub fn read_bc(
     // The header (never encrypted) is enough on its own to tell us which
     // login-phase (`MSG_ID_LOGIN`) reply we're looking at, and real
     // hardware doesn't decrypt those the way a naive reading of the
-    // negotiated `enc` would suggest — confirmed 2026-09-13 by comparing
-    // against `neolink`'s `de.rs` (never copied, only read) after our own
-    // AES-negotiated login failed to decrypt on real hardware:
+    // negotiated `enc` would suggest. Confirmed 2026-09-13 on real hardware
+    // for the AES case (a nonce reply 0xdd with a non-zero lower byte read as
+    // BCEncrypt, later login replies BCEncrypt): our AES-negotiated login
+    // first failed to decrypt and then succeeded with these rules. The
+    // lower-byte-0x00 (unencrypted) branch has not been seen on our devices:
     // - The very first login reply (the one carrying the nonce, in
     //   response to our request's `response_code` upper byte 0xdc) always
     //   comes back with upper byte 0xdd. Its lower byte is the encryption

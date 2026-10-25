@@ -84,11 +84,10 @@ impl PtzGuardXml {
 
 /// A camera's saved PTZ presets, and the write form of one preset command
 /// (`setPos` saves the current position, `toPos` moves to it, `delPos`
-/// removes it — `setPos`/`toPos` are documented in neolink; `delPos` is
-/// this project's best guess, matched against a capture of the official app:
-/// one message per preset op with no retries, which fits `delPos` working in
-/// one shot rather than the multi-attempt fallbacks other tools use for
-/// deletion).
+/// removes it — `delPos` is this project's best guess, matched against a
+/// capture of the official app: one message per preset op with no retries,
+/// which fits `delPos` working in one shot rather than needing a
+/// multi-attempt fallback for deletion).
 #[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct PtzPresetXml {
     #[serde(rename = "channelId")]
@@ -167,8 +166,8 @@ pub struct SupportItem {
     #[serde(rename = "audioVersion")]
     pub audio_version: Option<u32>,
     /// Bit mask of the camera's LEDs: bit 0 is the status LED, bits 1 and 2
-    /// the floodlight (reolink_aio; matches a Home Hub with E1 Outdoor PoE
-    /// and RLC-1224A cameras: 3 and 38 both have a spotlight, 0 has none).
+    /// the floodlight (matches a Home Hub with E1 Outdoor PoE and RLC-1224A
+    /// cameras: 3 and 38 both have a spotlight, 0 has none).
     #[serde(rename = "ledCtrl")]
     pub led_ctrl: Option<u32>,
     #[serde(rename = "lightType")]
@@ -180,8 +179,8 @@ pub struct SupportItem {
     #[serde(rename = "ptzType")]
     pub ptz_type: Option<u32>,
     /// Bit mask of PTZ features (bit 2 Monitor Point / Guard, bit 3
-    /// calibration, bit 4 digital zoom, bit 6 speed control — reolink_aio;
-    /// see `.plans/reolink-baichuan-calibration-monitor-point.md`).
+    /// calibration; bit 4 digital zoom and bit 6 speed control are
+    /// unverified and unused; see `.plans/reolink-baichuan-calibration-monitor-point.md`).
     #[serde(rename = "ptzControl")]
     pub ptz_control: Option<u32>,
     /// The picture pipeline's generation; 219075 goes with the cameras
@@ -202,7 +201,7 @@ impl Support {
                 let channel = i.channel_id?;
                 let on = |v: Option<u32>| v.unwrap_or(0) > 0;
                 // Which motors a pan/tilt(/zoom) camera has, by `ptzType`
-                // (values as reolink_aio decodes them).
+                // (0 and 5 seen on our devices; the other values are unverified).
                 let ptz = i.ptz_type.unwrap_or(0);
                 let physical_ptz = ptz != 0;
                 let ptz_control = i.ptz_control.unwrap_or(0);
@@ -1278,7 +1277,7 @@ mod tests {
     #[test]
     fn parses_a_real_shaped_encryption_reply() {
         // Self-authored sample shaped like the camera's legacy-login reply,
-        // not copied from any reference implementation's test fixtures.
+        // with a placeholder nonce.
         let sample = br#"<?xml version="1.0" encoding="UTF-8"?><body><Encryption version="1.1"><type>md5</type><nonce>AAAABBBBCCCCDDDD</nonce></Encryption></body>"#;
         let parsed = BcXml::from_bytes(sample).unwrap();
         assert_eq!(parsed.encryption.unwrap().nonce, "AAAABBBBCCCCDDDD");

@@ -15,10 +15,8 @@ use tokio::net::{TcpStream, UdpSocket};
 /// see `M2C_Q_R`'s `mtu` field) minus the 20-byte `UdpData` header. Real
 /// hardware Wireshark capture of the official Windows client 2026-09-16
 /// (`.plans/reoling-baichuan-p2p-audit-2026-09-16.md`) confirms 1330 is
-/// what it actually sends per fragment, matching `bairelay` and
-/// `reolink_aio`'s own constants byte-for-byte; this file previously used
-/// 1300, a plausible-looking number that was never checked against real
-/// traffic.
+/// what it actually sends per fragment; this file previously used 1300, a
+/// plausible-looking number that was never checked against real traffic.
 const MAX_FRAGMENT_SIZE: usize = 1330;
 
 /// Upper bound on how many entries an ack's missing-packet bitmap covers
@@ -39,26 +37,22 @@ const ACK_BITMAP_CAP: u32 = 4096;
 /// waiting on an ack we hadn't yet decided to send (see the ack-flush
 /// tick's own doc comment in `recv_bc_loop_udp` for the deadlock this
 /// caused); a real, unconditional periodic timer is simpler and is what
-/// the reference client actually does, so this file now matches it
+/// the captured client actually does, so this file now matches it
 /// instead of re-deriving a different scheme.
 const ACK_INTERVAL: Duration = Duration::from_millis(31);
 
 /// How often unacknowledged outgoing `UdpData` (see `Socket::Udp`'s `sent`
-/// field) are retransmitted. Matches `bairelay`'s own resend cadence
-/// (`bc_protocol/connection/udpsource.rs`) — no independent measurement of
-/// the official Windows client's resend timing exists yet (the captures
-/// analyzed 2026-09-16 didn't include a loss/resend event to observe), so
-/// this is inherited from the one reference that documents it rather than
-/// independently derived.
+/// field) are retransmitted. Unverified: no measurement of the official
+/// Windows client's resend timing exists yet (the captures analyzed
+/// 2026-09-16 didn't include a loss/resend event to observe), so this is an
+/// assumed value rather than one taken from a capture.
 const RESEND_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Cap on outstanding out-of-order packets in `udp_rx_task`'s reorder
-/// buffer. Matches `bairelay`'s own `REORDER_CAP`
-/// (`bc_protocol/connection/udpsource.rs`) — without a bound, a
-/// stray/malicious far-future `packet_id` could grow the buffer to
-/// unbounded heap before any error surfaces. 1024 is plenty of slack for
-/// legitimate reordering; past that the camera should retransmit anyway
-/// once it sees the gap in our ack.
+/// buffer — without a bound, a stray/malicious far-future `packet_id` could
+/// grow the buffer to unbounded heap before any error surfaces. 1024 is
+/// plenty of slack for legitimate reordering; past that the camera should
+/// retransmit anyway once it sees the gap in our ack.
 const REORDER_CAP: usize = 1024;
 
 /// Capacity of the channel `udp_rx_task` hands reassembled byte chunks
@@ -184,10 +178,7 @@ const RECV_TIMEOUT: Duration = Duration::from_secs(15);
 /// received — without this, our own acks (previously always empty) gave it
 /// no way to tell an already-reassembled out-of-order packet apart from a
 /// genuinely lost one, which is one plausible explanation for the roughly
-/// one-second bursty stutter seen on the relay-only (non-direct) path;
-/// matches `bairelay`'s own `build_send_ack`, the only reference among the
-/// three read for this project that actually populates this field instead
-/// of leaving it empty like `neolink` does.
+/// one-second bursty stutter seen on the relay-only (non-direct) path.
 fn build_ack_payload(next_expected: u32, out_of_order: &BTreeMap<u32, Vec<u8>>) -> Vec<u8> {
     let Some(&highest) = out_of_order.keys().next_back() else {
         return Vec::new();
@@ -207,11 +198,11 @@ fn build_ack_payload(next_expected: u32, out_of_order: &BTreeMap<u32, Vec<u8>>) 
 /// preceding second was exactly 1077307 bytes (the two match to the byte
 /// on every one of the 14 samples checked). The camera appears to use it
 /// as receiver feedback for its send rate. Our earlier value — the mean
-/// gap between incoming acks in microseconds, ~22000, copied from
-/// `bairelay`'s `AckLatency` — told the camera we were receiving ~22KB/s;
-/// a second, independent client (a rewrite that sent `0`) sat at the same
-/// ~6.3Mbit/s ceiling, while the official client, reporting its real
-/// ~1.08MB/s, is sent the encoder's full ~8.3+Mbit/s.
+/// gap between incoming acks in microseconds, ~22000, an earlier, wrong
+/// guess — told the camera we were receiving ~22KB/s; a separate rewrite of
+/// this client that reported `0` sat at the same ~6.3Mbit/s ceiling (it also
+/// differed in ack timing and fragment size), while the official client, reporting its
+/// real ~1.08MB/s, is sent the encoder's full ~8.3+Mbit/s.
 struct RateMeter {
     bytes: u64,
     window_start: std::time::Instant,
@@ -595,12 +586,9 @@ impl Drop for BcConnection {
 /// consumer's own `recv_bc()` calls.
 ///
 /// **Why this exists** (found 2026-09-16: `.plans/reoling-baichuan-p2p-audit-2026-09-16.md`
-/// sections 32-33, cross-checked against `bairelay`'s
-/// `bc_protocol/connection/udpsource.rs`, which splits its own raw-socket
-/// task from the consumer-facing stream the exact same way). The previous
-/// design ran this same logic inline inside what was then
-/// `recv_bc_loop_udp`, called synchronously by the consumer once per `Bc`
-/// message it wanted. Between calls — while the consumer was busy parsing
+/// sections 32-33). The previous design ran this same logic inline inside
+/// what was then `recv_bc_loop_udp`, called synchronously by the consumer
+/// once per `Bc` message it wanted. Between calls — while the consumer was busy parsing
 /// `BcMedia`, feeding GStreamer's `appsrc`, or otherwise processing the
 /// message it just got — nothing was reading the socket at all. Real
 /// hardware pushes the main stream continuously at up to the camera's
@@ -624,14 +612,12 @@ impl Drop for BcConnection {
 /// the `recv_from` arm** — confirmed on real hardware 2026-09-16 to be a
 /// real bug, not just a theoretical one: when `RX_CHANNEL_CAPACITY` filled
 /// (consumer briefly behind), that await parked the *entire* `select!`,
-/// including `ack_tick`. `bairelay`'s own comment on its equivalent timer
-/// is blunt about why that matters: "Offical Client does ack every 10ms
-/// if we don't also do this the camera seems to think we have a poor
-/// connection and will abort." A stalled ack tick reads to the camera as
-/// exactly that, and it responds by throttling/resending — a
-/// self-reinforcing slowdown that didn't exist in the old (consumer-
-/// driven) design, whose ack tick lived in the same loop but the loop
-/// never blocked on a channel. Dropping the data instead (matching the
+/// including `ack_tick`. That matters because the captured client acks on
+/// a steady periodic timer (see `ACK_INTERVAL`); a stalled ack tick reads
+/// to the camera as a poor connection, and it responds by
+/// throttling/resending — a self-reinforcing slowdown that didn't exist in
+/// the old (consumer-driven) design, whose ack tick lived in the same loop
+/// but the loop never blocked on a channel. Dropping the data instead (matching the
 /// kernel buffer's old behavior) isn't a safe fix either: unlike a
 /// datagram the kernel drops before we ever see it, a chunk here has
 /// already been reassembled and (implicitly, via our own ack bitmap)
@@ -701,13 +687,11 @@ async fn udp_rx_task(
                 match msg {
                     BcUdp::Data(data) => {
                         rate_meter.add(data.payload.len());
-                        // `packet_id == u32::MAX` is refused outright, matching
-                        // bairelay's own `UdpFlowState::handle_data` — accepting
+                        // `packet_id == u32::MAX` is refused outright: accepting
                         // it would let `build_ack_payload`'s `highest.saturating_add(1)`
                         // land back on 0, corrupting the ack-range arithmetic.
                         // `>= next_expected_packet_id` rejects already-consumed
-                        // duplicates; like bairelay's equivalent `packets_want`
-                        // check, this compares two `u32`s that both wrap at
+                        // duplicates; this compares two `u32`s that both wrap at
                         // `u32::MAX` in the same direction, so it stays correct
                         // across a wrap — only a pathological reorder spanning
                         // more than half the entire `u32` space could fool it.
@@ -751,11 +735,10 @@ async fn udp_rx_task(
                         // not a real cumulative packet_id to act on.
                         if ack.packet_id != 0xffffffff {
                             let start = ack.packet_id;
-                            // `start + 1 + idx` guarded against overflow the
-                            // same way `handle_ack` in bairelay's own
-                            // `UdpFlowState` is — `ack.payload` is wire data
-                            // (bounded by one UDP datagram in practice, but
-                            // not something to trust blindly for arithmetic).
+                            // `start + 1 + idx` guarded against overflow:
+                            // `ack.payload` is wire data (bounded by one UDP
+                            // datagram in practice, but not something to
+                            // trust blindly for arithmetic).
                             let payload_len = ack.payload.len() as u64;
                             let mut state = send_state.lock().await;
                             state.sent.retain(|&k, _| k > start);
@@ -857,14 +840,14 @@ fn flush_pending(
 /// Builds and sends one ack reflecting the current reorder-buffer state —
 /// the single send path for `recv_bc_loop_udp`'s periodic `ack_tick` (see
 /// `ACK_INTERVAL`'s doc comment). `next_expected_packet_id == 0` (nothing
-/// received yet this session) is a real, distinct wire state, not just the
-/// first ordinary value the counter happens to pass through: `bairelay`
-/// represents it with `packet_id`/`group_id` both `0xffffffff` rather than
-/// the ordinary cumulative-ack encoding — this file previously always used
-/// the ordinary encoding (which happens to also produce `packet_id =
-/// 0xffffffff` via `wrapping_sub(1)`, but left `group_id` at its default
-/// `0` instead of matching the reference's sentinel), a real, if minor,
-/// wire-format mismatch worth fixing while touching this function anyway.
+/// received yet this session) is treated as a distinct wire state, not just
+/// the first ordinary value the counter happens to pass through: it is sent
+/// with `packet_id`/`group_id` both `0xffffffff` (an assumption, not yet
+/// checked against a capture) rather than the ordinary cumulative-ack
+/// encoding — this file previously always used the ordinary encoding (which
+/// happens to also produce `packet_id = 0xffffffff` via `wrapping_sub(1)`,
+/// but left `group_id` at its default `0` instead of the sentinel), a minor
+/// wire-format inconsistency fixed while touching this function anyway.
 async fn send_ack(
     socket: &UdpSocket,
     peer: &PeerHandle,

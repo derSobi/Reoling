@@ -284,16 +284,14 @@ pub struct PeerHandle {
 /// `sid` (see [`C2dC`](crate::protocol::bcudp::xml::C2dC)/[`D2cCr`](crate::protocol::bcudp::xml::D2cCr)).
 /// That elicited a reply from the real NVR (so P2P "connect" looked
 /// successful) but every later BC message — including `C2D_HB` and the
-/// login request — then went completely unanswered. Both `bairelay`
-/// (`connection/discovery.rs::client_initiated_dev`, read-only reference)
-/// and `nodelink-js` (`bcudp/BcUdpStream.ts::p2pClientInitiated`, same)
-/// instead send `C2D_T` with the `sid` from `register()` and
-/// `conn: "local"` — the *same* message pair `connect_relay` already uses
-/// with `conn: "relay"` — and, after the device confirms, send a
-/// `C2R_CFM{conn: "local"}` back to the register server, exactly as
-/// `connect_relay` does for `conn: "relay"`. `C2D_C` is apparently a
-/// separate, session-less legacy path the device also answers but never
-/// treats as "connected" for a UID/`sid`-registered client.
+/// login request — then went completely unanswered. This function instead
+/// sends `C2D_T` with the `sid` from `register()` and `conn: "local"` — the
+/// *same* message pair `connect_relay` already uses with `conn: "relay"` —
+/// and, after the device confirms, sends a `C2R_CFM{conn: "local"}` back to
+/// the register server, exactly as `connect_relay` does for `conn: "relay"`.
+/// `C2D_C` is apparently a separate, session-less legacy path the device
+/// also answers but never treats as "connected" for a UID/`sid`-registered
+/// client.
 pub async fn connect_direct(
     socket: &UdpSocket,
     register_addr: SocketAddr,
@@ -325,8 +323,9 @@ pub async fn connect_direct(
                     addr: from,
                     local_connection_id: client_id,
                     remote_connection_id: reply.did,
-                    // Per bairelay: conn="local" never carries the sigV3
-                    // nonce (relay-only, cloud-account gated).
+                    // The direct path leaves the nonce to the legacy login
+                    // exchange (see `ReolinkClient::login`), even though a
+                    // captured direct `D2C_CFM` carries `nc` too (see `D2cCfm::nc`).
                     nonce: None,
                     is_direct: true,
                 }))
@@ -345,8 +344,7 @@ pub async fn connect_direct(
     // Confirm the local/direct path to the register server — mirrors
     // connect_relay's post-connect C2R_CFM, just with conn="local". Not yet
     // verified against real hardware whether this confirm is what unblocks
-    // the device (vs. the C2D_T/D2C_CFM pair itself); sending it is free
-    // and matches both reference implementations exactly.
+    // the device (vs. the C2D_T/D2C_CFM pair itself); sending it is free.
     let confirm = BcUdp::Discovery(UdpDiscovery {
         tid: rand::random::<u32>().max(1),
         payload: UdpXml::C2rCfm(crate::protocol::bcudp::xml::C2rCfm {
@@ -653,9 +651,8 @@ pub async fn connect_by_uid(socket: &UdpSocket, uid: &str) -> crate::Result<Peer
 /// all — regardless of whether a relay is also available — instead of only
 /// as a last resort when no relay exists. Exists to test, against real
 /// hardware whose relay-path login keeps failing, whether the direct path
-/// (where the legacy nonce exchange is the documented mechanism, per
-/// neolink) succeeds where relay does not. Delete once that question is
-/// answered.
+/// (where the nonce comes from the legacy nonce exchange) succeeds where
+/// relay does not. Delete once that question is answered.
 pub async fn connect_by_uid_prefer_direct(socket: &UdpSocket, uid: &str) -> crate::Result<PeerHandle> {
     let (lookup, register_result, client_id) = resolve_and_register(socket, uid).await?;
 

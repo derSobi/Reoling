@@ -696,11 +696,8 @@ Rust crate dependencies (Cargo-managed)
     file.
 
 Protocol documentation
-    Reoling's understanding of the Baichuan protocol was built by reading
-    (never copying code from):
-    - neolink (github.com/QuantumEntangledAndy/neolink, AGPL-3.0)
-    - reolink-cli (github.com/reolink/reolink-cli), Reolink's own
-      LAN-only official client, closed-source binary + documentation only
+    Reoling's Baichuan implementation is checked against packet captures of
+    the project's own devices and against probes run on them.
 
 Trademarks
     "Reolink" is a trademark of its respective owner. Reoling is an

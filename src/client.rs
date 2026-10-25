@@ -298,8 +298,8 @@ fn focus_xml(channel_id: u8, position: u32) -> Vec<u8> {
     ))
 }
 
-/// A PTZ preset command (`setPos`/`toPos`/`delPos`) in the shape neolink
-/// documents (`PtzPreset` > `presetList` > `preset`).
+/// A PTZ preset command (`setPos`/`toPos`/`delPos`) in the short shape
+/// (`PtzPreset` > `presetList` > `preset`, no position fields).
 fn preset_xml(channel_id: u8, id: u8, name: Option<&str>, command: &str) -> Vec<u8> {
     let name_tag = name.map(|n| format!("<name>{}</name>", crate::protocol::bc::xml::xml_escape(n))).unwrap_or_default();
     control_xml(&format!(
@@ -661,8 +661,8 @@ impl ReolinkClient {
     /// instead of the UDP/P2P transport, purely to isolate whether a given
     /// symptom is transport-layer or not. `.plans/reolink-protocols.md`'s
     /// claim that Baichuan TCP is the NVR/powered-camera family's
-    /// "primary" protocol is wrong (reverse-engineered, unverified,
-    /// contradicted by real capture evidence) — don't cite it. Falls back
+    /// "primary" protocol is wrong (unverified, contradicted by real capture
+    /// evidence) — don't cite it. Falls back
     /// to the UDP session if the device only resolved via relay, or if the
     /// direct TCP connect itself fails.
     pub async fn connect_by_uid_prefer_tcp(uid: &str) -> crate::Result<Self> {
@@ -778,13 +778,11 @@ impl ReolinkClient {
     /// (`.plans/docu/Wireshark/Reolink-ALL-Login_only_with_Home_Hub_Pro.pcapng`):
     /// both the legacy `LoginUpgrade` and the modern `LoginUser` request
     /// carry `channel_id: 0` in their `BcMeta`, even though the session
-    /// goes on to stream a non-zero camera channel afterward. This
-    /// contradicts an earlier reading of neolink's `BcCameraOpt::channel_id`
-    /// doc comment ("Channel the camera is on 0 unless using a NVR"), which
-    /// led this code to thread the target camera's channel into login's
-    /// `BcMeta` too (see bug #13/#14 in `.plans/reoling-project.md`) — real
-    /// capture evidence for the exact device class this project targets
-    /// overrides that inference. `channel_id` is passed only to
+    /// goes on to stream a non-zero camera channel afterward. An earlier
+    /// version of this code threaded the target camera's channel into
+    /// login's `BcMeta` too (see bug #13/#14 in `.plans/reoling-project.md`)
+    /// — real capture evidence for the exact device class this project
+    /// targets overrides that assumption. `channel_id` is passed only to
     /// `start_video`/`stop_video`, which is where the real client's own
     /// per-channel routing (`Extension`/`channelId` XML, wire `channel+1`)
     /// actually happens.
@@ -817,23 +815,21 @@ impl ReolinkClient {
                     // it meant "control-channel-only AES", to keep the
                     // video feed unencrypted for our GStreamer pipeline
                     // (which expects raw H.264). That premise was wrong on
-                    // two counts, found reading (not copying) both
-                    // `neolink` and `bairelay`, 2026-09-13: (1) neither
-                    // reference ever sends anything but 0xdc00/0xdc01/
-                    // 0xdc12 here — 0xdc02 isn't a real, recognized value,
-                    // and a real NVR (Hub Pro) was observed transport-ACKing
-                    // this exact legacy login message and then immediately
-                    // `D2C_DISC`-ing with no application-level reply at
-                    // all, on both the direct and relay paths, across every
-                    // other field we varied — consistent with the device
-                    // rejecting an unrecognized request outright rather
-                    // than degrading it; (2) neolink's own doc comment says
-                    // "the reolink camera only encrypt the control
-                    // messages[;] the camera feed is always accessible" —
-                    // i.e. this byte was never the video-encryption knob we
-                    // thought it was, so there was never a reason to ask
-                    // for anything less than full AES here. Now requesting
-                    // 0xdc12 (Aes), matching both references exactly.
+                    // two counts, 2026-09-13: (1) 0xdc02 isn't a real,
+                    // recognized value — a real NVR (Hub Pro) was observed
+                    // transport-ACKing this exact legacy login message and
+                    // then immediately `D2C_DISC`-ing with no
+                    // application-level reply at all, on both the direct
+                    // and relay paths, across every other field we varied
+                    // — consistent with the device rejecting an
+                    // unrecognized request outright rather than degrading
+                    // it; (2) asking for less than full AES was never
+                    // needed: under AES the camera encrypts only the leading
+                    // `encryptLen` bytes of each media unit, which `read_bc`
+                    // decrypts before GStreamer sees them (2026-09-14), so
+                    // live video plays after a 0xdc12 login. Now requesting
+                    // 0xdc12 (Aes), the value in our captured login (see
+                    // codec.rs's `legacy_login_upgrade_matches_a_real_captured_request_byte_for_byte`).
                     response_code: 0xdc12,
                     class: 0x6514,
                 },
@@ -1530,9 +1526,8 @@ impl ReolinkClient {
         // `Sub`'s values (handle 256, BcMeta.stream_type 1, XML streamType
         // "subStream") are NOT independently confirmed against our own
         // Wireshark capture — that capture only covers Main-stream Preview
-        // usage. They're inferred from cross-checking reference
-        // implementations (neolink, bairelay) per the 2026-09-16 audit
-        // (section 21). Treat as unverified until confirmed against real
+        // usage. They come from the 2026-09-16 audit (section 21), not
+        // from a capture. Treat as unverified until confirmed against real
         // hardware requesting a Sub stream.
         let (handle, stream_type_str, bc_meta_stream_type) = match quality {
             StreamProfile::Main => (0, "mainStream", 0),

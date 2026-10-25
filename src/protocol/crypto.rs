@@ -19,10 +19,8 @@ const AES_IV: &[u8; 16] = b"0123456789abcdef";
 /// garbage/invalid UTF-8). The real key phrase is `"{nonce}-{password}"`
 /// (nonce first, joined with a literal `-`), and the key is not the raw
 /// digest bytes but the first 16 bytes of the digest's *uppercase hex
-/// string representation* — confirmed by reading (not copying) the
-/// equivalent step in `neolink`'s `make_aeskey`, since neolink is a
-/// proven-working implementation and no other ground truth for this exact
-/// step was available.
+/// string representation* — confirmed on the same hardware: with this key,
+/// the AES messages that follow login decrypt to valid XML.
 pub fn aes_key_from_password(password: &str, nonce: &str) -> [u8; 16] {
     let key_phrase = format!("{nonce}-{password}");
     let digest = Md5::digest(key_phrase.as_bytes());

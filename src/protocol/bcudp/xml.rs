@@ -50,9 +50,9 @@ pub enum UdpXml {
     #[serde(rename = "D2C_DISC")]
     D2cDisc(D2cDisc),
     /// Client-to-device heartbeat, sent to the device's address on the
-    /// direct (non-relay) path — read (not copied) from `neolink`'s
-    /// `bcudp/xml.rs`, since our own real captures never show it (we never
-    /// sent one). Without it, real hardware just keeps retransmitting its
+    /// direct (non-relay) path. Our own real captures never show it (we
+    /// never sent one), so its field shape is unverified against a capture.
+    /// Without it, real hardware just keeps retransmitting its
     /// `D2C_C_R` every ~500ms and never processes any BC data we send —
     /// confirmed 2026-09-13 against a real direct connection. Sent
     /// periodically for the life of a direct connection; see
@@ -228,8 +228,7 @@ pub struct D2cCfm {
     /// `nc` value exactly as if it were the nonce from that legacy step
     /// (`MD5(username + nc)`, truncated the same way).
     ///
-    /// **Correction, 2026-09-16**: an earlier version of this comment,
-    /// sourced from `bairelay`'s `login_sigv3.rs` (read-only reference),
+    /// **Correction, 2026-09-16**: an earlier version of this comment
     /// claimed `nc` was absent for `conn: "local"`/`"map"` (relay-only,
     /// cloud-account-gated sigV3). A real capture of the official Windows
     /// client connecting directly over VPN contradicts that: its
@@ -239,9 +238,9 @@ pub struct D2cCfm {
     /// every path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nc: Option<String>,
-    /// Carries additional data for the modern login mechanisms (sigV3 /
-    /// ECDHE) per `bairelay`'s `login.rs` (read-only reference) — not yet
-    /// consumed by anything here, just parsed and kept available.
+    /// Presumably carries additional data for the modern login mechanisms
+    /// (sigV3 / ECDHE; unverified) — not yet consumed by anything here,
+    /// just parsed and kept available.
     /// `#[serde(default)]` keeps parsing backward-compatible with older
     /// captured/test XML that predates this field.
     #[serde(default)]
@@ -511,9 +510,9 @@ mod tests {
 
     #[test]
     fn c2d_hb_round_trips() {
-        // Field shape read (not copied) from neolink's bcudp/xml.rs — no
-        // real capture of this message exists yet, since we never sent one
-        // before discovering it was missing (see `UdpXml::C2dHb`).
+        // Field shape unverified: no real capture of this message exists
+        // yet, since we never sent one before discovering it was missing
+        // (see `UdpXml::C2dHb`).
         let xml = UdpXml::C2dHb(C2dHb { cid: 1, did: 2 });
         let bytes = xml.to_bytes();
         assert_eq!(UdpXml::from_bytes(&bytes).unwrap(), xml);

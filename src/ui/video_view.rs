@@ -11,12 +11,8 @@ use std::time::Duration;
 /// worth believing. Past it, the value is a clock that jumped (a real,
 /// recurring, camera-side timestamp-reporting artifact on this device
 /// family — see [[project-video-stutter-investigation]]) rather than a
-/// real gap in captured frames. `leolink` (a sibling Qt/libmpv Reolink
-/// client, `github.com/tombueng/leolink`, commit `8f0e61b`, 2026-09-14)
-/// independently landed on the same 5s figure for the same reason, and
-/// `bairelay`'s own `PACER_ANOMALY_CAP_TICKS` (checked 2026-09-15) is also
-/// 5s — three independent implementations agreeing is a much stronger
-/// signal than any one of them alone.
+/// real gap in captured frames. 5s is a chosen bound, not a value measured
+/// from a capture.
 const MAX_PLAUSIBLE_STEP_US: u64 = 5_000_000;
 
 /// What to advance the presentation clock by when the measured step isn't
@@ -253,8 +249,7 @@ impl VideoView {
     /// (`frame.microseconds`), guarded against implausible jumps — see
     /// `VideoSink::push_frame`'s doc comment. Arrival-time pacing
     /// (`do-timestamp`) was tried 2026-09-15/16 and replaced 2026-09-16
-    /// with this, following a sibling Reolink client's (`leolink`) own
-    /// arrival at the same conclusion for the same protocol.
+    /// with this.
     ///
     /// decodebin is used so GStreamer can select the best available decoder
     /// for the current system. Depending on the installed plugins and their
@@ -699,10 +694,7 @@ impl VideoSink {
     /// from any thread — see `VideoSink`'s own doc comment.
     ///
     /// PTS is computed from the camera's own capture clock
-    /// (`frame.microseconds`, a u32 wrapping every ~71.58 minutes),
-    /// ported from `leolink`'s `BcMediaParser::feed` (commit `8f0e61b`,
-    /// `github.com/tombueng/leolink`, 2026-09-14 — read-only reference,
-    /// never copied code from, only the algorithm):
+    /// (`frame.microseconds`, a u32 wrapping every ~71.58 minutes):
     ///
     /// - `step = frame.microseconds.wrapping_sub(last_raw)`, unwrapping the
     ///   32-bit counter correctly across a single wrap (the same trick
@@ -729,8 +721,7 @@ impl VideoSink {
     /// needed two thresholds fighting each other and never converged on
     /// real hardware. This is simpler — one plausibility check, one
     /// fallback value, no anchor, no resync, no wall-clock reference at
-    /// all — because leolink's own commit message frames the problem the
-    /// same way this project independently arrived at: the presentation
+    /// all — on the principle this project arrived at: the presentation
     /// clock should advance at the camera's own (trusted) cadence, and an
     /// untrustworthy reading should be smoothed over, not chased.
     pub fn push_frame(&self, frame: &VideoFrame) {

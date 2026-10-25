@@ -1194,7 +1194,7 @@ impl MainWindow {
     }
 
     /// Saves the current position as a new preset with an id the camera does
-    /// not already use (1..=63, the range neolink documents).
+    /// not already use (1..=63, the range this implementation assumes).
     fn next_preset_id(self: &Rc<Self>) -> Option<u8> {
         let key = self.playing_key()?;
         let used: std::collections::HashSet<u8> = self

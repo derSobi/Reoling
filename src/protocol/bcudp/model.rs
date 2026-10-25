@@ -23,7 +23,7 @@ pub struct UdpAck {
     /// camera's send rate depends on it: reporting ~22000 (an inter-ack gap)
     /// or 0 kept it at ~6.3Mbit/s of an ~8.3Mbit/s stream; reporting the
     /// real rate gives the full stream. Historically named `maybe_latency`
-    /// after `bairelay`'s guess.
+    /// after an earlier, wrong guess.
     pub received_bytes_per_sec: u32,
     pub payload: Vec<u8>,
 }
