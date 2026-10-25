@@ -4,6 +4,7 @@
 //! official app has but Reoling cannot act on yet are shown disabled, so the
 //! window looks the same and it is plain what is missing.
 
+use crate::ui::gpu::GpuKind;
 use crate::ui::settings::{self, Decoding, Latency, Settings, Theme};
 use gtk4::prelude::*;
 use gtk4::{
@@ -157,7 +158,7 @@ fn folder_row(
     open.connect_clicked(move |_| {
         let uri = glib::filename_to_uri(&*p.borrow(), None).ok();
         if let Some(uri) = uri {
-            let _ = gtk4::gio::AppInfo::launch_default_for_uri(&uri, None::<&gtk4::gio::AppLaunchContext>);
+            crate::ui::dialogs::open_uri(&uri);
         }
     });
     let parent = parent.clone();
@@ -265,19 +266,23 @@ pub fn open(parent: &Window, current: &Settings, on_change: impl Fn(Settings) + 
     });
 
     let hardware = settings::hardware_decoders();
-    // All three modes, always: the stored one must show as it is, even
-    // "Hardware" on a machine without a hardware decoder (it then decodes
-    // in software, and the row says so).
-    let modes: Vec<(Decoding, &str)> =
-        vec![(Decoding::Auto, "Auto"), (Decoding::Hardware, "Hardware"), (Decoding::Software, "Software")];
+    // All modes, always: the stored one must show as it is, even "Hardware"
+    // on a machine without a hardware decoder (it then decodes in software,
+    // and the row says so).
+    let modes: Vec<(Decoding, &str)> = vec![
+        (Decoding::AutoIntegrated, "Auto (integrated GPU first)"),
+        (Decoding::AutoDedicated, "Auto (dedicated GPU first)"),
+        (Decoding::Hardware, "Hardware"),
+        (Decoding::Software, "Software"),
+    ];
     let labels: Vec<&str> = modes.iter().map(|(_, l)| *l).collect();
     let decoding = drop_down(&labels, modes.iter().position(|(m, _)| *m == current.decoding).unwrap_or(0) as u32);
     let decoding_note = if hardware.is_empty() {
-        "Applies to streams started afterwards. Auto takes the best decoder GStreamer has; \
-         no hardware decoder was found on this machine, so Hardware decodes in software."
+        "Applies to streams started afterwards. No hardware decoder was found on this machine, \
+         so Auto and Hardware decode in software."
     } else {
-        "Applies to streams started afterwards. Auto takes the best decoder GStreamer has \
-         (hardware first, software when none fits)."
+        "Applies to streams started afterwards. Auto takes a hardware decoder, the integrated \
+         or the dedicated GPU's first, and software when none fits."
     };
     let mut device_labels = vec!["Automatic".to_string()];
     device_labels.extend(hardware.iter().map(|d| d.label.clone()));
@@ -469,24 +474,43 @@ fn system_status(parent: &Window, decoding: Decoding) {
         ),
         gstreamer::version_string().to_string(),
     ];
-    let hardware = settings::hardware_decoders();
+    let hardware = settings::hardware_decoder_kinds();
     if hardware.is_empty() {
         lines.push("Hardware decoders: none found".to_string());
     } else {
         lines.push(format!(
             "Hardware decoders: {}",
-            hardware.iter().map(|d| d.label.as_str()).collect::<Vec<_>>().join(", ")
+            hardware
+                .iter()
+                .map(|(d, kind)| match kind {
+                    GpuKind::Unknown => d.label.clone(),
+                    kind => format!("{} ({})", d.label, kind.label()),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     lines.push(format!(
         "Decoding: {}",
         match decoding {
-            Decoding::Auto => "Auto (the best decoder GStreamer has)",
+            Decoding::AutoIntegrated => {
+                "Auto (integrated GPU first, then GPUs of unknown kind, then dedicated; software when none fits)"
+            }
+            Decoding::AutoDedicated => {
+                "Auto (dedicated GPU first, then GPUs of unknown kind, then integrated; software when none fits)"
+            }
             Decoding::Hardware if settings::hardware_fallback() => "Hardware (none found: software)",
             Decoding::Hardware => "Hardware",
             Decoding::Software => "Software",
         }
     ));
+    lines.push(format!(
+        "Live view decoder: {}",
+        settings::decoder_in_use(false).unwrap_or_else(|| "none started yet".to_string())
+    ));
+    if let Some(replay) = settings::decoder_in_use(true) {
+        lines.push(format!("Playback decoder: {replay}"));
+    }
     lines.push(format!("Settings: {}", glib::user_config_dir().join("reoling").join("settings.ini").display()));
     let text = Label::new(Some(&lines.join("\n")));
     text.set_selectable(true);
@@ -524,7 +548,7 @@ fn system_status(parent: &Window, decoding: Decoding) {
 fn about_window(parent: &Window) {
     let open_uri = |uri: &'static str| {
         move |_: &Button| {
-            let _ = gtk4::gio::AppInfo::launch_default_for_uri(uri, None::<&gtk4::gio::AppLaunchContext>);
+            crate::ui::dialogs::open_uri(uri);
         }
     };
     let link = |title: &str, note: &str, uri: &'static str| {

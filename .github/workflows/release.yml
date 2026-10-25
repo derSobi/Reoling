@@ -94,7 +94,9 @@ jobs:
           # nothing it loads may have failed to (a module, a pixbuf loader,
           # a GStreamer plugin, a library, a symbol, a decoder). Ubuntu's
           # xvfb-run sends the program's stderr to its stdout, so the log
-          # takes both.
+          # takes both. The AppImage names in one line the GTK and
+          # GStreamer core it chose, the system's ("host") or its own
+          # ("bundled"); the second argument is the one it must name.
           export XDG_CONFIG_HOME="$RUNNER_TEMP/smoke-config" XDG_CACHE_HOME="$RUNNER_TEMP/smoke-cache" XDG_DATA_HOME="$RUNNER_TEMP/smoke-data"
           smoke() {
             rc=0
@@ -107,6 +109,14 @@ jobs:
             if grep -E 'Unable to load image-loading module|Failed to load module|Failed to load plugin|cannot open shared object file|symbol lookup error|undefined symbol|Missing decoder' "$RUNNER_TEMP/smoke.log"; then
               echo "::error::$1 printed a loading failure (above)"
               exit 1
+            fi
+            if [ -n "${2:-}" ]; then
+              stack=$(grep '^reoling: GTK and GStreamer core: ' "$RUNNER_TEMP/smoke.log" || true)
+              case $stack in
+                *$'\n'*|"") echo "::error::$1 did not name its GTK stack in exactly one line"; exit 1 ;;
+                "reoling: GTK and GStreamer core: $2 ("*) ;;
+                *) echo "::error::$1 should have taken the $2 GTK stack"; exit 1 ;;
+              esac
             fi
             echo "$1 ran for 20 s"
             # No build installs a thumbnailer (a program the desktop would
@@ -124,10 +134,14 @@ jobs:
           # (an attribute the session's gvfs keeps; not checked here),
           # thumbnail-cache entries for the file's URI (the runtime names
           # the file by its real path), and, the system having no Reoling
-          # desktop entry yet, a per-user one that starts the file.
+          # desktop entry yet, a per-user one that starts the file. The
+          # runner's GTK 4.14 and GStreamer 1.24 are as new as the bundled
+          # ones, so it runs on those first, then on its own
+          # (REOLING_GTK_STACK=bundled). Its --version is read without
+          # xvfb-run, which would add the stack line from stderr.
           chmod +x dist/Reoling-*.AppImage
-          test "$(xvfb-run -a dist/Reoling-*.AppImage --version)" = "reoling $VERSION"
-          smoke dist/Reoling-*.AppImage
+          test "$(dist/Reoling-*.AppImage --version 2>/dev/null)" = "reoling $VERSION"
+          smoke dist/Reoling-*.AppImage host
           for size in 16 22 24 32 48 64 128 256 512; do
             png="$XDG_DATA_HOME/icons/hicolor/${size}x${size}/apps/de.dersobi.reoling.png"
             test -s "$png" || { echo "::error::the AppImage did not copy its $size px icon into the user icon theme ($png)"; exit 1; }
@@ -151,6 +165,7 @@ jobs:
             exit 1
           fi
           desktop-file-validate "$entry"
+          REOLING_GTK_STACK=bundled smoke dist/Reoling-*.AppImage bundled
           # Then the .deb, installed; it does none of the above, and its
           # start removes the AppImage's per-user desktop entry, which would
           # hide the .deb's own.
@@ -162,6 +177,13 @@ jobs:
             exit 1
           fi
           ls -l dist
+
+      - name: Smoke tests in containers
+        # The AppImage on the systems its two GTK stacks are for: Ubuntu
+        # 26.04 with GTK 4.22 and Yaru-dark (the system's GTK, no theme
+        # parser error), Ubuntu 26.04 without libva-x11 (the software
+        # decoders still register), Ubuntu 24.04 without GTK 4 (its own).
+        run: scripts/smoke-appimage-in-docker.sh dist/Reoling-*.AppImage
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

@@ -44,6 +44,14 @@ fn main() {
     });
 
     app.connect_activate(move |app| {
+        // Reoling runs once: starting it again activates the running
+        // instance, which shows the window it has instead of building
+        // another one (that would log in to every device a second time).
+        // Dialogs are plain windows; the main window is the application's.
+        if let Some(window) = app.windows().into_iter().find(|w| w.is::<gtk4::ApplicationWindow>()) {
+            window.present();
+            return;
+        }
         // The window lives on through its own signal handlers; nothing else
         // needs to hold it.
         std::mem::forget(ui::main_window::build(app, uid_transport));

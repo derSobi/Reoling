@@ -1631,7 +1631,7 @@ impl PlaybackPage {
             .and_then(|d| d.path.as_ref())
             .and_then(|path| path.parent().map(Path::to_path_buf));
         if let Some(uri) = dir.and_then(|dir| glib::filename_to_uri(&dir, None).ok()) {
-            let _ = gtk4::gio::AppInfo::launch_default_for_uri(&uri, None::<&gtk4::gio::AppLaunchContext>);
+            crate::ui::dialogs::open_uri(&uri);
         }
     }
 

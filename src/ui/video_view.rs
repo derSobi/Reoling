@@ -521,6 +521,7 @@ impl VideoView {
             if !(klass.contains("Decoder") && klass.contains("Video")) {
                 return;
             }
+            crate::ui::settings::note_decoder(&factory, false);
             if element.find_property("qos").is_some() {
                 element.set_property("qos", false);
             }
@@ -1499,6 +1500,7 @@ fn tune_replay_decoder(element: &gstreamer::Element) {
     if std::env::var("REOLING_DEBUG_DECODER").is_ok() {
         eprintln!("DECODER {} ({klass}) for replay", factory.name());
     }
+    crate::ui::settings::note_decoder(&factory, true);
     if element.find_property("qos").is_some() {
         element.set_property("qos", false);
     }

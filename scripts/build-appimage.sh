@@ -14,7 +14,11 @@
 # to software. The build machine's libraries are what gets bundled (GLib
 # and libva excepted, see below: those are the host's), so the release
 # builds run on Ubuntu 24.04: the result then runs on any distribution
-# with glibc >= 2.39 and GLib >= 2.80.
+# with glibc >= 2.39 and GLib >= 2.80. Where the host has a GTK 4 and a
+# GStreamer core no older than the bundled ones, the AppImage runs on
+# those instead and keeps its own for other hosts (see "GTK and GStreamer
+# core" below and scripts/appimage-hook.sh, the AppRun hook that chooses).
+# The build reads the build machine's package database (dpkg) for that.
 #
 # Environment:
 #   APPIMAGE_TOOLS      directory holding linuxdeploy-x86_64.AppImage,
@@ -47,7 +51,8 @@ version=$("$binary" --version | awk '$1 == "reoling" { print $2 }')
 if [ -n "${APPIMAGE_TOOLS:-}" ]; then
     export PATH="$(realpath "$APPIMAGE_TOOLS"):$PATH"
 fi
-for tool in linuxdeploy-x86_64.AppImage appimagetool-x86_64.AppImage linuxdeploy-plugin-gtk.sh linuxdeploy-plugin-gstreamer.sh patchelf file; do
+for tool in linuxdeploy-x86_64.AppImage appimagetool-x86_64.AppImage linuxdeploy-plugin-gtk.sh \
+            linuxdeploy-plugin-gstreamer.sh patchelf file readelf dpkg-query; do
     command -v "$tool" >/dev/null || { echo "$tool not found (set APPIMAGE_TOOLS or install it)" >&2; exit 1; }
 done
 linuxdeploy=$(command -v linuxdeploy-x86_64.AppImage)
@@ -122,17 +127,24 @@ rm -rf "$appdir/usr/lib/girepository-1.0"
 # bundled libva would reject the drivers of any newer distribution. The va
 # plugin, libgstva and the FFmpeg libraries behind the libav decoders link
 # libva by soname and find the host's copy through the normal search path.
-# FFmpeg needs libva even to decode in software, so the build machine's copy
-# is kept aside in usr/lib/libva-fallback for a host that has none:
-# zz-reoling.sh puts that directory on LD_LIBRARY_PATH only then.
+# FFmpeg needs libva, libva-drm and libva-x11 even to decode in software,
+# and a host can have libva without libva-x11 (Ubuntu 26.04 with GTK but no
+# VA-API stack), so the build machine's copies are kept aside, each in a
+# directory of its own, usr/lib/libva-fallback/<soname>/: zz-reoling.sh
+# puts on LD_LIBRARY_PATH the directory of each one the host lacks, or all
+# of them for a host without libva itself. Their RUNPATH still covers
+# usr/lib, where they were.
 va_fallback="$appdir/usr/lib/libva-fallback"
 mkdir -p "$va_fallback"
 for lib in libva.so.2 libva-drm.so.2 libva-x11.so.2 libva-wayland.so.2; do
     if [ -f "$appdir/usr/lib/$lib" ]; then
-        mv "$appdir/usr/lib/$lib" "$va_fallback/"
+        mkdir -p "$va_fallback/$lib"
+        mv "$appdir/usr/lib/$lib" "$va_fallback/$lib/"
+        patchelf --set-rpath '$ORIGIN:$ORIGIN/../..' "$va_fallback/$lib/$lib"
     fi
 done
-[ -f "$va_fallback/libva.so.2" ] || { echo "linuxdeploy bundled no libva.so.2 to keep as the fallback" >&2; exit 1; }
+[ -f "$va_fallback/libva.so.2/libva.so.2" ] || { echo "linuxdeploy bundled no libva.so.2 to keep aside" >&2; exit 1; }
+echo "libva fallback: $(cd "$va_fallback" && echo *)"
 
 # GLib stays the host's too. The gtk plugin bundles libglib, libgobject,
 # libgio and libgmodule, but GIO loads its modules — the dconf GSettings
@@ -208,33 +220,133 @@ if grep -q 'GTK_THEME\|GDK_BACKEND' "$gtk_hook"; then
     exit 1
 fi
 
-cat > "$appdir/apprun-hooks/zz-reoling.sh" <<'HOOK'
-#! /usr/bin/env bash
-# Reoling's own hook, sourced after the linuxdeploy ones.
+# --- GTK and GStreamer core: the system's or the bundled ones ------------------
+# The AppImage runs on the system's GTK 4 where it is no older than the
+# bundled one, and on its own copy otherwise; zz-reoling.sh, the hook below
+# (scripts/appimage-hook.sh), chooses at every start. A desktop theme is
+# written for the GTK it comes with: Ubuntu 26.04's Yaru uses CSS that the
+# bundled GTK 4.14 drops, which loses, among others, the Playback
+# calendar's marks for the days with recordings. The system's GTK may link
+# the system's GStreamer core and -base libraries and bind every symbol of
+# them when it loads (Ubuntu 26.04's does), so the GStreamer core changes
+# together with GTK. The bundled copies of both move to usr/lib/gtk-fallback,
+# where only the bundled mode looks (its LD_LIBRARY_PATH); in the other mode
+# the system's libraries of the same names take their place.
+#
+# Which libraries move: the bundled ones the app links, each with every
+# other bundled library built from the same source package (released
+# together: cairo with cairo-gobject, the GStreamer -base libraries among
+# themselves), as the build machine's package database tells. The app's own
+# links are what makes the move necessary: one left in usr/lib would be
+# found there through the app's RUNPATH, ahead of the system's copy the
+# system's GTK was built for. Everything else stays in usr/lib for both
+# modes: the GStreamer plugins, which run on either core, the -bad libraries
+# they link (codecs, codecparsers, cuda, va), which have no stable ABI and
+# must be the ones the plugins were built with, FFmpeg, and the generic
+# libraries (moved as well, they would land on the library search path of
+# the system's GLib in the bundled mode, older than it may need). GTK's own
+# dependencies cannot serve as the list: they take in all the generic
+# libraries, and the build machine's GTK 4.14 links no GStreamer. The moved
+# libraries get the RUNPATH $ORIGIN:$ORIGIN/.., so that in the bundled mode
+# they find each other and usr/lib as they did there.
+fallback="$appdir/usr/lib/gtk-fallback"
+mkdir -p "$fallback"
+multiarch="$(uname -m)-linux-gnu"
+# The source package of the installed package that has the library $1 in
+# this machine's library directory.
+source_package() {
+    local pkg
+    pkg=$(dpkg -S "*/$multiarch/$1" 2>/dev/null | awk -F': ' 'index($2, "/") == 1 { print $1; exit }' || true)
+    [ -n "$pkg" ] || return 0
+    dpkg-query -W -f='${source:Package}' "$pkg"
+}
+needed() { readelf -d "$1" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'; }
+sources=()
+for so in $(needed "$appdir/usr/bin/reoling"); do
+    [ -e "$appdir/usr/lib/$so" ] || continue # the host's: glibc, GLib
+    src=$(source_package "$so")
+    if [ -z "$src" ]; then
+        echo "no installed package has $so, which the app links: cannot tell what moves with it" >&2
+        exit 1
+    fi
+    echo "the app links $so (source package $src)"
+    sources+=("$src")
+done
+case " ${sources[*]} " in
+    *" gst-plugins-bad1.0 "*)
+        echo "the app links a GStreamer -bad library: the bundled plugins need the bundled -bad libraries," >&2
+        echo "which have no stable ABI, so they cannot move to usr/lib/gtk-fallback with the GStreamer core" >&2
+        exit 1
+        ;;
+esac
+mapfile -t stack_packages < <(dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package} ${source:Package}\n' \
+    | awk -v list=" ${sources[*]} " '$1 == "ii" && index(list, " " $3 " ") { print $2 }')
+[ ${#sources[@]} -gt 0 ] || { echo "the app links none of the bundled libraries" >&2; exit 1; }
+[ ${#stack_packages[@]} -gt 0 ] || { echo "no installed package comes from ${sources[*]}" >&2; exit 1; }
+declare -A moved_bases=()
+while read -r path; do
+    name=${path##*/}
+    if [ -e "$appdir/usr/lib/$name" ]; then
+        moved_bases[${name%%.so*}]=1
+    fi
+done < <(dpkg -L "${stack_packages[@]}" | grep -E "/$multiarch/lib[^/]*\.so\.[0-9][^/]*$" | sort -u)
+[ ${#moved_bases[@]} -gt 0 ] || { echo "none of the bundled libraries comes from ${sources[*]}" >&2; exit 1; }
+for base in "${!moved_bases[@]}"; do
+    for f in "$appdir/usr/lib/$base".so*; do
+        mv "$f" "$fallback/"
+    done
+done
+for f in "$fallback"/*; do
+    if [ -f "$f" ] && [ ! -L "$f" ]; then
+        patchelf --set-rpath '$ORIGIN:$ORIGIN/..' "$f"
+    fi
+done
+for so in libgtk-4.so.1 libgstreamer-1.0.so.0; do
+    [ -f "$fallback/$so" ] || { echo "$so did not move to usr/lib/gtk-fallback" >&2; exit 1; }
+done
+for so in $(needed "$appdir/usr/bin/reoling"); do
+    if [ -e "$appdir/usr/lib/$so" ]; then
+        echo "the app links $so, which stayed in usr/lib: the app would take it from there with the system's GTK" >&2
+        exit 1
+    fi
+done
+mapfile -t moved < <(cd "$fallback" && ls)
+echo "GTK fallback (usr/lib/gtk-fallback, from ${sources[*]}): ${moved[*]}"
 
-# A plugin registry of its own: the bundled GStreamer is not the system's,
-# and sharing ~/.cache/gstreamer-1.0 with it would make both rescan at
-# every start.
-export GST_REGISTRY_1_0="${XDG_CACHE_HOME:-$HOME/.cache}/reoling/gstreamer-registry.bin"
-mkdir -p "$(dirname "$GST_REGISTRY_1_0")" 2>/dev/null || true
-
-# Fallback symbolic icons for the UI, tried after the desktop's own theme.
-export REOLING_ICON_PATH="$APPDIR/usr/share/reoling/icons"
-
-# gdk-pixbuf's loaders.cache (GDK_PIXBUF_MODULE_FILE, from the gtk hook)
-# names the bundled loaders by file name alone; the library search path
-# is what finds them.
-export LD_LIBRARY_PATH="$(dirname "$GDK_PIXBUF_MODULE_FILE")/loaders${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-
-# libva is the host's, which its VA drivers were built for. Only a host
-# without any libva gets the copy the build machine had: the FFmpeg
-# libraries behind the software decoders need libva to load at all.
-ldconfig_bin=$(command -v ldconfig || echo /sbin/ldconfig)
-if ! "$ldconfig_bin" -p 2>/dev/null | grep -q 'libva\.so\.2 (libc6,x86-64)'; then
-    echo "reoling: this system has no libva; using the AppImage's own copy (no VA-API decoding)" >&2
-    export LD_LIBRARY_PATH="$APPDIR/usr/lib/libva-fallback${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# The bundled GSettings schemas are the bundled GTK's: in the GLib schema
+# directory under usr/share, which the gtk hook puts first on XDG_DATA_DIRS,
+# they would shadow the system's GTK's own (older keys in the same schema
+# names), so they live under usr/share/reoling, named by the gtk hook's
+# GSETTINGS_SCHEMA_DIR, which the system's GTK goes without. Reoling itself
+# has no schema.
+schemas="$appdir/usr/share/glib-2.0/schemas"
+[ -f "$schemas/gschemas.compiled" ] || { echo "the gtk plugin bundled no compiled GSettings schemas" >&2; exit 1; }
+mkdir -p "$appdir/usr/share/reoling/gtk-fallback"
+mv "$schemas" "$appdir/usr/share/reoling/gtk-fallback/schemas"
+rmdir "$appdir/usr/share/glib-2.0" 2>/dev/null || true
+schema_line='export GSETTINGS_SCHEMA_DIR="$APPDIR/usr/share/reoling/gtk-fallback/schemas"'
+sed -i "s|^export GSETTINGS_SCHEMA_DIR=.*|$schema_line|" "$gtk_hook"
+if ! grep -qxF "$schema_line" "$gtk_hook"; then
+    echo "the gtk hook sets no GSETTINGS_SCHEMA_DIR to point at the moved schemas; its layout changed:" >&2
+    cat "$gtk_hook" >&2
+    exit 1
 fi
-HOOK
+
+# Reoling's own hook, sourced after the linuxdeploy ones, with the versions
+# of the bundled GTK and GStreamer (the build machine's, which linuxdeploy
+# copied) it compares the system's with.
+bundled_gtk=$(pkg-config --modversion gtk4)
+bundled_gst=$(pkg-config --modversion gstreamer-1.0)
+for v in "$bundled_gtk" "$bundled_gst"; do
+    [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "pkg-config gave GTK or GStreamer the version '$v'" >&2; exit 1; }
+done
+sed -e "s/@BUNDLED_GTK@/$bundled_gtk/" -e "s/@BUNDLED_GSTREAMER@/$bundled_gst/" "$repo/scripts/appimage-hook.sh" \
+    > "$appdir/apprun-hooks/zz-reoling.sh"
+if grep -q '@BUNDLED_' "$appdir/apprun-hooks/zz-reoling.sh"; then
+    echo "scripts/appimage-hook.sh has a placeholder left unfilled" >&2
+    exit 1
+fi
+echo "bundled GTK $bundled_gtk, GStreamer $bundled_gst"
 
 # linuxdeploy's AppRun names the hooks it knows; this one sources every hook
 # present (the two plugins' and ours, in name order) and runs the app. APPDIR
@@ -295,29 +407,107 @@ echo "AppImage icon: $(file -b "$appdir/.DirIcon" | cut -d, -f1,2) from $icon_sr
     || { echo "linuxdeploy put no desktop entry in usr/share/applications" >&2; exit 1; }
 
 # --- Check the bundle before packing it ---------------------------------------
-# Every element the app creates must register from the bundled plugins
-# alone (a throw-away registry, the AppDir's libraries, its own scanner).
-if command -v gst-inspect-1.0 >/dev/null; then
-    scanner=$(find "$appdir/usr/lib" -type f -name gst-plugin-scanner | head -n1)
-    check() {
-        env -i PATH="$PATH" HOME="$work" \
-            LD_LIBRARY_PATH="$appdir/usr/lib" \
-            GST_PLUGIN_SYSTEM_PATH_1_0="$appdir/usr/lib/gstreamer-1.0" GST_PLUGIN_PATH_1_0="" \
-            GST_PLUGIN_SCANNER_1_0="$scanner" GST_REGISTRY_1_0="$work/registry.bin" \
-            gst-inspect-1.0 "$@"
-    }
-    failed=()
-    for element in appsrc decodebin queue identity filesink fakesink videoconvert audioconvert audioresample volume \
-                   h264parse h265parse aacparse qtmux matroskamux autoaudiosink autoaudiosrc \
-                   avdec_h264 avdec_h265 avdec_aac gtk4paintablesink; do
-        check "$element" >/dev/null 2>&1 || failed+=("$element")
-    done
-    if [ ${#failed[@]} -ne 0 ]; then
-        echo "elements missing from the bundle: ${failed[*]}" >&2
-        check gtk4paintablesink || true
+# A command run in the environment AppRun gives the app on this machine:
+# the hooks sourced as AppRun sources them (with `set -e`), an empty
+# environment otherwise, REOLING_GTK_STACK=$1 unless $1 is empty.
+in_app_env() {
+    local stack=$1
+    shift
+    env -i PATH="$PATH" HOME="$work/home" XDG_CACHE_HOME="$work/cache" ${stack:+REOLING_GTK_STACK=$stack} \
+        bash -c 'set -e; export APPDIR="$1"; shift; for hook in "$APPDIR"/apprun-hooks/*.sh; do source "$hook"; done
+                 exec "$@"' _ "$appdir" "$@"
+}
+# The dynamic loader's view of the app, as in zz-reoling.sh's probe: the
+# app alone, and when $1 is "plugins" then every bundled plugin too, with
+# the libraries the app loaded preloaded ahead of them by file, in their
+# order (as the app has them loaded when GStreamer loads a plugin).
+cat > "$work/trace.sh" <<'TRACE'
+trace() {
+    LD_TRACE_LOADED_OBJECTS=1 LD_BIND_NOW=1 LD_WARN=1 \
+        LD_LIBRARY_PATH="$APPDIR/usr/lib/gstreamer-1.0${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$APPDIR/usr/bin/reoling"
+}
+app=$(trace || true)
+printf '%s\n' "$app"
+if [ "${1:-}" = plugins ]; then
+    preload=$(printf '%s\n' "$app" \
+        | awk 'NF == 4 && $2 == "=>" && substr($3, 1, 1) == "/" && index($3, ":") == 0 { printf "%s ", $3 }')
+    for f in "$APPDIR"/usr/lib/gstreamer-1.0/*.so; do preload="$preload ${f##*/}"; done
+    LD_PRELOAD="$preload" trace
+fi
+TRACE
+
+# The GTK choice, on this machine, whose GTK and GStreamer are the very
+# ones bundled: the hook must take them as the system's ("host", with the
+# versions it reads from the system's file names equal to the bundled
+# ones), and then nothing of usr/lib may load with the app and every moved
+# library must come from the system, the plugins' included; with
+# REOLING_GTK_STACK=bundled every moved library must come from
+# usr/lib/gtk-fallback. In both, the loader must find every library and
+# bind every symbol of the app and the plugins, as the hook's probe does on
+# the user's machine.
+for stack in host bundled; do
+    force=""
+    [ "$stack" = host ] || force=$stack
+    in_app_env "$force" bash "$work/trace.sh" plugins > "$work/trace-$stack.txt" 2> "$work/hook-$stack.txt" || true
+    in_app_env "$force" bash "$work/trace.sh" > "$work/trace-$stack-app.txt" 2>> "$work/hook-$stack.txt" || true
+    mode_lines=$(grep '^reoling: GTK and GStreamer core: ' "$work/hook-$stack.txt" | sort -u || true)
+    case $mode_lines in
+        *$'\n'*|"") echo "the hook named no single GTK choice ($stack):" >&2; cat "$work/hook-$stack.txt" >&2; exit 1 ;;
+    esac
+    echo "$stack: $mode_lines"
+    expected="reoling: GTK and GStreamer core: $stack ("
+    [ "$stack" = bundled ] || expected="$expected""the system's GTK $bundled_gtk, GStreamer $bundled_gst)"
+    if [ "${mode_lines#"$expected"}" = "$mode_lines" ]; then
+        echo "on this machine the hook should have said '$expected...'" >&2
         exit 1
     fi
-    echo "bundled plugins: $(check 2>/dev/null | tail -n1)"
+    if grep -E 'not found|undefined symbol|cannot be preloaded' "$work/trace-$stack.txt" "$work/hook-$stack.txt"; then
+        echo "the app or a bundled plugin does not load with the $stack GTK stack (above)" >&2
+        exit 1
+    fi
+    while read -r so arrow path _; do
+        [ "$arrow" = "=>" ] && [ -e "$fallback/$so" ] || continue
+        if [ "$stack" = host ]; then
+            case $path in
+                "$appdir"/*) echo "with the system's stack, $so came from $path" >&2; exit 1 ;;
+            esac
+        else
+            case $path in
+                "$fallback"/*) ;;
+                *) echo "with the bundled stack, $so came from $path" >&2; exit 1 ;;
+            esac
+        fi
+    done < "$work/trace-$stack.txt"
+    if [ "$stack" = host ] && grep -F "$appdir/" "$work/trace-$stack-app.txt"; then
+        echo "with the system's stack, the app itself loaded the libraries above from the AppImage" >&2
+        exit 1
+    fi
+    for so in libgtk-4.so.1 libgstreamer-1.0.so.0; do
+        if ! grep -q "^[[:space:]]*$so => " "$work/trace-$stack-app.txt"; then
+            echo "$stack: the app loads no $so" >&2
+            exit 1
+        fi
+    done
+done
+
+# Every element the app creates must register from the bundled plugins
+# alone (a throw-away registry, the bundled scanner), on either stack.
+if command -v gst-inspect-1.0 >/dev/null; then
+    check() { in_app_env "$check_stack" gst-inspect-1.0 "$@"; }
+    for check_stack in host bundled; do
+        failed=()
+        for element in appsrc decodebin queue identity filesink fakesink videoconvert audioconvert audioresample \
+                       volume h264parse h265parse aacparse qtmux matroskamux autoaudiosink autoaudiosrc \
+                       avdec_h264 avdec_h265 avdec_aac gtk4paintablesink; do
+            check "$element" >/dev/null 2>&1 || failed+=("$element")
+        done
+        if [ ${#failed[@]} -ne 0 ]; then
+            echo "elements missing from the bundle with the $check_stack GTK stack: ${failed[*]}" >&2
+            check gtk4paintablesink || true
+            exit 1
+        fi
+        echo "bundled plugins, $check_stack GTK stack: $(check 2>/dev/null | tail -n1)"
+    done
     # The hardware decoders register only where the build machine has the
     # driver; the plugins travel either way.
     for hw in "nvh264dec nvcodec NVIDIA" "vah264dec va VA-API"; do
@@ -332,11 +522,13 @@ if command -v gst-inspect-1.0 >/dev/null; then
         echo "the nvcodec plugin is bundled without libgstcuda-1.0" >&2
         exit 1
     fi
-    if ls "$appdir"/usr/lib/libva*.so* >/dev/null 2>&1; then
+    # Whether any of the patterns matches a file.
+    any_file() { local p; for p in "$@"; do compgen -G "$p" >/dev/null && return 0; done; return 1; }
+    if any_file "$appdir/usr/lib/libva*.so*" "$fallback/libva*.so*"; then
         echo "libva is bundled beside the other libraries; it must come from the host (the fallback copy lives in usr/lib/libva-fallback)" >&2
         exit 1
     fi
-    if ls "$appdir"/usr/lib/libglib-2.0.so* "$appdir"/usr/lib/libgio-2.0.so* "$appdir"/usr/lib/libgobject-2.0.so* >/dev/null 2>&1; then
+    if any_file "$appdir"/usr/lib/{,gtk-fallback/}{libglib-2.0,libgio-2.0,libgobject-2.0}.so*; then
         echo "GLib is bundled; it must come from the host, whose GIO modules it loads" >&2
         exit 1
     fi
