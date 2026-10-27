@@ -68,6 +68,9 @@ jobs:
       - name: Test
         run: xvfb-run -a cargo test --release --locked
 
+      - name: Video zoom rendering test
+        run: xvfb-run -a cargo test --release --locked --bin reoling ui::zoom_picture::tests::widget_renders_and_resets -- --ignored --exact
+
       - name: GTK 4 paintable sink plugin
         run: scripts/build-gst-gtk4-plugin.sh target/gst-gtk4
 
