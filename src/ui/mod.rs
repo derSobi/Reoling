@@ -26,3 +26,4 @@ pub mod settings_view;
 pub mod settings_window;
 pub mod sidebar;
 pub mod video_view;
+mod zoom_picture;

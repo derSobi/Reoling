@@ -43,6 +43,12 @@ answers first.
   restarts on the next start; fullscreen with a control bar that slides in;
   a latency setting (Low / Balanced / Smooth) trades reaction time for
   smoothness over a poor connection.
+- Digital video zoom in live view and playback: scroll up over the picture
+  to zoom in at the pointer, and down to zoom out, up to 16×. Left-click and
+  drag to pan while zoomed in; middle-click restores the whole picture.
+  Zoom stays when resizing or entering
+  fullscreen and resets when switching cameras or streams. It respects Stretch Mode;
+  snapshots and recordings still contain the full frame.
 - Sound: the stream's audio with a volume control; Talk (microphone to the
   camera, ADPCM).
 - Playback (the tab beside Live View): recorded video per camera of a Home
@@ -358,6 +364,13 @@ no real hardware required):
 
 ```bash
 cargo test
+```
+
+The video zoom rendering test needs a display and runs separately. The
+release workflow and Docker validation run it under Xvfb:
+
+```bash
+cargo test --bin reoling ui::zoom_picture::tests::widget_renders_and_resets -- --ignored --exact
 ```
 
 ## License
