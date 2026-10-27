@@ -1,6 +1,6 @@
+use super::zoom_picture::ZoomPicture;
 use gstreamer::prelude::*;
 use gstreamer_app::AppSrc;
-use gtk4::Picture;
 use reoling::{VideoFrame, VideoType};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -182,7 +182,7 @@ impl Recorder {
 }
 
 pub struct VideoView {
-    picture: Picture,
+    picture: ZoomPicture,
 
     // The codec (H.264 vs H.265) is only known once the first frame
     // arrives, so the pipeline is built lazily on the first ensure_sink()
@@ -200,7 +200,7 @@ pub struct VideoView {
 impl VideoView {
     pub fn new() -> Self {
         Self {
-            picture: Picture::new(),
+            picture: ZoomPicture::new(),
             sink: RefCell::new(None),
             replay: false,
             replay_volume: std::cell::Cell::new(1.0),
@@ -225,7 +225,7 @@ impl VideoView {
         }
     }
 
-    pub fn widget(&self) -> &Picture {
+    pub fn widget(&self) -> &ZoomPicture {
         &self.picture
     }
 

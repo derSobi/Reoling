@@ -101,6 +101,7 @@ if [ -z "$appimage_in" ]; then
     if [ -z "${SKIP_TESTS:-}" ]; then
         step "cargo test --release"
         xvfb-run -a cargo test --release --locked
+        xvfb-run -a cargo test --release --locked --bin reoling ui::zoom_picture::tests::widget_renders_and_resets -- --ignored --exact
     fi
 
     step "GTK 4 paintable sink plugin"
