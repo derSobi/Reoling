@@ -1,9 +1,13 @@
-//! Read-only settings pages of a camera channel and of an NVR or Home Hub
-//! itself: which queries each page sends, how the replies are gathered into
-//! one `SettingsPage`, and a diagnostic probe (`REOLING_PROBE_SETTINGS`).
+//! Settings pages of a camera channel and of an NVR or Home Hub itself:
+//! which queries each page sends, how the replies are gathered into one
+//! `SettingsPage`, the few writes the official app was captured making (see
+//! `protocol::bc::settings_write`), and a diagnostic probe
+//! (`REOLING_PROBE_SETTINGS`).
 //!
-//! Every message here is a query: an empty request, or one whose body only
-//! names what to read (the smart-detection type). Nothing is written.
+//! A page's reads are queries: an empty request, or one whose body only names
+//! what to read (the smart-detection type). The probe writes nothing. The
+//! replies a write is built from are kept as received (`RawReplies`) next to
+//! the parsed page; they are never printed.
 //!
 //! A page's reads go out one after the other, each under its own message
 //! number. Whichever task reads the connection when a reply comes (the video
@@ -18,6 +22,10 @@
 
 use super::{control_xml, monitor_point_read_extension, pushed_update, ChannelAbilities, DeviceIdentity, DeviceUpdate, ImageKind, ReolinkClient};
 use crate::protocol::bc::model::*;
+use crate::protocol::bc::settings_write::{
+    write_extension, RawBody, SettingsWrite, CAPTURED_WRITES, MSG_ID_SET_AI_DENOISE, MSG_ID_SET_AUDIO_CFG,
+    MSG_ID_SET_DAY_NIGHT_THRESHOLD, MSG_ID_SET_LED_STATE, MSG_ID_SET_OSD, MSG_ID_SET_VIDEO_INPUT,
+};
 use crate::protocol::bc::settings_xml::*;
 use crate::protocol::bc::xml::{xml_escape, Extension, XML_VERSION};
 use std::collections::HashMap;
@@ -107,6 +115,31 @@ pub const MSG_ID_AUTO_REBOOT: u32 = 101;
 /// How long a page waits for its last reply before it is reported with
 /// `NoReply` gaps.
 pub const SETTINGS_REPLY_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long a write waits for the device's answer (the captured ones took
+/// 0.25 to 0.7 s) before it is reported as `WriteReply::NoReply`.
+pub const SETTINGS_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The reads whose reply text a page keeps, to build a write from: the
+/// replies the captured writes are made of. None of them carries a secret.
+const KEPT_REPLIES: [u32; 6] =
+    [MSG_ID_OSD, MSG_ID_VIDEO_INPUT, MSG_ID_DAY_NIGHT_THRESHOLD, MSG_ID_LED_STATE, MSG_ID_AUDIO_CFG, MSG_ID_AI_DENOISE];
+
+/// The reply texts of a page's writable reads, by message id, exactly as
+/// received. `Debug` shows the ids and lengths only.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RawReplies(Vec<(u32, RawBody)>);
+
+impl RawReplies {
+    pub fn new(replies: Vec<(u32, RawBody)>) -> Self {
+        RawReplies(replies)
+    }
+
+    /// The reply to the read `msg_id`, when it came with a body.
+    pub fn get(&self, msg_id: u32) -> Option<&RawBody> {
+        self.0.iter().find(|(id, _)| *id == msg_id).map(|(_, body)| body)
+    }
+}
 
 /// What a device is, from its model string: which pages it has and which
 /// reads only one kind answers.
@@ -273,12 +306,16 @@ pub struct CameraImagePage {
     pub video_input: Read<VideoInput>,
     pub advanced: Read<InputAdvanceCfg>,
     pub threshold: Read<DayNightThreshold>,
+    /// The 26 and 296 replies, for the picture write.
+    pub raw: RawReplies,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CameraDisplayPage {
     pub datetime: Read<OsdDatetime>,
     pub name: Read<OsdName>,
+    /// The 44 reply, for the OSD write.
+    pub raw: RawReplies,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -299,6 +336,9 @@ pub struct CameraLightSoundPage {
     pub audio: Read<AudioCfg>,
     pub denoise: Read<AiDenoise>,
     pub record_audio: Read<CompressionAudio>,
+    /// The 208, 264 and 439 replies, for the light, volume and noise
+    /// reduction writes.
+    pub raw: RawReplies,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -311,6 +351,42 @@ pub struct CameraSchedulesPage {
     pub ftp: Read<ScheduledTask>,
     pub siren: Read<ScheduledTask>,
     pub hub_siren: Read<ScheduledTask>,
+}
+
+impl CameraImagePage {
+    /// The 26 reply as received, for the picture write.
+    pub fn picture_reply(&self) -> Option<&RawBody> {
+        self.raw.get(MSG_ID_VIDEO_INPUT)
+    }
+
+    /// The 296 reply as received, for the threshold echo that goes with it.
+    pub fn threshold_reply(&self) -> Option<&RawBody> {
+        self.raw.get(MSG_ID_DAY_NIGHT_THRESHOLD)
+    }
+}
+
+impl CameraDisplayPage {
+    /// The 44 reply as received, for the OSD write.
+    pub fn osd_reply(&self) -> Option<&RawBody> {
+        self.raw.get(MSG_ID_OSD)
+    }
+}
+
+impl CameraLightSoundPage {
+    /// The 208 reply as received, for the light write.
+    pub fn led_reply(&self) -> Option<&RawBody> {
+        self.raw.get(MSG_ID_LED_STATE)
+    }
+
+    /// The 264 reply as received, for the volume write.
+    pub fn audio_reply(&self) -> Option<&RawBody> {
+        self.raw.get(MSG_ID_AUDIO_CFG)
+    }
+
+    /// The 439 reply as received, for the noise-reduction write.
+    pub fn denoise_reply(&self) -> Option<&RawBody> {
+        self.raw.get(MSG_ID_AI_DENOISE)
+    }
 }
 
 /// The address rows (one read, four roots), of a camera or of the device.
@@ -654,6 +730,8 @@ struct SlotState {
     /// never when the gates ruled it out).
     msg_num: Option<u16>,
     outcome: Option<Read<SettingsBody>>,
+    /// The reply as received, for a read in `KEPT_REPLIES` that answered.
+    raw: Option<RawBody>,
 }
 
 /// The replies of one page as they come in, shared between the task that
@@ -664,6 +742,9 @@ pub struct PageCollector {
     slots: Vec<SlotState>,
     /// The page has been reported (or superseded); nothing more is emitted.
     done: bool,
+    /// The caller's number for this read of the page, given back with it
+    /// (see `query_settings`).
+    number: u64,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -679,9 +760,10 @@ impl PageCollector {
                 msg_id: r.msg_id,
                 msg_num: None,
                 outcome: if r.send { None } else { Some(Err(ReadFailure::NotSent)) },
+                raw: None,
             })
             .collect();
-        PageCollector { target, slots, done: false }
+        PageCollector { target, slots, done: false, number: 0 }
     }
 
     pub fn is_done(&self) -> bool {
@@ -720,6 +802,11 @@ impl PageCollector {
     /// open, else to the slot of its number. `false` when the number is not
     /// this page's or the slot already has an outcome.
     pub fn record(&mut self, msg_num: u16, outcome: Read<SettingsBody>) -> bool {
+        self.record_reply(msg_num, outcome, None)
+    }
+
+    /// `record`, keeping the reply's text as well (see `KEPT_REPLIES`).
+    pub fn record_reply(&mut self, msg_num: u16, outcome: Read<SettingsBody>, raw: Option<RawBody>) -> bool {
         let Some(mut index) = self.slots.iter().position(|s| s.msg_num == Some(msg_num)) else {
             return false;
         };
@@ -734,8 +821,21 @@ impl PageCollector {
         if self.slots[index].outcome.is_some() {
             return false;
         }
+        let kept = KEPT_REPLIES.contains(&self.slots[index].msg_id) && outcome.is_ok();
+        self.slots[index].raw = raw.filter(|_| kept);
         self.slots[index].outcome = Some(outcome);
         true
+    }
+
+    /// The kept replies of these reads.
+    fn raw_replies(&self, ids: &[u32]) -> RawReplies {
+        RawReplies(
+            self.slots
+                .iter()
+                .filter(|s| ids.contains(&s.msg_id))
+                .filter_map(|s| s.raw.clone().map(|raw| (s.msg_id, raw)))
+                .collect(),
+        )
     }
 
     /// Every read has an outcome.
@@ -758,6 +858,13 @@ impl PageCollector {
         }
         self.done = true;
         Some(self.assemble())
+    }
+
+    /// `finish_if_complete`, as the update that reports the page under the
+    /// caller's number for the read.
+    pub fn finish_update(&mut self) -> Option<DeviceUpdate> {
+        let read = self.number;
+        self.finish_if_complete().map(|page| DeviceUpdate::Settings { page, read })
     }
 
     fn read(&self, slot: Slot) -> Read<&SettingsBody> {
@@ -799,6 +906,7 @@ impl PageCollector {
                         video_input: self.pick(m(MSG_ID_VIDEO_INPUT), |b| &b.video_input),
                         advanced: self.pick(m(MSG_ID_VIDEO_INPUT), |b| &b.input_advance),
                         threshold: self.pick(m(MSG_ID_DAY_NIGHT_THRESHOLD), |b| &b.day_night_threshold),
+                        raw: self.raw_replies(&[MSG_ID_VIDEO_INPUT, MSG_ID_DAY_NIGHT_THRESHOLD]),
                     },
                 },
                 CameraPage::Display => SettingsPage::CameraDisplay {
@@ -806,6 +914,7 @@ impl PageCollector {
                     page: CameraDisplayPage {
                         datetime: self.pick(m(MSG_ID_OSD), |b| &b.osd_datetime),
                         name: self.pick(m(MSG_ID_OSD), |b| &b.osd_channel_name),
+                        raw: self.raw_replies(&[MSG_ID_OSD]),
                     },
                 },
                 CameraPage::Detection => SettingsPage::CameraDetection {
@@ -828,6 +937,7 @@ impl PageCollector {
                         audio: self.pick(m(MSG_ID_AUDIO_CFG), |b| &b.audio_cfg),
                         denoise: self.pick(m(MSG_ID_AI_DENOISE), |b| &b.ai_denoise),
                         record_audio: self.pick(m(MSG_ID_GET_COMPRESSION), |b| &b.compression),
+                        raw: self.raw_replies(&[MSG_ID_LED_STATE, MSG_ID_AUDIO_CFG, MSG_ID_AI_DENOISE]),
                     },
                 },
                 CameraPage::Schedules => SettingsPage::CameraSchedules {
@@ -921,6 +1031,136 @@ impl PageCollector {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Collecting a write's answers
+// ---------------------------------------------------------------------------
+
+/// The writes a camera page sends: the ones its own reads are made into.
+fn page_writes(page: CameraPage) -> &'static [u32] {
+    match page {
+        CameraPage::Display => &[MSG_ID_SET_OSD],
+        CameraPage::Image => &[MSG_ID_SET_VIDEO_INPUT, MSG_ID_SET_DAY_NIGHT_THRESHOLD],
+        CameraPage::LightSound => &[MSG_ID_SET_LED_STATE, MSG_ID_SET_AUDIO_CFG, MSG_ID_SET_AI_DENOISE],
+        _ => &[],
+    }
+}
+
+/// Whether a group of writes may go out for `target` on a device of `kind`:
+/// a camera page of a Home Hub (the only device the writes were captured
+/// on), every write one of `CAPTURED_WRITES` that page sends, for that
+/// page's channel, and the picture's writes only as the official app sends
+/// them: the 25, then its 297.
+fn sendable(target: SettingsTarget, kind: DeviceKind, writes: &[SettingsWrite]) -> bool {
+    let SettingsTarget::Camera { channel, page } = target else { return false };
+    let ids: Vec<u32> = writes.iter().map(|w| w.msg_id).collect();
+    let pair = [MSG_ID_SET_VIDEO_INPUT, MSG_ID_SET_DAY_NIGHT_THRESHOLD];
+    let paired = !ids.iter().any(|id| pair.contains(id)) || ids == pair;
+    kind == DeviceKind::Hub
+        && !writes.is_empty()
+        && paired
+        && writes.iter().all(|w| {
+            CAPTURED_WRITES.contains(&w.msg_id) && page_writes(page).contains(&w.msg_id) && w.channel == channel
+        })
+}
+
+/// What became of one write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteReply {
+    /// The device answered with this code (200: done).
+    Code(u16),
+    /// No answer within `SETTINGS_WRITE_TIMEOUT`.
+    NoReply,
+    /// It was not sent: the connection failed, or the write was not one
+    /// Reoling may send.
+    NotSent,
+}
+
+/// One write of a group and its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteOutcome {
+    pub msg_id: u32,
+    pub reply: WriteReply,
+}
+
+#[derive(Debug)]
+struct WriteSlot {
+    msg_id: u32,
+    msg_num: Option<u16>,
+    reply: Option<WriteReply>,
+}
+
+/// The answers to one group of writes as they come in, shared like a
+/// page's `PageCollector`.
+#[derive(Debug)]
+pub struct WriteCollector {
+    target: SettingsTarget,
+    /// The caller's number for the group, given back with its answers.
+    group: u64,
+    slots: Vec<WriteSlot>,
+    done: bool,
+}
+
+impl WriteCollector {
+    pub fn new(target: SettingsTarget, group: u64, writes: &[SettingsWrite]) -> Self {
+        let slots = writes.iter().map(|w| WriteSlot { msg_id: w.msg_id, msg_num: None, reply: None }).collect();
+        WriteCollector { target, group, slots, done: false }
+    }
+
+    pub fn sent(&mut self, index: usize, msg_num: u16) {
+        if let Some(slot) = self.slots.get_mut(index) {
+            slot.msg_num = Some(msg_num);
+        }
+    }
+
+    /// The write at `index` and every later one get this answer without a
+    /// reply (they could not, or must not, be sent).
+    pub fn failed_from(&mut self, index: usize, reply: WriteReply) {
+        for slot in self.slots.iter_mut().skip(index).filter(|s| s.reply.is_none()) {
+            slot.reply = Some(reply);
+        }
+    }
+
+    pub fn expects(&self, msg_num: u16, msg_id: u32) -> bool {
+        self.slots.iter().any(|s| s.msg_num == Some(msg_num) && s.msg_id == msg_id)
+    }
+
+    /// The device's code for the write sent under `msg_num`; `false` when
+    /// it is not this group's or already answered.
+    pub fn record(&mut self, msg_num: u16, code: u16) -> bool {
+        match self.slots.iter_mut().find(|s| s.msg_num == Some(msg_num)) {
+            Some(slot) if slot.reply.is_none() => {
+                slot.reply = Some(WriteReply::Code(code));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn fill_open(&mut self, reply: WriteReply) {
+        for slot in self.slots.iter_mut().filter(|s| s.reply.is_none()) {
+            slot.reply = Some(reply);
+        }
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    /// The group's update, once: when every write has an answer.
+    pub fn finish_if_complete(&mut self) -> Option<DeviceUpdate> {
+        if self.done || self.slots.iter().any(|s| s.reply.is_none()) {
+            return None;
+        }
+        self.done = true;
+        let results = self
+            .slots
+            .iter()
+            .map(|s| WriteOutcome { msg_id: s.msg_id, reply: s.reply.unwrap_or(WriteReply::NoReply) })
+            .collect();
+        Some(DeviceUpdate::SettingsWritten { target: self.target, group: self.group, results })
+    }
+}
+
 /// The outcome a reply message carries: a parsed body for 200 or 300, a
 /// refusal for any other code.
 fn reply_outcome(bc: &Bc) -> Read<SettingsBody> {
@@ -944,19 +1184,40 @@ pub(super) enum Routed {
     Consumed(Option<DeviceUpdate>),
 }
 
+/// The reply's text, for a read whose reply a page keeps.
+fn reply_text(bc: &Bc) -> Option<RawBody> {
+    if !KEPT_REPLIES.contains(&bc.meta.msg_id) {
+        return None;
+    }
+    match &bc.body {
+        BcBody::Modern(ModernMsg { payload: Some(payload), .. }) => {
+            std::str::from_utf8(payload).ok().map(RawBody::new)
+        }
+        _ => None,
+    }
+}
+
 /// The first check of `pushed_update`: a reply whose message number and id
 /// are one of a settings page's reads is recorded there and consumed, and
-/// the page is returned once it is complete. A reply that comes too late
-/// (its page already given up or read again) is consumed all the same, so
-/// its id is never mistaken for a message of its own. Only the id, channel,
-/// code and length of such a reply are ever printed, never its body.
+/// the page is returned once it is complete; the same for the answer to one
+/// of a group of writes, the group's results once every write has its
+/// answer. A reply that comes too late (its page or group already given up,
+/// or the page read again) is consumed all the same, so its id is never
+/// mistaken for a message of its own. Only the id, channel, code and length
+/// of such a reply are ever printed, never its body.
 pub(super) fn settings_reply(bc: &Bc, pending: &Mutex<HashMap<u16, ImageKind>>) -> Routed {
     let msg_num = bc.meta.msg_num;
-    let collector = match lock(pending).get(&msg_num) {
-        Some(ImageKind::SettingsPage(collector)) => Arc::clone(collector),
+    let (page, write) = match lock(pending).get(&msg_num) {
+        Some(ImageKind::SettingsPage(collector)) => (Some(Arc::clone(collector)), None),
+        Some(ImageKind::SettingsWrite(collector)) => (None, Some(Arc::clone(collector))),
         _ => return Routed::NotOurs,
     };
-    if !lock(&collector).expects(msg_num, bc.meta.msg_id) {
+    let ours = match (&page, &write) {
+        (Some(page), _) => lock(page).expects(msg_num, bc.meta.msg_id),
+        (_, Some(write)) => lock(write).expects(msg_num, bc.meta.msg_id),
+        _ => false,
+    };
+    if !ours {
         return Routed::NotOurs;
     }
     if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
@@ -965,17 +1226,29 @@ pub(super) fn settings_reply(bc: &Bc, pending: &Mutex<HashMap<u16, ImageKind>>) 
             _ => 0,
         };
         eprintln!(
-            "DEBUG settings reply: msg={} channel={} code={} bytes={bytes}",
-            bc.meta.msg_id, bc.meta.channel_id, bc.meta.response_code
+            "DEBUG settings {}: msg={} channel={} code={} bytes={bytes}",
+            if write.is_some() { "write answer" } else { "reply" },
+            bc.meta.msg_id,
+            bc.meta.channel_id,
+            bc.meta.response_code
         );
     }
     lock(pending).remove(&msg_num);
+    if let Some(write) = write {
+        let mut write = lock(&write);
+        if !write.record(msg_num, bc.meta.response_code) {
+            return Routed::Consumed(None);
+        }
+        return Routed::Consumed(write.finish_if_complete());
+    }
+    let Some(page) = page else { return Routed::Consumed(None) };
     let outcome = reply_outcome(bc);
-    let mut collector = lock(&collector);
-    if !collector.record(msg_num, outcome) {
+    let raw = reply_text(bc);
+    let mut collector = lock(&page);
+    if !collector.record_reply(msg_num, outcome, raw) {
         return Routed::Consumed(None);
     }
-    Routed::Consumed(collector.finish_if_complete().map(DeviceUpdate::Settings))
+    Routed::Consumed(collector.finish_update())
 }
 
 /// A request is about to go out under `msg_num`, a number that comes round
@@ -991,16 +1264,19 @@ impl ReolinkClient {
     /// Reads one settings page: sends its queries one after the other and
     /// reports the page as `DeviceUpdate::Settings` once every reply is in
     /// (or `SETTINGS_REPLY_TIMEOUT` has passed, the unanswered reads marked
-    /// `NoReply`). A page still pending for the same target is dropped. The
+    /// `NoReply`), with `read`, the caller's number for this read: a page
+    /// that was complete before a newer read of it was sent still comes, and
+    /// the number tells it apart. A page still pending for the same target
+    /// is dropped. The
     /// pending entries of a dropped or given-up read stay until its reply
     /// comes (`settings_reply` then consumes it) or the number comes round
     /// again (`number_reused`).
-    pub async fn query_settings(&mut self, target: SettingsTarget, gates: &SettingsGates) {
+    pub async fn query_settings(&mut self, target: SettingsTarget, gates: &SettingsGates, read: u64) {
         let reads = page_reads(target, gates);
         if let Some(old) = self.settings_pages.remove(&target) {
             lock(&old).mark_done();
         }
-        let collector = Arc::new(Mutex::new(PageCollector::new(target, &reads)));
+        let collector = Arc::new(Mutex::new(PageCollector { number: read, ..PageCollector::new(target, &reads) }));
         let channel_id = target.channel();
         for (index, read) in reads.iter().enumerate() {
             if !read.send {
@@ -1022,23 +1298,102 @@ impl ReolinkClient {
         }
         self.settings_pages.insert(target, Arc::clone(&collector));
         // Nothing to wait for (every read ruled out, or none could be sent).
-        if let Some(page) = lock(&collector).finish_if_complete() {
-            let _ = self.channel_updates_tx.send(DeviceUpdate::Settings(page));
+        if let Some(update) = lock(&collector).finish_update() {
+            let _ = self.channel_updates_tx.send(update);
             return;
         }
         let updates = self.channel_updates_tx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(SETTINGS_REPLY_TIMEOUT).await;
-            let page = {
+            let update = {
                 let mut collector = lock(&collector);
                 if collector.is_done() {
                     return;
                 }
                 collector.fill_open(ReadFailure::NoReply);
+                collector.finish_update()
+            };
+            if let Some(update) = update {
+                let _ = updates.send(update);
+            }
+        });
+    }
+
+    /// Writes one group of settings built by `settings_write` (the picture
+    /// write with its threshold echo, or one other write) for `target`'s
+    /// channel. The messages go out back to back, as the official app sends
+    /// a 25 with its 297, each with an Extension naming the channel alone.
+    /// The answers come as one `DeviceUpdate::SettingsWritten` once every
+    /// write has its code, or after `SETTINGS_WRITE_TIMEOUT` with `NoReply`
+    /// for the rest. A group holding a write Reoling may not send (on a
+    /// device of another `kind` than a Home Hub, an id outside
+    /// `CAPTURED_WRITES` or not of the target's page, another channel, a
+    /// device page) is not sent at all; once one write could not be sent,
+    /// the later ones are not sent either. `group` is the caller's number
+    /// for the group, given back with the answers. Only ids, channels, codes
+    /// and lengths are printed.
+    pub async fn write_settings(
+        &mut self,
+        target: SettingsTarget,
+        kind: DeviceKind,
+        group: u64,
+        writes: Vec<SettingsWrite>,
+    ) {
+        let collector = Arc::new(Mutex::new(WriteCollector::new(target, group, &writes)));
+        if !sendable(target, kind, &writes) {
+            lock(&collector).failed_from(0, WriteReply::NotSent);
+        } else {
+            for (index, write) in writes.iter().enumerate() {
+                let msg_num = self.next_msg_num();
+                let request = Bc {
+                    meta: BcMeta {
+                        msg_id: write.msg_id,
+                        channel_id: write.channel,
+                        stream_type: 0,
+                        msg_num,
+                        response_code: 0,
+                        class: 0x6414,
+                    },
+                    body: BcBody::Modern(ModernMsg {
+                        extension_xml: Some(write_extension(write.channel)),
+                        payload: Some(write.body().as_bytes().to_vec()),
+                    }),
+                };
+                if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
+                    eprintln!(
+                        "DEBUG settings write: msg={} channel={} bytes={}",
+                        write.msg_id,
+                        write.channel,
+                        write.body().len()
+                    );
+                }
+                lock(&collector).sent(index, msg_num);
+                // Registered before the send, as for the reads.
+                lock(&self.pending_images).insert(msg_num, ImageKind::SettingsWrite(Arc::clone(&collector)));
+                if self.connection.lock().await.send_bc(&request, &self.encryption).await.is_err() {
+                    lock(&self.pending_images).remove(&msg_num);
+                    lock(&collector).failed_from(index, WriteReply::NotSent);
+                    break;
+                }
+            }
+        }
+        if let Some(update) = lock(&collector).finish_if_complete() {
+            let _ = self.channel_updates_tx.send(update);
+            return;
+        }
+        let updates = self.channel_updates_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(SETTINGS_WRITE_TIMEOUT).await;
+            let update = {
+                let mut collector = lock(&collector);
+                if collector.is_done() {
+                    return;
+                }
+                collector.fill_open(WriteReply::NoReply);
                 collector.finish_if_complete()
             };
-            if let Some(page) = page {
-                let _ = updates.send(DeviceUpdate::Settings(page));
+            if let Some(update) = update {
+                let _ = updates.send(update);
             }
         });
     }
@@ -1061,7 +1416,7 @@ impl ReolinkClient {
             .chain(CameraPage::ALL.iter().map(|page| SettingsTarget::Camera { channel, page: *page }));
         for target in targets {
             let started = Instant::now();
-            self.query_settings(target, &gates).await;
+            self.query_settings(target, &gates, 0).await;
             let page = self.probe_collect(target).await;
             let elapsed = started.elapsed();
             let lines = self.settings_pages.get(&target).map(|c| lock(c).summary()).unwrap_or_default();
@@ -1091,7 +1446,7 @@ impl ReolinkClient {
                     Err(_) => return None,
                 };
                 match pushed_update(&bc, &mut image_chunks, &self.pending_images, &self.channel_uids) {
-                    Some(DeviceUpdate::Settings(page)) if page.target() == target => return Some(page),
+                    Some(DeviceUpdate::Settings { page, .. }) if page.target() == target => return Some(page),
                     Some(update) => {
                         let _ = self.channel_updates_tx.send(update);
                     }
@@ -1420,7 +1775,7 @@ mod tests {
         assert!(matches!(settings_reply(&reply(80, 7, 200, None), &pending), Routed::NotOurs));
         assert!(lock(&pending).contains_key(&7));
         let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<AutoReboot version=\"1.1\">\n<enable>1</enable>\n<weekDay>Sunday</weekDay>\n<hour>11</hour>\n<minute>0</minute>\n<second>0</second>\n</AutoReboot>\n</body>\n";
-        let Routed::Consumed(Some(DeviceUpdate::Settings(SettingsPage::DeviceMaintenance(page)))) =
+        let Routed::Consumed(Some(DeviceUpdate::Settings { page: SettingsPage::DeviceMaintenance(page), .. })) =
             settings_reply(&reply(101, 7, 200, Some(xml)), &pending)
         else {
             panic!("the complete page is returned")
@@ -1478,6 +1833,165 @@ mod tests {
         // A number nobody holds is left alone.
         number_reused(&pending, 41);
         assert!(lock(&pending).is_empty());
+    }
+
+    const OSD_READ: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<OsdDatetime version=\"1.1\">\n<channelId>1</channelId>\n<enable>1</enable>\n<topLeftX>65537</topLeftX>\n<topLeftY>1</topLeftY>\n<width>0</width>\n<height>0</height>\n<language>Chinese</language>\n</OsdDatetime>\n<OsdChannelName version=\"1.1\">\n<channelId>1</channelId>\n<name>Camera1</name>\n<enable>1</enable>\n<topLeftX>65536</topLeftX>\n<topLeftY>65536</topLeftY>\n<enWatermark>0</enWatermark>\n<enBgcolor>0</enBgcolor>\n</OsdChannelName>\n</body>\n";
+
+    #[test]
+    fn the_replies_a_write_is_built_from_are_kept_and_never_printed() {
+        let target = camera(1, CameraPage::Display);
+        let reads = page_reads(target, &hub());
+        let pending = Mutex::new(HashMap::new());
+        let collector = Arc::new(Mutex::new(PageCollector::new(target, &reads)));
+        lock(&collector).sent(0, 60);
+        lock(&pending).insert(60u16, ImageKind::SettingsPage(Arc::clone(&collector)));
+        let Routed::Consumed(Some(DeviceUpdate::Settings { page: SettingsPage::CameraDisplay { page, .. }, .. })) =
+            settings_reply(&reply(44, 60, 200, Some(OSD_READ)), &pending)
+        else {
+            panic!("the page is complete")
+        };
+        assert_eq!(page.osd_reply().map(RawBody::as_str), Some(OSD_READ));
+        assert_eq!(page.name.as_ref().unwrap().name.as_deref(), Some("Camera1"));
+        let printed = format!("{page:?}");
+        assert!(!printed.contains("<OsdChannelName"), "{printed}");
+        // A refused read keeps nothing; neither does a read no write uses.
+        let mut c = PageCollector::new(target, &reads);
+        c.sent(0, 61);
+        assert!(c.record_reply(61, Err(ReadFailure::Refused(400)), Some(RawBody::new("x"))));
+        let SettingsPage::CameraDisplay { page, .. } = c.assemble() else { panic!("wrong page") };
+        assert_eq!(page.osd_reply(), None);
+        let reads = page_reads(camera(1, CameraPage::Detection), &hub());
+        let mut c = PageCollector::new(camera(1, CameraPage::Detection), &reads);
+        c.sent(1, 62);
+        assert!(c.record_reply(62, Ok(SettingsBody::default()), Some(RawBody::new("x"))));
+        assert!(c.slots.iter().all(|s| s.raw.is_none()));
+        assert_eq!(reply_text(&reply(46, 1, 200, Some("<body/>"))), None);
+        assert!(reply_text(&reply(208, 1, 200, Some("<body/>"))).is_some());
+    }
+
+    #[test]
+    fn a_page_comes_back_under_the_number_of_its_read() {
+        // A read complete just before a newer read of the same page went out
+        // still reports: its number tells it from the newer read's page.
+        let target = camera(1, CameraPage::Display);
+        let reads = page_reads(target, &hub());
+        let pending = Mutex::new(HashMap::new());
+        let older = Arc::new(Mutex::new(PageCollector { number: 5, ..PageCollector::new(target, &reads) }));
+        lock(&older).sent(0, 70);
+        lock(&pending).insert(70u16, ImageKind::SettingsPage(Arc::clone(&older)));
+        let Routed::Consumed(Some(DeviceUpdate::Settings { page, read: 5 })) =
+            settings_reply(&reply(44, 70, 200, Some(OSD_READ)), &pending)
+        else {
+            panic!("the older read's page, under its number")
+        };
+        assert_eq!(page.target(), target);
+        // The newer read, given up by the timeout, reports under its own.
+        lock(&older).mark_done();
+        let newer = Arc::new(Mutex::new(PageCollector { number: 6, ..PageCollector::new(target, &reads) }));
+        lock(&newer).sent(0, 71);
+        lock(&newer).fill_open(ReadFailure::NoReply);
+        assert!(matches!(lock(&newer).finish_update(), Some(DeviceUpdate::Settings { read: 6, .. })));
+        assert!(lock(&newer).finish_update().is_none(), "once");
+        // A read superseded before it was complete never reports.
+        let mut superseded = PageCollector { number: 7, ..PageCollector::new(target, &reads) };
+        superseded.mark_done();
+        superseded.fill_open(ReadFailure::NoReply);
+        assert!(superseded.finish_update().is_none());
+    }
+
+    fn osd_write_for(channel: u8) -> SettingsWrite {
+        let read = OSD_READ.replace("<channelId>1</channelId>", &format!("<channelId>{channel}</channelId>"));
+        crate::protocol::bc::settings_write::osd_write(&RawBody::new(read), channel, &Default::default()).unwrap()
+    }
+
+    fn with_id(msg_id: u32) -> SettingsWrite {
+        let mut write = osd_write_for(1);
+        write.msg_id = msg_id;
+        write
+    }
+
+    #[test]
+    fn only_captured_writes_for_the_pages_channel_are_sent() {
+        let hub = DeviceKind::Hub;
+        let target = camera(1, CameraPage::Display);
+        assert!(sendable(target, hub, &[osd_write_for(1)]));
+        assert!(!sendable(target, hub, &[]));
+        assert!(!sendable(target, hub, &[osd_write_for(2)]), "another channel");
+        assert!(!sendable(device(DevicePage::LightSound), hub, &[osd_write_for(0)]), "a device page");
+        assert!(!sendable(target, hub, &[osd_write_for(1), with_id(57)]), "not one of the captured writes");
+        // Only a Home Hub's cameras.
+        for kind in [DeviceKind::Nvr, DeviceKind::Camera] {
+            assert!(!sendable(target, kind, &[osd_write_for(1)]), "{kind:?}");
+        }
+        // Only the writes of the target's page.
+        let image = camera(1, CameraPage::Image);
+        let light = camera(1, CameraPage::LightSound);
+        assert!(!sendable(image, hub, &[osd_write_for(1)]), "an OSD write for the Image page");
+        assert!(!sendable(target, hub, &[with_id(MSG_ID_SET_LED_STATE)]), "a light write for the Display page");
+        assert!(sendable(light, hub, &[with_id(MSG_ID_SET_LED_STATE)]));
+        assert!(sendable(light, hub, &[with_id(MSG_ID_SET_AI_DENOISE)]));
+        assert!(!sendable(camera(1, CameraPage::Detection), hub, &[with_id(MSG_ID_SET_AUDIO_CFG)]));
+        // The picture's writes only as the pair, the 25 first.
+        let (picture, threshold) = (with_id(MSG_ID_SET_VIDEO_INPUT), with_id(MSG_ID_SET_DAY_NIGHT_THRESHOLD));
+        assert!(sendable(image, hub, &[picture.clone(), threshold.clone()]));
+        assert!(!sendable(image, hub, &[picture.clone()]), "a 25 without its 297");
+        assert!(!sendable(image, hub, &[threshold.clone()]), "a 297 alone");
+        assert!(!sendable(image, hub, &[threshold, picture]), "the other order");
+    }
+
+    #[test]
+    fn write_answers_are_routed_by_number_and_reported_once() {
+        let target = camera(1, CameraPage::Image);
+        let picture = crate::protocol::bc::settings_write::MSG_ID_SET_VIDEO_INPUT;
+        let threshold = crate::protocol::bc::settings_write::MSG_ID_SET_DAY_NIGHT_THRESHOLD;
+        let mut first = osd_write_for(1);
+        first.msg_id = picture;
+        let mut second = osd_write_for(1);
+        second.msg_id = threshold;
+        let collector = Arc::new(Mutex::new(WriteCollector::new(target, 7, &[first, second])));
+        lock(&collector).sent(0, 70);
+        lock(&collector).sent(1, 71);
+        let pending = Mutex::new(HashMap::new());
+        lock(&pending).insert(70u16, ImageKind::SettingsWrite(Arc::clone(&collector)));
+        lock(&pending).insert(71u16, ImageKind::SettingsWrite(Arc::clone(&collector)));
+        // Another id under the number is not this write's answer.
+        assert!(matches!(settings_reply(&reply(57, 70, 200, None), &pending), Routed::NotOurs));
+        assert!(matches!(settings_reply(&reply(picture, 70, 200, None), &pending), Routed::Consumed(None)));
+        let Routed::Consumed(Some(DeviceUpdate::SettingsWritten { target: t, group, results })) =
+            settings_reply(&reply(threshold, 71, 400, None), &pending)
+        else {
+            panic!("the group is answered")
+        };
+        assert_eq!((t, group), (target, 7));
+        assert_eq!(
+            results,
+            [
+                WriteOutcome { msg_id: picture, reply: WriteReply::Code(200) },
+                WriteOutcome { msg_id: threshold, reply: WriteReply::Code(400) }
+            ]
+        );
+        assert!(lock(&pending).is_empty());
+        assert!(lock(&collector).finish_if_complete().is_none(), "reported once");
+        // Given up after the timeout: a late answer is consumed, not routed.
+        let mut write = osd_write_for(1);
+        write.msg_id = crate::protocol::bc::settings_write::MSG_ID_SET_OSD;
+        let collector = Arc::new(Mutex::new(WriteCollector::new(camera(1, CameraPage::Display), 8, &[write])));
+        lock(&collector).sent(0, 72);
+        lock(&pending).insert(72u16, ImageKind::SettingsWrite(Arc::clone(&collector)));
+        lock(&collector).fill_open(WriteReply::NoReply);
+        let Some(DeviceUpdate::SettingsWritten { results, .. }) = lock(&collector).finish_if_complete() else {
+            panic!("given up")
+        };
+        assert_eq!(results[0].reply, WriteReply::NoReply);
+        assert!(matches!(settings_reply(&reply(45, 72, 200, None), &pending), Routed::Consumed(None)));
+        // Not sent: this write and every later one.
+        let mut c = WriteCollector::new(target, 9, &[osd_write_for(1), osd_write_for(1)]);
+        c.sent(0, 80);
+        c.failed_from(1, WriteReply::NotSent);
+        assert!(c.finish_if_complete().is_none());
+        assert!(c.record(80, 200));
+        let Some(DeviceUpdate::SettingsWritten { results, .. }) = c.finish_if_complete() else { panic!("complete") };
+        assert_eq!(results.iter().map(|r| r.reply).collect::<Vec<_>>(), [WriteReply::Code(200), WriteReply::NotSent]);
     }
 
     #[test]

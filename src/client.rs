@@ -22,7 +22,8 @@ pub use settings::{
     probe_channel as settings_probe_channel, CameraDetectionPage, CameraDisplayPage, CameraImagePage, CameraInfoPage,
     CameraLightSoundPage, CameraPage, CameraSchedulesPage, DeviceAlertsPage, DeviceInfoPage, DeviceKind,
     DeviceLightSoundPage, DeviceMaintenancePage, DeviceNetworkPage, DevicePage, DeviceStoragePage, DeviceTimePage,
-    DeviceUsersPage, NetworkRows, Read, ReadFailure, SettingsGates, SettingsPage, SettingsTarget, SETTINGS_REPLY_TIMEOUT,
+    DeviceUsersPage, NetworkRows, RawReplies, Read, ReadFailure, SettingsGates, SettingsPage, SettingsTarget,
+    WriteOutcome, WriteReply, SETTINGS_REPLY_TIMEOUT, SETTINGS_WRITE_TIMEOUT,
 };
 pub use replay::{
     file_for_time, next_file, sort_and_dedup_files, DownloadCancel, DownloadProgress, DownloadStream, DownloadSummary,
@@ -120,8 +121,13 @@ pub enum DeviceUpdate {
     EncodeProfiles { channel_id: u8, profiles: Vec<crate::encoding::EncodeProfile> },
     /// What camera sits on a channel: its own name, model and firmware.
     ChannelVersion { channel_id: u8, name: Option<String>, model: Option<String>, firmware: Option<String> },
-    /// One read-only settings page, complete (see `query_settings`).
-    Settings(SettingsPage),
+    /// One settings page, complete, with the caller's number for the read
+    /// it answers (see `query_settings`).
+    Settings { page: SettingsPage, read: u64 },
+    /// The device's answers to one group of settings writes, in the order
+    /// they were sent, with the caller's number for the group (see
+    /// `write_settings`).
+    SettingsWritten { target: SettingsTarget, group: u64, results: Vec<settings::WriteOutcome> },
 }
 
 /// What the device says it is, as reported after login.
@@ -236,7 +242,8 @@ pub struct ReolinkClient {
 }
 
 /// What an in-flight request was asking for: a `MSG_ID_IMAGE_FILE` request
-/// (see its own doc comment), or one read of a settings page.
+/// (see its own doc comment), one read of a settings page, or one settings
+/// write.
 #[derive(Debug, Clone)]
 enum ImageKind {
     MonitorPoint,
@@ -246,6 +253,8 @@ enum ImageKind {
     /// One read of a settings page; the collector gathers the page's
     /// replies (see `client::settings`).
     SettingsPage(Arc<std::sync::Mutex<settings::PageCollector>>),
+    /// One write of a group; the collector gathers the device's codes.
+    SettingsWrite(Arc<std::sync::Mutex<settings::WriteCollector>>),
 }
 
 #[derive(Debug, Clone)]

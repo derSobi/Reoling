@@ -2,8 +2,8 @@ use crate::ui::download_job::DownloadJob;
 use crate::ui::playback_driver::{PlaybackCommand, PlaybackDriver, PLAYBACK_TICK};
 use crate::ui::video_view::VideoSink;
 use reoling::{
-    ChannelInfo, CivilTime, DeviceIdentity, DeviceUpdate, RecordStream, ReolinkClient, ReplaySpeed, SettingsGates,
-    SettingsPage, SettingsTarget, StreamProfile, VideoFrame, VideoType,
+    ChannelInfo, CivilTime, DeviceIdentity, DeviceKind, DeviceUpdate, RecordStream, ReolinkClient, ReplaySpeed,
+    SettingsGates, SettingsPage, SettingsTarget, SettingsWrite, StreamProfile, VideoFrame, VideoType, WriteOutcome,
 };
 use std::collections::VecDeque;
 use std::net::IpAddr;
@@ -64,10 +64,15 @@ pub enum DeviceEvent {
     Playback(PlaybackEvent),
     /// A recording download (see `download_job`).
     Download(DownloadEvent),
-    /// One read-only settings page, complete (answer to `query_settings`).
-    Settings(SettingsPage),
-    /// A download runs; the settings page is read once it is over.
+    /// One settings page, complete, with the number its read was sent under
+    /// (answer to `query_settings`).
+    Settings { page: SettingsPage, read: u64 },
+    /// A download runs; the settings page is read (or written) once it is
+    /// over.
     SettingsDeferred(SettingsTarget),
+    /// The device's answers to one group of settings writes, with the
+    /// number the group was sent under (answer to `write_settings`).
+    SettingsWritten { target: SettingsTarget, group: u64, results: Vec<WriteOutcome> },
 }
 
 enum Command {
@@ -100,7 +105,8 @@ enum Command {
     QueryEncodeProfiles { channel: u8 },
     QueryChannelVersion { channel: u8 },
     SetEncoding { channel: u8, body: String },
-    QuerySettings { target: SettingsTarget, gates: SettingsGates },
+    QuerySettings { target: SettingsTarget, gates: SettingsGates, read: u64 },
+    WriteSettings { target: SettingsTarget, kind: DeviceKind, group: u64, writes: Vec<SettingsWrite> },
     Playback(PlaybackCommand),
     Download(DownloadRequest),
     DownloadCancel,
@@ -160,7 +166,7 @@ async fn deferral_notice(
             let event = PlaybackEvent::Notice { session, message: "Playback continues after the download".to_string() };
             let _ = tx.send(DeviceEvent::Playback(event)).await;
         }
-        Command::QuerySettings { target, .. } => {
+        Command::QuerySettings { target, .. } | Command::WriteSettings { target, .. } => {
             let _ = tx.send(DeviceEvent::SettingsDeferred(*target)).await;
         }
         _ => {}
@@ -279,10 +285,19 @@ impl DeviceLink {
         let _ = self.commands.send(Command::SetEncoding { channel, body });
     }
 
-    /// Reads one settings page (answered as `Settings`; `SettingsDeferred`
-    /// first when a download has the connection).
-    pub fn query_settings(&self, target: SettingsTarget, gates: SettingsGates) {
-        let _ = self.commands.send(Command::QuerySettings { target, gates });
+    /// Reads one settings page (answered as `Settings` with the same `read`,
+    /// the caller's number for this read; `SettingsDeferred` first when a
+    /// download has the connection).
+    pub fn query_settings(&self, target: SettingsTarget, gates: SettingsGates, read: u64) {
+        let _ = self.commands.send(Command::QuerySettings { target, gates, read });
+    }
+
+    /// Writes one group of settings on a device of `kind` (answered as
+    /// `SettingsWritten` with the same `group`; `SettingsDeferred` first
+    /// when a download has the connection, the writes going out once it is
+    /// over).
+    pub fn write_settings(&self, target: SettingsTarget, kind: DeviceKind, group: u64, writes: Vec<SettingsWrite>) {
+        let _ = self.commands.send(Command::WriteSettings { target, kind, group, writes });
     }
 
     /// Streams the channel (replacing whatever this device was streaming).
@@ -574,8 +589,13 @@ pub fn spawn_device(
                     incoming = async {
                         if has_deferred { Incoming::Deferred } else { Incoming::Received(command_rx.recv().await) }
                     } => match incoming.command(&mut deferred) {
-                        Some(command @ (Command::Play { .. } | Command::Stop | Command::Playback(_) | Command::QuerySettings { .. }))
-                            if downloading =>
+                        Some(
+                            command @ (Command::Play { .. }
+                            | Command::Stop
+                            | Command::Playback(_)
+                            | Command::QuerySettings { .. }
+                            | Command::WriteSettings { .. }),
+                        ) if downloading =>
                         {
                             if let Some(job) = download.as_mut() {
                                 deferral_notice(&command, job, &driver, &deferred, &tx).await;
@@ -624,7 +644,12 @@ pub fn spawn_device(
                         Some(Command::QueryEncoding { channel }) => client.query_encoding(channel).await,
                         Some(Command::QueryEncodeProfiles { channel }) => client.query_encode_profiles(channel).await,
                         Some(Command::QueryChannelVersion { channel }) => client.query_channel_version(channel).await,
-                        Some(Command::QuerySettings { target, gates }) => client.query_settings(target, &gates).await,
+                        Some(Command::QuerySettings { target, gates, read }) => {
+                            client.query_settings(target, &gates, read).await
+                        }
+                        Some(Command::WriteSettings { target, kind, group, writes }) => {
+                            client.write_settings(target, kind, group, writes).await
+                        }
                         Some(Command::SetEncoding { channel, body }) => {
                             if let Err(e) = client.set_encoding(channel, body).await {
                                 let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
@@ -805,7 +830,10 @@ pub fn spawn_device(
                             DeviceUpdate::ChannelVersion { channel_id, model, firmware, .. } => {
                                 DeviceEvent::ChannelVersion { channel_id, model, firmware }
                             }
-                            DeviceUpdate::Settings(page) => DeviceEvent::Settings(page),
+                            DeviceUpdate::Settings { page, read } => DeviceEvent::Settings { page, read },
+                            DeviceUpdate::SettingsWritten { target, group, results } => {
+                                DeviceEvent::SettingsWritten { target, group, results }
+                            }
                         };
                         if tx.send(event).await.is_err() {
                             break;

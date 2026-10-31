@@ -21,6 +21,7 @@ pub mod remote;
 pub mod schedule_grid;
 pub mod secrets;
 pub mod settings;
+pub mod settings_edit;
 pub mod settings_pages;
 pub mod settings_view;
 pub mod settings_window;
