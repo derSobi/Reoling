@@ -675,9 +675,15 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             }
         });
         // Fullscreen: any pointer movement brings the controls up for a while.
+        // A motion event at the last position is no movement: Wayland sends
+        // those while the bar itself slides in or out.
         let w = weak.clone();
+        let last_position = Cell::new(None);
         let motion = gtk4::EventControllerMotion::new();
-        motion.connect_motion(move |_, _, _| {
+        motion.connect_motion(move |_, x, y| {
+            if last_position.replace(Some((x, y))) == Some((x, y)) {
+                return;
+            }
             if let Some(m) = w.upgrade() {
                 m.show_fullscreen_bar();
             }
@@ -764,6 +770,29 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             glib::Propagation::Proceed
         });
         window.add_controller(keys);
+        // The window manager makes the window fullscreen after `set_fullscreen`
+        // has returned: the controls' hide timer starts from here, so the bar
+        // also goes away when the pointer never moves. When the window manager
+        // ends fullscreen by itself, the controls go back below the video.
+        let w = weak.clone();
+        window.connect_fullscreened_notify(move |window| {
+            if let Some(m) = w.upgrade() {
+                if m.fullscreen_bar.child().is_none() {
+                    return;
+                }
+                if window.is_fullscreen() {
+                    m.show_fullscreen_bar();
+                } else {
+                    // Not from inside `unfullscreen()`, which may notify before
+                    // `set_fullscreen(false)` has moved the controls back.
+                    glib::idle_add_local_once(move || {
+                        if !m.window.is_fullscreen() && m.fullscreen_bar.child().is_some() {
+                            m.set_fullscreen(false);
+                        }
+                    });
+                }
+            }
+        });
 
         // Best-effort disconnect on close: the network thread needs a moment
         // to get the packet out before the process exits.
@@ -919,6 +948,18 @@ fn download_names(device: Option<&Device>, channel: u8) -> (String, String) {
     (device.name.clone(), camera)
 }
 
+/// Whether a popover of a control inside `widget` is on screen.
+fn popover_open_below(widget: &impl IsA<gtk4::Widget>) -> bool {
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        if (c.is::<gtk4::Popover>() && c.is_mapped()) || popover_open_below(&c) {
+            return true;
+        }
+        child = c.next_sibling();
+    }
+    false
+}
+
 fn sidebar_icon() -> &'static str {
     let has = |name: &str| {
         gtk4::gdk::Display::default()
@@ -981,7 +1022,8 @@ impl MainWindow {
     }
 
     /// Brings the fullscreen controls up and hides them again after a pause
-    /// in pointer movement (never while the pointer is on them).
+    /// in pointer movement (never while the pointer is on them or one of
+    /// their popovers is open).
     fn show_fullscreen_bar(self: &Rc<Self>) {
         if !self.window.is_fullscreen() {
             return;
@@ -995,7 +1037,13 @@ impl MainWindow {
                 && this.window.is_fullscreen()
                 && !this.pointer_on_bar.get()
             {
-                this.fullscreen_bar.set_reveal_child(false);
+                // The volume slider or the stream list would close with the
+                // bar: wait until it is closed.
+                if popover_open_below(&this.bars) {
+                    this.show_fullscreen_bar();
+                } else {
+                    this.fullscreen_bar.set_reveal_child(false);
+                }
             }
         });
     }
