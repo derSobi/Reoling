@@ -46,8 +46,12 @@ answers first.
 - Digital video zoom in live view and playback: scroll up over the picture
   to zoom in at the pointer, and down to zoom out, up to 16×. Left-click and
   drag to pan while zoomed in; middle-click restores the whole picture.
-  Zoom stays when resizing or entering
-  fullscreen and resets when switching cameras or streams. It respects Stretch Mode;
+  Zoom stays when resizing or entering fullscreen. In live view it resets
+  whenever the stream starts again (another camera, channel or stream, Play
+  after Stop); in playback it stays across seeks, speed changes and the
+  recordings of one day, and resets on another day, camera or channel, once
+  a lost connection is back, on leaving Playback and whenever the video
+  codec changes (a main/sub switch can change it). It respects Stretch Mode;
   snapshots and recordings still contain the full frame.
 - Sound: the stream's audio with a volume control; Talk (microphone to the
   camera, ADPCM).

@@ -72,7 +72,7 @@ fn anchor_enabled() -> bool {
 /// elements are designed to be pushed to from any thread; this is the
 /// standard pattern for a live source), so once obtained via
 /// `VideoView::ensure_sink` (which must run on the GTK main thread — it
-/// touches the `Picture` widget), `push_frame` can and should be called
+/// touches the `ZoomPicture` widget), `push_frame` can and should be called
 /// directly from the network/media thread that actually has the frame
 /// data, without hopping through the GTK main loop at all.
 ///
@@ -526,7 +526,7 @@ impl VideoView {
         });
 
         /*
-         * Connect gtk4paintablesink to GtkPicture.
+         * Connect gtk4paintablesink to the ZoomPicture.
          */
         let paintable =
             sink.property::<gtk4::gdk::Paintable>("paintable");

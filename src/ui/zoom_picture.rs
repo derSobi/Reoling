@@ -2,7 +2,7 @@
 //! transformed; snapshots and recordings still use the original frames.
 
 use gtk4::{gdk, graphene, prelude::*, subclass::prelude::*};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 const MAX_ZOOM: f64 = 16.0;
 const ZOOM_STEP: f64 = 1.2;
@@ -71,19 +71,25 @@ struct PanDrag {
 }
 
 impl PictureRect {
+    /// The picture's place in a `width` × `height` widget, on whole pixels
+    /// as GtkPicture 4.14 and newer places it unzoomed: the size rounded up,
+    /// the offset truncated. Zoomed at a fraction of a pixel, the outer rows
+    /// or columns would be partly covered and show blended with the
+    /// background.
     fn fit(width: f64, height: f64, aspect: f64, keep_aspect: bool) -> Option<Self> {
         if width <= 0.0 || height <= 0.0 {
             return None;
         }
-        let (w, h) = if keep_aspect && aspect > 0.0 {
-            let w = width.min(height * aspect);
-            (w, w / aspect)
-        } else {
+        let (w, h) = if !keep_aspect || aspect <= 0.0 {
             (width, height)
+        } else if aspect > width / height {
+            (width, (width / aspect).ceil())
+        } else {
+            ((height * aspect).ceil(), height)
         };
         Some(Self {
-            x: (width - w) / 2.0,
-            y: (height - h) / 2.0,
+            x: ((width - w) / 2.0).trunc(),
+            y: ((height - h) / 2.0).trunc(),
             width: w,
             height: h,
         })
@@ -96,6 +102,31 @@ impl PictureRect {
     }
 }
 
+/// The point a wheel step zooms about: where the pointer is at the scroll
+/// event, else the last motion position. The latter is stale after a layout
+/// change without pointer motion (entering fullscreen by double-click).
+fn scroll_anchor(at_event: Option<(f64, f64)>, last_motion: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    at_event.or(last_motion)
+}
+
+/// The cursor over the viewport: a closed hand while panning, an open one
+/// over a zoomed picture.
+fn cursor_name(dragging: bool, zoomed: bool, over_picture: bool) -> Option<&'static str> {
+    if dragging {
+        Some("grabbing")
+    } else if zoomed && over_picture {
+        Some("grab")
+    } else {
+        None
+    }
+}
+
+/// Notes `name` as the cursor shown; true only when it differs from the one
+/// noted before.
+fn cursor_changes(shown: &Cell<Option<&'static str>>, name: Option<&'static str>) -> bool {
+    shown.replace(name) != name
+}
+
 mod imp {
     use super::*;
 
@@ -105,6 +136,11 @@ mod imp {
         pub(super) zoom: Cell<Zoom>,
         pub(super) pointer: Cell<Option<(f64, f64)>>,
         pub(super) drag: Cell<Option<PanDrag>>,
+        // The cursor last set, so motion events do not set it again.
+        pub(super) cursor: Cell<Option<&'static str>>,
+        // The paintable whose new frames redraw this widget while zoomed,
+        // with its invalidate-contents and invalidate-size handlers.
+        pub(super) watched: RefCell<Option<(gdk::Paintable, [glib::SignalHandlerId; 2])>>,
     }
 
     #[glib::object_subclass]
@@ -155,9 +191,10 @@ mod imp {
                     | gtk4::EventControllerScrollFlags::DISCRETE,
             );
             let weak = obj.downgrade();
-            scroll.connect_scroll(move |_, _, dy| {
+            scroll.connect_scroll(move |controller, _, dy| {
                 if let Some(obj) = weak.upgrade() {
-                    if let Some((x, y)) = obj.imp().pointer.get() {
+                    if let Some((x, y)) = scroll_anchor(obj.pointer_position(controller), obj.imp().pointer.get()) {
+                        obj.imp().pointer.set(Some((x, y)));
                         if obj.scroll_at(dy, x, y) {
                             return glib::Propagation::Stop;
                         }
@@ -180,9 +217,10 @@ mod imp {
             let weak = obj.downgrade();
             drag.connect_drag_update(move |gesture, dx, dy| {
                 if let Some(obj) = weak.upgrade() {
-                    if obj.update_pan(dx, dy) {
-                        // Claim only after movement, leaving a stationary
-                        // double-click available for fullscreen.
+                    // Claim only beyond the drag threshold: a double-click
+                    // (fullscreen) still counts when the pointer moves a
+                    // pixel or two between press and release.
+                    if obj.update_pan(dx, dy) && dx.hypot(dy) >= f64::from(obj.settings().gtk_dnd_drag_threshold()) {
                         gesture.set_state(gtk4::EventSequenceState::Claimed);
                     }
                 }
@@ -215,6 +253,7 @@ mod imp {
         }
 
         fn dispose(&self) {
+            self.obj().watch(None);
             self.picture.unparent();
         }
     }
@@ -222,15 +261,28 @@ mod imp {
     impl WidgetImpl for ZoomPicture {
         fn snapshot(&self, snapshot: &gtk4::Snapshot) {
             let obj = self.obj();
-            let Some(rect) = obj.picture_rect() else {
+            let zoom = self.zoom.get();
+            // Unzoomed, the inner picture draws itself, pixel for pixel as a
+            // plain GtkPicture would.
+            if zoom == Zoom::default() {
+                obj.snapshot_child(&self.picture, snapshot);
+                return;
+            }
+            let (Some(rect), Some(paintable)) = (obj.picture_rect(), self.picture.paintable()) else {
                 return;
             };
-            let zoom = self.zoom.get();
+            // Clip only the sides the zoomed picture overhangs. At a pan
+            // limit its own edge lies on the rectangle's, and a clip there as
+            // well would blend that edge twice at a fractional display scale.
+            let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
+            let open = |at_limit: bool| if at_limit { 1.0 } else { 0.0 };
+            let (left, top) = (open(near(zoom.x, 0.0)), open(near(zoom.y, 0.0)));
+            let (right, bottom) = (open(near(zoom.x + zoom.scale, 1.0)), open(near(zoom.y + zoom.scale, 1.0)));
             snapshot.push_clip(&graphene::Rect::new(
-                rect.x as f32,
-                rect.y as f32,
-                rect.width as f32,
-                rect.height as f32,
+                (rect.x - left) as f32,
+                (rect.y - top) as f32,
+                (rect.width + left + right) as f32,
+                (rect.height + top + bottom) as f32,
             ));
             snapshot.save();
             snapshot.translate(&graphene::Point::new(
@@ -238,7 +290,12 @@ mod imp {
                 (rect.y * (1.0 - zoom.scale) + zoom.y * rect.height) as f32,
             ));
             snapshot.scale(zoom.scale as f32, zoom.scale as f32);
-            obj.snapshot_child(&self.picture, snapshot);
+            // Zoomed, the paintable is drawn here at the rectangle the clip
+            // and the pan limits use, which is GtkPicture's own placement
+            // (`PictureRect::fit`): no empty strip, and the edges look as
+            // they do unzoomed. `watch` redraws this widget on new frames.
+            snapshot.translate(&graphene::Point::new(rect.x as f32, rect.y as f32));
+            paintable.snapshot(snapshot.upcast_ref::<gdk::Snapshot>(), rect.width, rect.height);
             snapshot.restore();
             snapshot.pop();
         }
@@ -246,30 +303,65 @@ mod imp {
 }
 
 glib::wrapper! {
+    /// A picture for the video view with digital zoom: the wheel zooms about
+    /// the pointer (up to 16×), a left drag pans while zoomed, a middle click
+    /// shows the whole picture again. Unzoomed it draws like a
+    /// `gtk4::Picture`.
     pub struct ZoomPicture(ObjectSubclass<imp::ZoomPicture>)
         @extends gtk4::Widget,
         @implements gtk4::Accessible, gtk4::Buildable, gtk4::ConstraintTarget;
 }
 
 impl ZoomPicture {
+    /// An empty, unzoomed picture.
     pub fn new() -> Self {
         glib::Object::new()
     }
 
+    /// What the picture shows, if anything.
     pub fn paintable(&self) -> Option<gdk::Paintable> {
         self.imp().picture.paintable()
     }
 
+    /// Shows `paintable` (a new stream, or nothing), unzoomed.
     pub fn set_paintable(&self, paintable: Option<&impl IsA<gdk::Paintable>>) {
         self.reset_zoom();
         self.imp().picture.set_paintable(paintable);
+        self.watch(paintable.map(|p| p.as_ref()));
     }
 
+    /// Letterboxes the picture to its aspect ratio (true) or stretches it
+    /// over the whole widget (false), as
+    /// `gtk4::Picture::set_keep_aspect_ratio`. A pan under way ends.
     pub fn set_keep_aspect_ratio(&self, keep: bool) {
         self.end_pan();
         self.imp().picture.set_keep_aspect_ratio(keep);
         self.update_cursor();
         self.queue_draw();
+    }
+
+    /// While zoomed the paintable is drawn by this widget, not by the inner
+    /// picture, whose own redraw requests then stop at it: a new frame (or
+    /// size) of `paintable` has to redraw this widget itself. The handlers
+    /// hold this widget weakly and go with the next paintable or on dispose.
+    fn watch(&self, paintable: Option<&gdk::Paintable>) {
+        if let Some((old, handlers)) = self.imp().watched.take() {
+            for handler in handlers {
+                old.disconnect(handler);
+            }
+        }
+        let Some(paintable) = paintable else { return };
+        let redraw = |weak: glib::WeakRef<Self>| {
+            move |_: &gdk::Paintable| {
+                // Unzoomed, the inner picture redraws on its own.
+                if let Some(obj) = weak.upgrade().filter(|obj| obj.imp().zoom.get() != Zoom::default()) {
+                    obj.queue_draw();
+                }
+            }
+        };
+        let contents = paintable.connect_invalidate_contents(redraw(self.downgrade()));
+        let size = paintable.connect_invalidate_size(redraw(self.downgrade()));
+        *self.imp().watched.borrow_mut() = Some((paintable.clone(), [contents, size]));
     }
 
     fn reset_zoom(&self) {
@@ -323,13 +415,33 @@ impl ZoomPicture {
             .pointer
             .get()
             .is_some_and(|(x, y)| self.picture_rect().and_then(|r| r.position(x, y)).is_some());
-        self.set_cursor_from_name(if self.imp().drag.get().is_some() {
-            Some("grabbing")
-        } else if self.imp().zoom.get().scale > 1.0 && over_picture {
-            Some("grab")
-        } else {
-            None
-        });
+        let name = cursor_name(self.imp().drag.get().is_some(), self.imp().zoom.get().scale > 1.0, over_picture);
+        // Called on every motion event: a cursor only when it changes.
+        if cursor_changes(&self.imp().cursor, name) {
+            self.set_cursor_from_name(name);
+        }
+    }
+
+    /// Where the pointer is for the event `controller` is handling, in this
+    /// widget's coordinates. A GTK 4 scroll event carries no position of its
+    /// own, so the seat's pointer is asked where it is now: the live position
+    /// on X11, that of the last pointer event on Wayland. Both are relative
+    /// to the surface, which can extend beyond the native widget (client-side
+    /// decorations).
+    fn pointer_position(&self, controller: &impl IsA<gtk4::EventController>) -> Option<(f64, f64)> {
+        let event = controller.as_ref().current_event()?;
+        let native = self.native()?;
+        let (x, y) = match event.position() {
+            Some(position) => position,
+            None => {
+                // The seat's logical pointer: X11 refuses a position query
+                // for the physical device an event can name.
+                let (x, y, _) = native.surface()?.device_position(&event.seat()?.pointer()?)?;
+                (x, y)
+            }
+        };
+        let (dx, dy) = native.surface_transform();
+        native.upcast_ref::<gtk4::Widget>().translate_coordinates(self, x - dx, y - dy)
     }
 
     fn picture_rect(&self) -> Option<PictureRect> {
@@ -363,7 +475,9 @@ mod tests {
     // Run separately on a display (or with GDK_BACKEND=broadway and a
     // connected gtk4-broadwayd): cargo test --bin reoling
     // zoom_picture::tests::widget_renders_and_resets -- --ignored
-    #[test]
+    // `gtk4::test` runs every GTK test on one thread, the only one GTK can be
+    // initialised on, so it can run together with the other window tests.
+    #[gtk4::test]
     #[ignore = "requires a GTK display"]
     fn widget_renders_and_resets() {
         gtk4::init().unwrap();
@@ -388,17 +502,7 @@ mod tests {
             .child(&picture)
             .build();
         window.present();
-        let context = glib::MainContext::default();
-        for _ in 0..100 {
-            while context.pending() {
-                context.iteration(false);
-            }
-            if picture.width() > 0 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert_eq!((picture.width(), picture.height()), (400, 300));
+        settle(&picture, 400, 300);
         let renderer = gtk4::gsk::CairoRenderer::new();
         renderer.realize(None::<&gdk::Surface>).unwrap();
         let render = || {
@@ -458,8 +562,17 @@ mod tests {
         assert!(picture.scroll_at(-3.0, 100.0, 100.0));
         picture.set_paintable(Some(&texture));
         assert_eq!(render(), original, "a new stream resets zoom");
+        // Zoomed, new frames redraw the widget through handlers on the
+        // paintable; each new paintable takes them over.
+        let invalidate =
+            glib::subclass::SignalId::lookup("invalidate-contents", gdk::Paintable::static_type()).unwrap();
+        let watched = |paintable: &gdk::MemoryTexture| {
+            glib::signal::signal_has_handler_pending(paintable, invalidate, None, true)
+        };
+        assert!(watched(&texture));
         assert!(picture.scroll_at(-3.0, 100.0, 100.0));
         picture.set_paintable(None::<&gdk::Paintable>);
+        assert!(!watched(&texture), "no handler stays on a previous paintable");
         assert_eq!(picture.imp().zoom.get(), Zoom::default());
         assert!(!picture.scroll_at(-1.0, 100.0, 100.0));
         picture.set_paintable(Some(&texture));
@@ -471,8 +584,166 @@ mod tests {
             255,
             "stretch fills the viewport"
         );
+
+        // Motion over a zoomed picture keeps the cursor it has; only a change
+        // of cursor sets a new one.
+        assert!(picture.scroll_at(-3.0, 100.0, 100.0));
+        picture.imp().pointer.set(Some((100.0, 100.0)));
+        picture.update_cursor();
+        let grab = picture.cursor();
+        assert_eq!(grab.as_ref().and_then(|cursor| cursor.name()).as_deref(), Some("grab"));
+        picture.imp().pointer.set(Some((120.0, 110.0)));
+        picture.update_cursor();
+        assert_eq!(picture.cursor(), grab, "the same cursor object");
+        assert!(picture.begin_pan(120.0, 110.0));
+        assert_eq!(picture.cursor().and_then(|cursor| cursor.name()).as_deref(), Some("grabbing"));
+        picture.end_pan();
+        picture.reset_zoom();
+        assert_eq!(picture.cursor(), None);
+
+        // Unzoomed, the widget draws exactly like a plain GtkPicture, also
+        // where the letterbox or the pillarbox falls between pixels. Zoomed
+        // one step about the centre and at 16× panned to either corner, the
+        // picture covers every pixel row and column of its rectangle wholly
+        // and none outside it, as the plain picture does from GTK 4.14 on: no
+        // empty strip and no edge blended with the background. From either
+        // pan limit a drag pans back, also from a press near the opposite
+        // corner.
+        for (width, height) in [(160, 90), (90, 160)] {
+            let pixels: Vec<u8> = (0..height)
+                .flat_map(|y| (0..width).flat_map(move |x| [(x * 7) as u8, (y * 5) as u8, 128, 255]))
+                .collect();
+            let pattern = gdk::MemoryTexture::new(
+                width,
+                height,
+                gdk::MemoryFormat::R8g8b8a8,
+                &glib::Bytes::from_owned(pixels),
+                width as usize * 4,
+            );
+            for keep in [true, false] {
+                let plain = gtk4::Picture::new();
+                plain.set_paintable(Some(&pattern));
+                plain.set_keep_aspect_ratio(keep);
+                let zoomed = ZoomPicture::new();
+                zoomed.set_paintable(Some(&pattern));
+                zoomed.set_keep_aspect_ratio(keep);
+                let windows = [plain.upcast_ref::<gtk4::Widget>(), zoomed.upcast_ref()].map(|child| {
+                    let window =
+                        gtk4::Window::builder().decorated(false).default_width(401).default_height(301).build();
+                    window.set_child(Some(child));
+                    window.present();
+                    window
+                });
+                settle(&plain, 401, 301);
+                settle(&zoomed, 401, 301);
+                let case = format!("{width}x{height} picture, keep aspect ratio {keep}");
+                let unzoomed = pixels_of(&zoomed, &renderer);
+                let plain_pixels = pixels_of(&plain, &renderer);
+                assert!(plain_pixels == unzoomed, "1× like a plain picture: {case}");
+
+                let rect = zoomed.picture_rect().unwrap();
+                let (cx, cy) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+                let (right, bottom) = (rect.x + rect.width - 2.0, rect.y + rect.height - 2.0);
+                assert!(zoomed.scroll_at(-1.0, cx, cy));
+                let step = pixels_of(&zoomed, &renderer);
+                zoomed.reset_zoom();
+                assert!(zoomed.scroll_at(-100.0, rect.x, rect.y));
+                assert_eq!(zoomed.imp().zoom.get(), Zoom { scale: MAX_ZOOM, x: 0.0, y: 0.0 });
+                let top_left = pixels_of(&zoomed, &renderer);
+                assert!(zoomed.begin_pan(right, bottom));
+                assert!(zoomed.update_pan(-30.0, -20.0));
+                let zoom = zoomed.imp().zoom.get();
+                assert!(zoom.x < 0.0 && zoom.y < 0.0, "pans back from the top-left limit: {case}");
+                zoomed.update_pan(-1e6, -1e6);
+                zoomed.end_pan();
+                assert_eq!(zoomed.imp().zoom.get(), Zoom { scale: MAX_ZOOM, x: 1.0 - MAX_ZOOM, y: 1.0 - MAX_ZOOM });
+                let bottom_right = pixels_of(&zoomed, &renderer);
+                assert!(zoomed.begin_pan(rect.x + 2.0, rect.y + 2.0));
+                assert!(zoomed.update_pan(30.0, 20.0));
+                let zoom = zoomed.imp().zoom.get();
+                assert!(
+                    zoom.x > 1.0 - MAX_ZOOM && zoom.y > 1.0 - MAX_ZOOM,
+                    "pans back from the bottom-right limit: {case}"
+                );
+                zoomed.end_pan();
+
+                let alpha = |pixels: &[u8], x: usize, y: usize| pixels[(y * 401 + x) * 4 + 3];
+                let inside = |i: usize, start: f64, length: f64| (start..start + length).contains(&(i as f64));
+                let renders = [
+                    ("1× plain", &plain_pixels),
+                    ("1.2×", &step),
+                    ("16× top-left", &top_left),
+                    ("16× bottom-right", &bottom_right),
+                ];
+                for (label, pixels) in renders {
+                    // `PictureRect::fit` matches GtkPicture 4.14 and newer.
+                    if label == "1× plain" && gtk4::check_version(4, 14, 0).is_some() {
+                        continue;
+                    }
+                    for y in 0..301 {
+                        let expected = if inside(y, rect.y, rect.height) { 255 } else { 0 };
+                        assert_eq!(alpha(pixels, cx as usize, y), expected, "row {y} at {label}: {case}");
+                    }
+                    for x in 0..401 {
+                        let expected = if inside(x, rect.x, rect.width) { 255 } else { 0 };
+                        assert_eq!(alpha(pixels, x, cy as usize), expected, "column {x} at {label}: {case}");
+                    }
+                }
+                for window in windows {
+                    window.close();
+                }
+            }
+        }
         renderer.unrealize();
+
+        // Nothing but its window keeps the widget alive (the handlers hold it
+        // weakly), and its handlers go with it.
+        picture.set_paintable(Some(&texture));
+        assert!(watched(&texture));
+        let weak = picture.downgrade();
+        drop(picture);
         window.close();
+        drop(window);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while weak.upgrade().is_some() && std::time::Instant::now() < deadline {
+            pump();
+        }
+        assert!(weak.upgrade().is_none(), "the widget is freed with its window");
+        assert!(!watched(&texture), "its handlers are gone");
+    }
+
+    /// Runs what the main loop has pending, then waits 10 ms.
+    fn pump() {
+        let context = glib::MainContext::default();
+        while context.pending() {
+            context.iteration(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    /// Runs the main loop until `widget` has its size, for up to 5 s: a
+    /// release build under Xvfb can take a while to map a first window.
+    fn settle(widget: &impl IsA<gtk4::Widget>, width: i32, height: i32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while (widget.width(), widget.height()) != (width, height) && std::time::Instant::now() < deadline {
+            pump();
+        }
+        pump();
+        assert_eq!((widget.width(), widget.height()), (width, height));
+    }
+
+    /// The pixels of `widget` as its window draws it, at once rather than on
+    /// the next frame.
+    fn pixels_of(widget: &impl IsA<gtk4::Widget>, renderer: &gtk4::gsk::CairoRenderer) -> Vec<u8> {
+        let window = widget.parent().unwrap();
+        let bounds = widget.compute_bounds(&window).unwrap();
+        let snapshot = gtk4::Snapshot::new();
+        window.snapshot_child(widget, &snapshot);
+        let texture = renderer.render_texture(&snapshot.to_node().unwrap(), Some(&bounds));
+        let (width, height) = (texture.width() as usize, texture.height() as usize);
+        let mut pixels = vec![0; width * height * 4];
+        texture.download(&mut pixels, width * 4);
+        pixels
     }
 
     fn near(a: f64, b: f64) {
@@ -559,8 +830,44 @@ mod tests {
         let tall = PictureRect::fit(800.0, 600.0, 0.5, true).unwrap();
         assert_eq!(tall.position(250.0, 0.0), Some((0.0, 0.0)));
         assert_eq!(tall.position(249.0, 300.0), None);
+        // Fits at fractions of a pixel round as GtkPicture's do: the size
+        // up, the offset down.
+        let fit = |width, height, aspect| {
+            let rect = PictureRect::fit(width, height, aspect, true).unwrap();
+            (rect.x, rect.y, rect.width, rect.height)
+        };
+        assert_eq!(fit(934.0, 560.0, 16.0 / 9.0), (0.0, 17.0, 934.0, 526.0));
+        assert_eq!(fit(401.0, 301.0, 16.0 / 9.0), (0.0, 37.0, 401.0, 226.0));
+        assert_eq!(fit(1001.0, 600.0, 9.0 / 16.0), (331.0, 0.0, 338.0, 600.0));
         let stretched = PictureRect::fit(800.0, 600.0, 2.0, false).unwrap();
         assert_eq!(stretched.position(200.0, 150.0), Some((0.25, 0.25)));
         assert!(PictureRect::fit(0.0, 600.0, 2.0, true).is_none());
+    }
+
+    #[test]
+    fn a_wheel_step_zooms_about_where_the_event_happened() {
+        // The last motion position is stale after fullscreen came in under a
+        // still pointer. Only the fallback order is tested here: the lookup
+        // in `pointer_position` needs a pointer on a display and is checked
+        // outside the test suite.
+        assert_eq!(scroll_anchor(Some((520.0, 230.0)), Some((259.0, 184.0))), Some((520.0, 230.0)));
+        assert_eq!(scroll_anchor(None, Some((259.0, 184.0))), Some((259.0, 184.0)));
+        assert_eq!(scroll_anchor(Some((520.0, 230.0)), None), Some((520.0, 230.0)));
+        assert_eq!(scroll_anchor(None, None), None);
+    }
+
+    #[test]
+    fn the_cursor_is_set_only_when_it_changes() {
+        assert_eq!(cursor_name(false, false, true), None);
+        assert_eq!(cursor_name(false, true, false), None);
+        assert_eq!(cursor_name(false, true, true), Some("grab"));
+        assert_eq!(cursor_name(true, true, false), Some("grabbing"));
+        assert_eq!(cursor_name(true, true, true), Some("grabbing"));
+        // A widget starts with no cursor of its own.
+        let shown = Cell::new(None);
+        let names = [None, Some("grab"), Some("grab"), Some("grabbing"), Some("grabbing"), Some("grab"), None, None];
+        let changes: Vec<bool> = names.into_iter().map(|name| cursor_changes(&shown, name)).collect();
+        assert_eq!(changes, [false, true, false, true, false, true, true, false]);
+        assert_eq!(shown.get(), None);
     }
 }
