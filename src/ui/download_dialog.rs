@@ -374,7 +374,8 @@ mod tests {
     /// Needs a display: opens the dialog, makes its note and error appear
     /// and disappear as the fields change and counts GTK's "Trying to
     /// measure" warnings (a window smaller than its content) meanwhile.
-    #[test]
+    /// `gtk4::test`: on the one thread every GTK test shares.
+    #[gtk4::test]
     #[ignore = "opens a window on the display; run explicitly"]
     fn the_window_keeps_up_with_its_content() {
         use std::sync::atomic::Ordering::SeqCst;

@@ -194,8 +194,8 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
     let video = Rc::new(VideoView::new());
 
     // Every connection's network thread asks here for a `VideoSink` once it
-    // knows the codec; building the pipeline touches the `Picture`, so it has
-    // to happen on the GTK main thread (see `bridge::spawn_connection`).
+    // knows the codec; building the pipeline touches the `ZoomPicture`, so it
+    // has to happen on the GTK main thread (see `bridge::spawn_connection`).
     let (sink_request_tx, mut sink_request_rx) = tokio::sync::mpsc::channel::<SinkRequest>(8);
     let video_for_sink = Rc::clone(&video);
     glib::spawn_future_local(async move {
