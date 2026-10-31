@@ -21,7 +21,10 @@ use gtk4::{
     GestureClick, HeaderBar, IconTheme, Image, Label, Orientation, Overlay, Paned, ScaleButton,
     Revealer, RevealerTransitionType, Stack, StackSwitcher, ToggleButton,
 };
-use reoling::{looks_multi_channel, CameraPage, DeviceKind, DevicePage, SettingsGates, SettingsTarget, StreamProfile};
+use reoling::{
+    looks_multi_channel, CameraPage, DeviceKind, DevicePage, SettingsGates, SettingsTarget, SettingsWrite,
+    StreamProfile,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -477,7 +480,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
                 m.open_camera_settings(true);
             }
         });
-        let (w_reload, w_save, w_page) = (weak.clone(), weak.clone(), weak.clone());
+        let (w_reload, w_save, w_page, w_write) = (weak.clone(), weak.clone(), weak.clone(), weak.clone());
         let camera_settings = CameraSettings::new(camera_settings::Handlers {
             on_reload: Box::new(move |_channel| {
                 if let Some(m) = w_reload.upgrade() {
@@ -496,7 +499,12 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
                     m.control(move |link, channel| link.set_encoding(channel, body.clone()));
                 }
             }),
-            on_read_page: Box::new(move |channel, page| w_page.upgrade().is_some_and(|m| m.read_camera_page(channel, page))),
+            on_read_page: Box::new(move |channel, page, read| {
+                w_page.upgrade().is_some_and(|m| m.read_camera_page(channel, page, read))
+            }),
+            on_write: Box::new(move |key, channel, page, group, writes| {
+                w_write.upgrade().is_some_and(|m| m.write_camera_page(key, channel, page, group, writes))
+            }),
         });
         // An NVR's or Hub's own settings, opened from its sidebar card.
         let w_device_page = weak.clone();
@@ -1115,15 +1123,16 @@ impl MainWindow {
         let model = if device.multi_channel { String::new() } else { device.model.clone() };
         let kind = DeviceKind::from_model(&device.model);
         let abilities = device.abilities.get(&device.channel).copied();
-        self.camera_settings.open(&title, device.channel, &model, &device.encode_profiles, kind, abilities);
+        self.camera_settings.open(&key, &title, device.channel, &model, &device.encode_profiles, kind, abilities);
         if raise {
             self.camera_settings.present();
         }
     }
 
-    /// One read-only tab of the camera window's channel, over the watched
-    /// device's link; `false` when nothing is being watched.
-    fn read_camera_page(&self, channel: u8, page: CameraPage) -> bool {
+    /// One tab of the camera window's channel, over the watched device's
+    /// link, under the window's number for this read (the page comes back
+    /// with it); `false` when nothing is being watched.
+    fn read_camera_page(&self, channel: u8, page: CameraPage, read: u64) -> bool {
         let Some(key) = self.playing_key() else { return false };
         let Some(device) = self.device(&key) else { return false };
         let links = self.links.borrow();
@@ -1133,19 +1142,46 @@ impl MainWindow {
             device.abilities.get(&channel).copied(),
             &device.username,
         );
-        l.link.query_settings(SettingsTarget::Camera { channel, page }, gates);
+        l.link.query_settings(SettingsTarget::Camera { channel, page }, gates, read);
+        true
+    }
+
+    /// One group of writes of the camera window's device (`key`) and
+    /// channel, over that device's link; `false` unless it is the one being
+    /// watched, on that channel. Only a Home Hub's cameras are written
+    /// (their shapes are the captured ones).
+    fn write_camera_page(
+        &self,
+        key: &str,
+        channel: u8,
+        page: CameraPage,
+        group: u64,
+        writes: Vec<SettingsWrite>,
+    ) -> bool {
+        if self.playing_key().as_deref() != Some(key) {
+            return false;
+        }
+        let Some(device) = self.device(key) else { return false };
+        let kind = DeviceKind::from_model(&device.model);
+        if kind != DeviceKind::Hub || device.channel != channel {
+            return false;
+        }
+        let links = self.links.borrow();
+        let Some(l) = links.get(key) else { return false };
+        l.link.write_settings(SettingsTarget::Camera { channel, page }, kind, group, writes);
         true
     }
 
     /// One tab of an NVR's or Hub's own settings, on that device's link
     /// (whether or not it is the one being watched); `false` when the device
-    /// is not connected.
+    /// is not connected. Its reads go unnumbered (0): that window writes
+    /// nothing.
     fn read_device_page(&self, key: &str, page: DevicePage) -> bool {
         let Some(device) = self.device(key) else { return false };
         let links = self.links.borrow();
         let Some(l) = links.get(key) else { return false };
         let gates = SettingsGates::new(DeviceKind::from_model(&device.model), None, &device.username);
-        l.link.query_settings(SettingsTarget::Device { page }, gates);
+        l.link.query_settings(SettingsTarget::Device { page }, gates, 0);
         true
     }
 
@@ -1613,8 +1649,10 @@ impl MainWindow {
                 this.connected.borrow_mut().remove(&key);
                 this.channel_lists.borrow_mut().remove(&key);
                 // The old connection goes without a word; the Playback page
-                // waits for the new one.
+                // waits for the new one, the camera window gives up a save
+                // it had out on the old one.
                 this.playback.device_reconnecting(&key);
+                this.camera_settings.reconnecting(&key);
                 *this.autoplay.borrow_mut() = Some(key.clone());
                 this.connect(&key, true);
             },
@@ -1949,13 +1987,16 @@ impl MainWindow {
             }
             DeviceEvent::Playback(event) => self.playback.on_event(key, event),
             DeviceEvent::Download(event) => self.playback.on_download(key, event),
-            // The read-only settings pages: a camera tab goes to the camera
-            // window when it shows that channel of the watched device, a
-            // device tab to the device window when it shows this device.
-            DeviceEvent::Settings(page) => match page.target() {
-                SettingsTarget::Camera { channel, .. } => {
-                    if self.playing_key().as_deref() == Some(key) && self.camera_settings.is_open_for(channel) {
-                        self.camera_settings.set_page(&page);
+            // The settings pages: a camera tab goes to the camera window when
+            // it shows that channel of the watched device or, once closed,
+            // while that tab's save or re-read is under way (the read before a
+            // save, or the one after it, may come then; see `takes`) and the
+            // window is still that device's, a device tab to the device window
+            // when it shows this device.
+            DeviceEvent::Settings { page, read } => match page.target() {
+                target @ SettingsTarget::Camera { .. } => {
+                    if self.playing_key().as_deref() == Some(key) && self.camera_settings.takes(key, target) {
+                        self.camera_settings.set_page(&page, read);
                     }
                 }
                 SettingsTarget::Device { .. } => {
@@ -1964,9 +2005,19 @@ impl MainWindow {
                     }
                 }
             },
+            // A save goes on while the camera window is closed: its next
+            // group still goes out (the window drops the save when it is
+            // opened anew).
+            DeviceEvent::SettingsWritten { target, group, results } => {
+                if let SettingsTarget::Camera { channel, .. } = target {
+                    if self.playing_key().as_deref() == Some(key) && self.camera_settings.is_for(key, channel) {
+                        self.camera_settings.written(target, group, &results);
+                    }
+                }
+            }
             DeviceEvent::SettingsDeferred(target) => match target {
-                SettingsTarget::Camera { channel, .. } => {
-                    if self.playing_key().as_deref() == Some(key) && self.camera_settings.is_open_for(channel) {
+                SettingsTarget::Camera { .. } => {
+                    if self.playing_key().as_deref() == Some(key) && self.camera_settings.takes(key, target) {
                         self.camera_settings.page_deferred(&target);
                     }
                 }
@@ -2272,6 +2323,7 @@ impl MainWindow {
         if self.device_settings.is_open_for(key) {
             self.device_settings.lost("the device was removed");
         }
+        self.camera_settings.removed(key);
         self.links.borrow_mut().remove(key); // dropping the link disconnects
         self.connected.borrow_mut().remove(key);
         self.channel_lists.borrow_mut().remove(key);

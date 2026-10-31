@@ -1,9 +1,11 @@
-//! What the read-only settings tabs show. Each page a device answered is
-//! turned into plain groups of rows — a title with a text, a fill level, a
-//! weekly schedule — with the device's own words and numbers put into the
+//! What the settings tabs show. Each page a device answered is turned into
+//! plain groups of rows — a title with a text, a fill level, a weekly
+//! schedule, or, for the few settings Reoling can write, a control (see
+//! `settings_edit`) — with the device's own words and numbers put into the
 //! app's. Nothing here needs GTK, so every translation can be tested; the
 //! settings windows only render the groups.
 
+use crate::ui::settings_edit::{self, Control, EditView, Field};
 use reoling::protocol::bc::xml::VersionInfo;
 use reoling::{
     AccessUserList, AiCfg, AiDetectCfg, AutoReboot, CameraDetectionPage, CameraDisplayPage, CameraImagePage,
@@ -27,6 +29,9 @@ pub enum Value {
     Schedules(Vec<(String, ScheduleTable)>),
     /// A text with lines that unfold under it.
     Lines { text: String, lines: Vec<String> },
+    /// A setting the user may change; `enabled` is false while a save is out
+    /// or the row is locked.
+    Control { control: Control, enabled: bool },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +86,9 @@ pub struct Context<'a> {
     /// The local time now as civil seconds (Unix time plus the local UTC
     /// offset), for dates computed from a duration.
     pub local_now: Option<i64>,
+    /// The camera tab's writable rows and the user's unsaved edits; `None`
+    /// shows every row read-only.
+    pub edit: Option<EditView<'a>>,
 }
 
 pub const NOT_AVAILABLE: &str = "Not available on this device";
@@ -89,12 +97,18 @@ const DASH: &str = "—";
 
 /// Builds the tab for one page the device answered.
 pub fn build(page: &SettingsPage, ctx: &Context) -> Tab {
+    let editable = Editable {
+        controls: ctx.edit.as_ref().map_or_else(Vec::new, |view| {
+            let controls = settings_edit::controls(page, view).into_iter();
+            controls.map(|(f, c)| (f, c, view.enabled && !settings_edit::locked(page, f, view.edits))).collect()
+        }),
+    };
     match page {
         SettingsPage::CameraInfo { page, .. } => camera_info(page),
-        SettingsPage::CameraImage { page, .. } => camera_image(page, ctx.abilities),
-        SettingsPage::CameraDisplay { page, .. } => camera_display(page),
+        SettingsPage::CameraImage { page, .. } => camera_image(page, ctx.abilities, &editable),
+        SettingsPage::CameraDisplay { page, .. } => camera_display(page, &editable),
         SettingsPage::CameraDetection { page, .. } => camera_detection(page, ctx.abilities),
-        SettingsPage::CameraLightSound { page, .. } => camera_light_sound(page, ctx.abilities),
+        SettingsPage::CameraLightSound { page, .. } => camera_light_sound(page, ctx.abilities, &editable),
         SettingsPage::CameraSchedules { page, .. } => camera_schedules(page, ctx.abilities),
         SettingsPage::CameraNetwork { page, .. } => {
             let mut tab = Tab {
@@ -114,6 +128,31 @@ pub fn build(page: &SettingsPage, ctx: &Context) -> Tab {
         SettingsPage::DeviceAlerts(page) => device_alerts(page, ctx.channels),
         SettingsPage::DeviceUsers(page) => device_users(page, ctx.local_now),
         SettingsPage::DeviceMaintenance(page) => device_maintenance(page),
+    }
+}
+
+/// The controls of a tab's writable rows (none on a read-only tab), each
+/// with whether it takes a change now: not while a save is out, nor while
+/// the row is locked (see `settings_edit::locked`).
+#[derive(Default)]
+struct Editable {
+    controls: Vec<(Field, Control, bool)>,
+}
+
+impl Editable {
+    fn has(&self, field: Field) -> bool {
+        self.controls.iter().any(|(f, ..)| *f == field)
+    }
+
+    /// The row: the field's control when it has one, else the text.
+    fn row(&self, title: &str, field: Field, text: String) -> Row {
+        match self.controls.iter().find(|(f, ..)| *f == field) {
+            Some((_, control, enabled)) => Row {
+                title: title.to_string(),
+                value: Value::Control { control: control.clone(), enabled: *enabled },
+            },
+            None => Row::text(title, text),
+        }
     }
 }
 
@@ -613,11 +652,11 @@ fn camera_info(page: &CameraInfoPage) -> Tab {
     Tab { status: status(&[outcome(&page.version)]), groups: group_for("Camera", &page.version, version_rows).into_iter().collect() }
 }
 
-fn camera_image(page: &CameraImagePage, abilities: Option<ChannelAbilities>) -> Tab {
+fn camera_image(page: &CameraImagePage, abilities: Option<ChannelAbilities>, ed: &Editable) -> Tab {
     let mut tab = Tab { status: status(&[outcome(&page.video_input), outcome(&page.advanced), outcome(&page.threshold)]), groups: Vec::new() };
     tab.groups.extend(group_for("Picture", &page.video_input, |v| {
         let mut rows = vec![
-            Row::text("Brightness", num(v.bright)),
+            ed.row("Brightness", Field::Brightness, num(v.bright)),
             Row::text("Contrast", num(v.contrast)),
             Row::text("Saturation", num(v.saturation)),
             Row::text("Sharpness", num(v.sharpen)),
@@ -628,10 +667,10 @@ fn camera_image(page: &CameraImagePage, abilities: Option<ChannelAbilities>) -> 
         }
         rows
     }));
-    tab.groups.extend(group_for("Advanced", &page.advanced, |a| advanced_rows(a, abilities)));
+    tab.groups.extend(group_for("Advanced", &page.advanced, |a| advanced_rows(a, abilities, ed)));
     tab.groups.extend(group_for("Day and night", &page.advanced, |a| match &a.day_night {
         Some(dn) => vec![
-            Row::text("Mode", capitalised_opt(&dn.mode)),
+            ed.row("Mode", Field::DayNight, capitalised_opt(&dn.mode)),
             Row::text("IR cut", capitalised_opt(&dn.ircut_mode)),
             Row::text("Threshold", capitalised_opt(&dn.threshold)),
         ],
@@ -641,9 +680,9 @@ fn camera_image(page: &CameraImagePage, abilities: Option<ChannelAbilities>) -> 
     tab
 }
 
-fn advanced_rows(a: &InputAdvanceCfg, abilities: Option<ChannelAbilities>) -> Vec<Row> {
+fn advanced_rows(a: &InputAdvanceCfg, abilities: Option<ChannelAbilities>, ed: &Editable) -> Vec<Row> {
     let mut rows = vec![
-        Row::text("Flip", on_off(a.flip)),
+        ed.row("Flip", Field::Flip, on_off(a.flip)),
         Row::text("Mirror", on_off(a.mirror)),
         Row::text("Anti-flicker", a.power_line_frequency.as_ref().map_or_else(|| DASH.to_string(), anti_flicker)),
         Row::text("Colour day mode", a.bd_day_color.as_ref().map_or_else(|| DASH.to_string(), |m| capitalised_opt(&m.mode))),
@@ -679,11 +718,11 @@ fn threshold_rows(t: &DayNightThreshold) -> Vec<Row> {
     ]
 }
 
-fn camera_display(page: &CameraDisplayPage) -> Tab {
+fn camera_display(page: &CameraDisplayPage, ed: &Editable) -> Tab {
     let mut tab = Tab { status: status(&[outcome(&page.datetime), outcome(&page.name)]), groups: Vec::new() };
     tab.groups.extend(group_for("Date and time", &page.datetime, |d: &OsdDatetime| {
         vec![
-            Row::text("Shown", on_off(d.enable)),
+            ed.row("Shown", Field::DateShown, on_off(d.enable)),
             Row::text("Position", position_label(d.top_left_x, d.top_left_y)),
             Row::text("Language", text(&d.language)),
         ]
@@ -692,8 +731,8 @@ fn camera_display(page: &CameraDisplayPage) -> Tab {
         vec![
             Row::text("Name", text(&n.name)),
             Row::text("Shown", on_off(n.enable)),
-            Row::text("Position", position_label(n.top_left_x, n.top_left_y)),
-            Row::text("Watermark", on_off(n.watermark)),
+            ed.row("Position", Field::NamePosition, position_label(n.top_left_x, n.top_left_y)),
+            ed.row("Watermark", Field::Watermark, on_off(n.watermark)),
             Row::text("Background", on_off(n.background)),
         ]
     }));
@@ -778,7 +817,7 @@ fn motion_rows(md: &MotionDetect) -> Vec<Row> {
     rows
 }
 
-fn camera_light_sound(page: &CameraLightSoundPage, abilities: Option<ChannelAbilities>) -> Tab {
+fn camera_light_sound(page: &CameraLightSoundPage, abilities: Option<ChannelAbilities>, ed: &Editable) -> Tab {
     let pet = pet_label(abilities);
     let mut tab = Tab {
         status: status(&[
@@ -793,9 +832,9 @@ fn camera_light_sound(page: &CameraLightSoundPage, abilities: Option<ChannelAbil
     tab.groups.extend(group_for("Lights", &page.led, |led: &LedState| {
         let mut rows = Vec::new();
         if allows(abilities, |a| a.status_led) {
-            rows.push(Row::text("Status LED", led_state(&led.light_state)));
+            rows.push(ed.row("Status LED", Field::StatusLed, led_state(&led.light_state)));
         }
-        rows.push(Row::text("Infrared lights", led_state(&led.state)));
+        rows.push(ed.row("Infrared lights", Field::Infrared, led_state(&led.state)));
         if led.ir_led_brightness.unwrap_or(0) > 0 {
             rows.push(Row::text("IR brightness", num(led.ir_led_brightness)));
         }
@@ -822,19 +861,29 @@ fn camera_light_sound(page: &CameraLightSoundPage, abilities: Option<ChannelAbil
         ]
     }));
     let mut sound = Vec::new();
-    sound.extend(row_for("Volume", &page.audio, |a| num(a.volume)));
+    match &page.audio {
+        Ok(a) if ed.has(Field::Volume) => sound.push(ed.row("Volume", Field::Volume, num(a.volume))),
+        audio => sound.extend(row_for("Volume", audio, |a| num(a.volume))),
+    }
     // No ability in the support table says which cameras have audio noise
     // reduction, so every camera is asked: one without it refuses the read
     // and the row is left out; one with it shows the value it reports.
     if let Ok(d) = &page.denoise {
-        sound.push(Row::text(
-            "Noise reduction",
-            match d.enable {
-                Some(0) => "Off".to_string(),
-                Some(_) => format!("On, level {}", num(d.level)),
-                None => DASH.to_string(),
-            },
-        ));
+        if ed.has(Field::Denoise) && ed.has(Field::DenoiseLevel) {
+            // The level stays on show, locked, while noise reduction is off
+            // (see `settings_edit::locked`).
+            sound.push(ed.row("Noise reduction", Field::Denoise, on_off(d.enable)));
+            sound.push(ed.row("Noise reduction level", Field::DenoiseLevel, num(d.level)));
+        } else {
+            sound.push(Row::text(
+                "Noise reduction",
+                match d.enable {
+                    Some(0) => "Off".to_string(),
+                    Some(_) => format!("On, level {}", num(d.level)),
+                    None => DASH.to_string(),
+                },
+            ));
+        }
     }
     sound.extend(row_for("Record audio", &page.record_audio, |c| {
         on_off(c.main_stream.as_ref().and_then(|s| s.audio))
@@ -1521,6 +1570,7 @@ mod tests {
                 stat: Some("night".into()),
                 threshold_value: Some(MinMaxCur { min: Some(0), max: Some(100), cur: Some(50) }),
             }),
+            raw: Default::default(),
         };
         let no_binning = ChannelAbilities { binning: false, ..Default::default() };
         let tab = build(&SettingsPage::CameraImage { channel: 0, page: page.clone() }, &Context { abilities: Some(no_binning), ..Default::default() });
@@ -1669,6 +1719,7 @@ mod tests {
             audio: Ok(reoling::AudioCfg { channel_id: Some(0), volume: Some(80) }),
             denoise: Err(ReadFailure::Refused(400)),
             record_audio: Ok(reoling::CompressionAudio { channel_id: Some(0), main_stream: Some(reoling::StreamAudio { audio: Some(1) }) }),
+            raw: Default::default(),
         };
         let no_led = ChannelAbilities { status_led: false, ..Default::default() };
         let tab = build(&SettingsPage::CameraLightSound { channel: 0, page: page.clone() }, &Context { abilities: Some(no_led), ..Default::default() });
@@ -1950,6 +2001,77 @@ mod tests {
             tab.groups[2].rows,
             vec![Row::text("Lock after failed logins", "On"), Row::text("Rule", "after 5 failed attempts, for 60 s")]
         );
+    }
+
+    #[test]
+    fn a_hubs_writable_rows_become_controls() {
+        use crate::ui::settings_edit::{Edit, Edits, WriteGate};
+        use reoling::protocol::bc::settings_write::CapturedCamera;
+        use reoling::{DeviceKind, RawBody, RawReplies};
+        const LED_READ: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<LedState version=\"1.1\">\n<channelId>1</channelId>\n<ledVersion>0</ledVersion>\n<IRLedBrightness>0</IRLedBrightness>\n<state>auto</state>\n<lightState>open</lightState>\n<doorbellLightState>close</doorbellLightState>\n</LedState>\n</body>\n";
+        const AUDIO_READ: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<audioCfg version=\"1.1\">\n<channelId>1</channelId>\n<timeout>0</timeout>\n<audioSelect>0</audioSelect>\n<volume>92</volume>\n<preAlarm>0</preAlarm>\n<audioListId>0</audioListId>\n<visitorLoudspeaker>0</visitorLoudspeaker>\n</audioCfg>\n</body>\n";
+        let page = SettingsPage::CameraLightSound {
+            channel: 1,
+            page: CameraLightSoundPage {
+                led: Ok(LedState {
+                    channel_id: Some(1),
+                    led_version: Some(0),
+                    ir_led_brightness: Some(0),
+                    state: Some("auto".into()),
+                    light_state: Some("open".into()),
+                    doorbell_light_state: Some("close".into()),
+                }),
+                spotlight: Err(ReadFailure::NotSent),
+                audio: Ok(reoling::AudioCfg { channel_id: Some(1), volume: Some(92) }),
+                denoise: Ok(reoling::AiDenoise { channel_id: Some(1), enable: Some(1), level: Some(4) }),
+                record_audio: Err(ReadFailure::NoReply),
+                raw: RawReplies::new(vec![(208, RawBody::new(LED_READ)), (264, RawBody::new(AUDIO_READ))]),
+            },
+        };
+        let edits = Edits::default();
+        let hub = WriteGate { kind: DeviceKind::Hub, abilities: None, camera: Some(CapturedCamera::E1OutdoorPoe) };
+        let view = EditView { gate: hub, edits: &edits, enabled: true };
+        let tab = build(&page, &Context { edit: Some(view), ..Default::default() });
+        let controls = |tab: &Tab| -> Vec<(String, bool)> {
+            tab.groups
+                .iter()
+                .flat_map(|g| g.rows.iter())
+                .filter_map(|r| match &r.value {
+                    Value::Control { enabled, .. } => Some((r.title.clone(), *enabled)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let names = |list: Vec<(String, bool)>| list.into_iter().map(|(t, _)| t).collect::<Vec<_>>();
+        assert_eq!(names(controls(&tab)), ["Status LED", "Infrared lights", "Volume"]);
+        // Noise reduction has no reply to build from here: the text row.
+        assert!(tab.groups[1].rows.contains(&Row::text("Noise reduction", "On, level 4")));
+        // While a save is out the controls are drawn switched off.
+        let busy = EditView { gate: hub, edits: &edits, enabled: false };
+        let tab = build(&page, &Context { edit: Some(busy), ..Default::default() });
+        assert!(controls(&tab).iter().all(|(_, enabled)| !enabled));
+        // An NVR's camera, or no edit view at all: every row is text.
+        let nvr = EditView { gate: WriteGate { kind: DeviceKind::Nvr, ..hub }, edits: &edits, enabled: true };
+        assert!(controls(&build(&page, &Context { edit: Some(nvr), ..Default::default() })).is_empty());
+        let tab = build(&page, &Context::default());
+        assert!(controls(&tab).is_empty());
+        assert_eq!(tab.groups[0].rows[0], Row::text("Status LED", "On"));
+        // Noise reduction on the camera its write was captured on: the switch
+        // and the level, which is locked while noise reduction is off.
+        const DENOISE_READ: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<aiDenoise Version=\"1.1\">\n<channelId>1</channelId>\n<enable>1</enable>\n<level>4</level>\n</aiDenoise>\n</body>\n";
+        let SettingsPage::CameraLightSound { channel, page: mut light } = page.clone() else { unreachable!() };
+        light.raw = RawReplies::new(vec![(439, RawBody::new(DENOISE_READ))]);
+        let denoise = SettingsPage::CameraLightSound { channel, page: light };
+        let rlc = WriteGate { camera: Some(CapturedCamera::Rlc1224a), ..hub };
+        let drawn = |edits: &Edits| {
+            let view = EditView { gate: rlc, edits, enabled: true };
+            controls(&build(&denoise, &Context { edit: Some(view), ..Default::default() }))
+        };
+        let row = |title: &str, enabled: bool| (title.to_string(), enabled);
+        assert_eq!(drawn(&edits), [row("Noise reduction", true), row("Noise reduction level", true)]);
+        let mut off = Edits::default();
+        off.set(Edit::Denoise(false), &denoise);
+        assert_eq!(drawn(&off), [row("Noise reduction", true), row("Noise reduction level", false)]);
     }
 
     #[test]

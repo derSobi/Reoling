@@ -270,7 +270,7 @@ impl DeviceSettings {
         let Some(view) = self.view(which) else { return };
         let channels = self.channels.borrow();
         let uid_hint = self.uid_hint.borrow().clone();
-        let ctx = Context { abilities: None, channels: &channels, uid_hint, local_now: local_now() };
+        let ctx = Context { abilities: None, channels: &channels, uid_hint, local_now: local_now(), edit: None };
         view.show(&settings_pages::build(page, &ctx));
     }
 
