@@ -109,6 +109,141 @@ fn scroll_anchor(at_event: Option<(f64, f64)>, last_motion: Option<(f64, f64)>) 
     at_event.or(last_motion)
 }
 
+/// The pointer's position on a Wayland surface, asked of the compositor. GDK
+/// answers a position query from the last pointer event, and none follows when
+/// the surface moves under a still pointer: fullscreen entered or left by
+/// double-click, a window maximized or moved without the pointer. A second
+/// `wl_pointer` on GDK's own connection is sent an `enter` at once, which on
+/// GNOME Shell 50.1 carries the pointer's current position (measured); what
+/// other compositors put there is not measured. The pointer is released as soon
+/// as the `enter` has arrived, on a queue of its own, so GDK never sees its
+/// events.
+mod wayland {
+    use gtk4::{gdk, glib::translate::ToGlibPtr, prelude::*};
+    use std::ffi::{c_int, c_void};
+    use std::ptr;
+
+    #[repr(C)]
+    struct Interface {
+        _opaque: [u8; 0],
+    }
+
+    /// libwayland's `union wl_argument`, as far as `enter` needs it.
+    #[repr(C)]
+    union Argument {
+        fixed: i32,
+        object: *mut c_void,
+    }
+
+    type Dispatcher = unsafe extern "C" fn(*const c_void, *mut c_void, u32, *const c_void, *mut Argument) -> c_int;
+
+    #[link(name = "wayland-client")]
+    extern "C" {
+        static wl_pointer_interface: Interface;
+        fn wl_display_create_queue(display: *mut c_void) -> *mut c_void;
+        fn wl_event_queue_destroy(queue: *mut c_void);
+        fn wl_display_roundtrip_queue(display: *mut c_void, queue: *mut c_void) -> c_int;
+        fn wl_proxy_create_wrapper(proxy: *mut c_void) -> *mut c_void;
+        fn wl_proxy_wrapper_destroy(wrapper: *mut c_void);
+        fn wl_proxy_set_queue(proxy: *mut c_void, queue: *mut c_void);
+        fn wl_proxy_get_version(proxy: *mut c_void) -> u32;
+        fn wl_proxy_get_user_data(proxy: *mut c_void) -> *mut c_void;
+        fn wl_proxy_add_dispatcher(proxy: *mut c_void, dispatcher: Dispatcher, implementation: *const c_void,
+            data: *mut c_void) -> c_int;
+        fn wl_proxy_marshal_flags(proxy: *mut c_void, opcode: u32, interface: *const Interface, version: u32,
+            flags: u32, ...) -> *mut c_void;
+    }
+
+    // GTK's Wayland backend, part of the GTK library.
+    extern "C" {
+        fn gdk_wayland_display_get_wl_display(display: *mut gdk::ffi::GdkDisplay) -> *mut c_void;
+        fn gdk_wayland_seat_get_wl_seat(seat: *mut gdk::ffi::GdkSeat) -> *mut c_void;
+        fn gdk_wayland_surface_get_wl_surface(surface: *mut gdk::ffi::GdkSurface) -> *mut c_void;
+    }
+
+    const SEAT_GET_POINTER: u32 = 0;
+    const POINTER_ENTER: u32 = 0;
+    const POINTER_RELEASE: u32 = 1;
+    const POINTER_RELEASE_SINCE: u32 = 3;
+    const MARSHAL_FLAG_DESTROY: u32 = 1;
+
+    struct Enter {
+        surface: *mut c_void,
+        x: f64,
+        y: f64,
+    }
+
+    /// Notes the pointer's `enter(serial, surface, x, y)`; every other event
+    /// is ignored, including those of protocol versions newer than this code.
+    unsafe extern "C" fn dispatch(
+        _: *const c_void,
+        proxy: *mut c_void,
+        opcode: u32,
+        _: *const c_void,
+        args: *mut Argument,
+    ) -> c_int {
+        if opcode == POINTER_ENTER {
+            let enter = &mut *wl_proxy_get_user_data(proxy).cast::<Enter>();
+            enter.surface = (*args.add(1)).object;
+            enter.x = f64::from((*args.add(2)).fixed) / 256.0;
+            enter.y = f64::from((*args.add(3)).fixed) / 256.0;
+        }
+        0
+    }
+
+    /// The pointer's position on `surface` in its coordinates, or None: not on
+    /// Wayland, no pointer on `seat` (asking for one would be a protocol
+    /// error), the pointer over another surface or none of this client's.
+    pub(super) fn pointer_position(surface: &gdk::Surface, seat: &gdk::Seat) -> Option<(f64, f64)> {
+        if surface.display().type_().name() != "GdkWaylandDisplay"
+            || !seat.capabilities().contains(gdk::SeatCapabilities::POINTER)
+        {
+            return None;
+        }
+        // SAFETY: the objects are GDK's own, alive for the duration of this
+        // call; the new pointer and its queue are this function's alone, and
+        // `enter` outlives the pointer, which is destroyed before returning.
+        unsafe {
+            let display = gdk_wayland_display_get_wl_display(surface.display().to_glib_none().0);
+            let wl_seat = gdk_wayland_seat_get_wl_seat(seat.to_glib_none().0);
+            let wl_surface = gdk_wayland_surface_get_wl_surface(surface.to_glib_none().0);
+            if display.is_null() || wl_seat.is_null() || wl_surface.is_null() {
+                return None;
+            }
+            let version = wl_proxy_get_version(wl_seat);
+            if version < POINTER_RELEASE_SINCE {
+                return None;
+            }
+            let queue = wl_display_create_queue(display);
+            if queue.is_null() {
+                return None;
+            }
+            let mut enter = Enter { surface: ptr::null_mut(), x: 0.0, y: 0.0 };
+            let wrapper = wl_proxy_create_wrapper(wl_seat);
+            if !wrapper.is_null() {
+                wl_proxy_set_queue(wrapper, queue);
+                let pointer = wl_proxy_marshal_flags(
+                    wrapper,
+                    SEAT_GET_POINTER,
+                    &wl_pointer_interface,
+                    version,
+                    0,
+                    ptr::null_mut::<c_void>(),
+                );
+                wl_proxy_wrapper_destroy(wrapper);
+                if !pointer.is_null() {
+                    if wl_proxy_add_dispatcher(pointer, dispatch, ptr::null(), ptr::addr_of_mut!(enter).cast()) == 0 {
+                        wl_display_roundtrip_queue(display, queue);
+                    }
+                    wl_proxy_marshal_flags(pointer, POINTER_RELEASE, ptr::null(), version, MARSHAL_FLAG_DESTROY);
+                }
+            }
+            wl_event_queue_destroy(queue);
+            (enter.surface == wl_surface).then_some((enter.x, enter.y))
+        }
+    }
+}
+
 /// The cursor over the viewport: a closed hand while panning, an open one
 /// over a zoomed picture.
 fn cursor_name(dragging: bool, zoomed: bool, over_picture: bool) -> Option<&'static str> {
@@ -424,20 +559,26 @@ impl ZoomPicture {
 
     /// Where the pointer is for the event `controller` is handling, in this
     /// widget's coordinates. A GTK 4 scroll event carries no position of its
-    /// own, so the seat's pointer is asked where it is now: the live position
-    /// on X11, that of the last pointer event on Wayland. Both are relative
-    /// to the surface, which can extend beyond the native widget (client-side
-    /// decorations).
+    /// own, so the pointer is asked where it is now: the live position on X11,
+    /// on Wayland the compositor's answer (`wayland::pointer_position`), else
+    /// that of the last pointer event. All are relative to the surface, which
+    /// can extend beyond the native widget (client-side decorations).
     fn pointer_position(&self, controller: &impl IsA<gtk4::EventController>) -> Option<(f64, f64)> {
         let event = controller.as_ref().current_event()?;
         let native = self.native()?;
         let (x, y) = match event.position() {
             Some(position) => position,
             None => {
-                // The seat's logical pointer: X11 refuses a position query
-                // for the physical device an event can name.
-                let (x, y, _) = native.surface()?.device_position(&event.seat()?.pointer()?)?;
-                (x, y)
+                let (surface, seat) = (native.surface()?, event.seat()?);
+                match wayland::pointer_position(&surface, &seat) {
+                    Some(position) => position,
+                    None => {
+                        // The seat's logical pointer: X11 refuses a position
+                        // query for the physical device an event can name.
+                        let (x, y, _) = surface.device_position(&seat.pointer()?)?;
+                        (x, y)
+                    }
+                }
             }
         };
         let (dx, dy) = native.surface_transform();
