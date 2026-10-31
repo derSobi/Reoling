@@ -40,9 +40,12 @@ answers first.
   each channel offers (main / extern / sub) are read from the device.
 - Live view: click a device or one of its channels; the lightest stream is
   the default; Stop freezes the picture and becomes Play; the last stream
-  restarts on the next start; fullscreen with a control bar that slides in;
-  a latency setting (Low / Balanced / Smooth) trades reaction time for
-  smoothness over a poor connection.
+  restarts on the next start; fullscreen with a control bar that slides in
+  on entering it and whenever the pointer moves, and out again after 2.5 s
+  without movement (it stays while the pointer is on it and while its
+  volume slider or stream list is open); a latency setting
+  (Low / Balanced / Smooth) trades reaction time for smoothness over a
+  poor connection.
 - Digital video zoom in live view and playback: scroll up over the picture
   to zoom in at the pointer, and down to zoom out, up to 16×. Left-click and
   drag to pan while zoomed in; middle-click restores the whole picture.
@@ -100,24 +103,56 @@ answers first.
   Clear (main) and Fluent (sub) can be changed: resolution, frame rate,
   bitrate and I-frame interval, offered only as the camera itself allows;
   the live picture restarts with the new settings. Balanced (extern) is
-  shown as it is. Beside Encoding, read-only tabs show what else the
+  shown as it is. Beside Encoding, further tabs show what else the
   camera tells about itself, with the values as the camera reports them:
-  Info (model, firmware, UID), Image (brightness, contrast, saturation,
+  Info (model and firmware), Image (brightness, contrast, saturation,
   sharpness, hue, corridor mode, day and night switching, the advanced
   picture settings), Display (date, time and camera name on the picture,
   the watermark), Detection (motion sensitivity and alarm delay, smart
   detection types and object sizes, auto tracking), Light & sound
-  (status LED, infrared lights, the spotlight and its schedule, siren
+  (status LED, infrared lights, the spotlight with its schedule and
   triggers, sound), Schedules (the weekly recording, email, push, FTP
-  and siren schedules, drawn as grids) and Network (address mode, IP,
-  mask, gateway, MAC, DNS). Rows a model does not have — binning, auto
-  tracking, a status LED, "Pet" instead of "Animal" — are left out, as
-  the camera's own ability table says. Reload reads a tab again; the
-  tabs are read while the camera's live video runs (press Play first if
-  it is stopped) and wait while a download holds the connection. Product
-  pictures come from Reolink's own site and are cached; until one loads,
-  or for a model without one, a drawing of the device kind (camera, NVR,
-  Home Hub) stands in.
+  and siren schedules, drawn as grids) and, except on an NVR's cameras,
+  Network (address mode, IP, mask, gateway, MAC, DNS). Rows a model does
+  not have — binning, auto tracking, a status LED, "Pet" instead of
+  "Animal" — are left out, as the camera's own ability table says. On a
+  Home Hub's cameras a few rows can be changed, each written with the
+  message body the official Reolink app was captured sending; a row is
+  offered only on the camera model its write was captured on, and only
+  while the camera's reply has the captured shape and the row's current
+  value is one of those offered. On an E1 Outdoor PoE these are, on
+  Display, the date shown or hidden, the watermark and the camera name's
+  position (top left or bottom right, offered when the date sits at
+  neither); on Image, brightness (0 to 255), flip and the day and night
+  mode (Auto or Black & white); on Light & sound, the status LED, the
+  infrared lights (Auto or Off) and the volume (0 to 100). On an
+  RLC-1224A it is noise reduction on Light & sound, with its level
+  (1 to 5, locked while noise reduction is off). Each of these rows was
+  confirmed working against a Home Hub Pro. Such a tab has Save and
+  Revert. Save reads the tab again first and builds its writes from that
+  read: the edited values change, every other value the read returned
+  goes back as it was, so another value changed elsewhere in the
+  meantime is kept; the parts no read returns go out as the official app
+  sends them (on Display, the flow-data overlay switched off). When
+  that read already has one of the edited values, finds a row that can
+  no longer be changed, or gets no answer, nothing is written and the
+  footer says so. The writes go one after the other, each once the one
+  before was answered 200 (an Image change is followed at once by the day
+  and night threshold, sent back unchanged as the official app does; the
+  change counts as saved once its own write is answered 200); a refusal,
+  or no answer within 10 s, stops the rest, and the changes not saved
+  stay for another Save. The tab is then read again, and the footer names
+  a saved value the camera did not keep or that could not be read back.
+  Revert drops the changes not saved yet, and so do Reload and the window
+  opening anew (the gear button pressed again, another camera or channel,
+  Play after Stop). Every other row outside Encoding stays read-only, and
+  on an NVR's cameras or a camera added on its own only Encoding can be
+  changed. Reload reads a tab again; the tabs are read and saved while
+  the camera's live video runs (press Play first if it is stopped) and
+  wait while a download holds the connection. Product pictures come from
+  Reolink's own site and are cached; until one loads, or for a model
+  without one, a drawing of the device kind (camera, NVR, Home Hub)
+  stands in.
 - Device settings ("Device settings…" in the card menu of a connected Home
   Hub or NVR): the device's own window, read-only, one tab each. Info
   (model, firmware, UID), Storage (each drive's size and fill level, what
@@ -147,12 +182,16 @@ answers first.
 
 **Not done yet**
 
-- Changing the settings on the new pages: only Encoding is editable; the
-  camera and device pages are read-only.
+- Changing the other settings on the new pages: beyond Encoding and the
+  few camera rows above, the camera and device pages are read-only. A
+  Save of several rows that share one write (two Display rows, say) sends
+  them in one message, which the capture does not show: the official app
+  was captured changing one value per write.
 - Playback of several cameras at once (one camera per page today), and
   thumbnails: the device list and the recordings show names and times,
   no pictures.
-- Split View, zoom on cameras behind an NVR's sub-channel numbering.
+- Split View, and the camera's own zoom (Camera control) on cameras
+  behind an NVR's sub-channel numbering.
 - Playback: one download at a time per device, and the device's playback
   and live video wait while it runs; no download of several cameras or of
   a whole day at once.
@@ -221,7 +260,8 @@ src/
 │                and the reliable BCUDP connection.
 ├── client.rs    Client/session API: login and live video;
 │                `client/replay.rs`: recordings, events, playback and
-│                downloads; `client/settings.rs`: the settings pages.
+│                downloads; `client/settings.rs`: the settings pages
+│                and their writes.
 ├── talk.rs      ADPCM encoding for Talk.
 ├── ui/          GTK4 + GStreamer desktop app (main window, sidebar,
 │                dialogs, settings, playback, downloads, video and audio).
@@ -348,7 +388,10 @@ APPIMAGE_TOOLS=~/appimage-tools scripts/build-appimage.sh target/release/reoling
 Requires:
 
 - Rust (edition 2021, `rust-version` 1.75+ — see `Cargo.toml`)
-- GTK4 (`>= 4.6`, Ubuntu 22.04's baseline) and its development headers
+- GTK4 (`>= 4.6`, Ubuntu 22.04's baseline) with its Wayland backend, and
+  its development headers
+- `libwayland-client` 1.20 or newer and its development headers
+  (`libwayland-dev`, which `libgtk-4-dev` pulls in)
 - GStreamer, including `gstreamer-app`, the GTK4 paintable sink
   (`gstreamer1.0-gtk4`, or `scripts/build-gst-gtk4-plugin.sh` where the
   distribution has none) and a decoder plugin (`gstreamer1.0-libav` for
