@@ -2,7 +2,7 @@
 name = "reoling"
 version = "1.0.2"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 license = "AGPL-3.0-or-later"
 description = "Unofficial Linux client for Reolink cameras, NVRs and Home Hubs (Baichuan P2P)"
 repository = "https://github.com/derSobi/Reoling"

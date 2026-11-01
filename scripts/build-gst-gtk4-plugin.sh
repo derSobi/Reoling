@@ -8,7 +8,7 @@
 #
 # writes <output directory>/libgstgtk4.so. Needs the GTK 4 and GStreamer
 # development packages (libgtk-4-dev, libgstreamer1.0-dev,
-# libgstreamer-plugins-base1.0-dev) and a Rust toolchain.
+# libgstreamer-plugins-base1.0-dev) and Rust 1.92 or newer.
 #
 # Environment:
 #   GST_GTK4_VERSION   crate version (default below; pinned with its SHA-256)

@@ -224,7 +224,7 @@ The workflow installs the .deb and starts both packages (`--version`, then
 20 s on a virtual display) on Ubuntu 24.04, the AppImage there on either
 GTK, and the AppImage again in Ubuntu 26.04 and 24.04 containers
 (`scripts/smoke-appimage-in-docker.sh`) before it uploads them. To build
-them yourself — the sink build needs a current stable Rust, and
+them yourself — the sink build needs Rust 1.92 or newer, and
 `scripts/validate-in-docker.sh --host <output directory>` rehearses the
 whole release in an `ubuntu:24.04` container and runs the container tests:
 
@@ -245,10 +245,11 @@ Requires:
 - `libwayland-client` 1.20 or newer and its development headers
   (`libwayland-dev`, which `libgtk-4-dev` pulls in)
 - GStreamer, including `gstreamer-app`, the GTK4 paintable sink
-  (`gstreamer1.0-gtk4`, or `scripts/build-gst-gtk4-plugin.sh` where the
-  distribution has none) and a decoder plugin (`gstreamer1.0-libav` for
-  software decoding; the nvcodec and va plugins from
-  `gstreamer1.0-plugins-bad` for NVIDIA and VA-API hardware decoding)
+  (`gstreamer1.0-gtk4`, or `scripts/build-gst-gtk4-plugin.sh`, which needs
+  Rust 1.92 or newer, where the distribution has none) and a decoder
+  plugin (`gstreamer1.0-libav` for software decoding; the nvcodec and va
+  plugins from `gstreamer1.0-plugins-bad` for NVIDIA and VA-API hardware
+  decoding)
 
 ```bash
 cargo build --release
