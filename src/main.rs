@@ -12,6 +12,9 @@ fn main() {
         return;
     }
 
+    // First: GStreamer would name the program after the executable, and GTK
+    // reads the name when it opens the display (see `set_program_name`).
+    ui::icon::set_program_name();
     gstreamer::init().expect("failed to initialize GStreamer");
     scan_private_plugins();
 

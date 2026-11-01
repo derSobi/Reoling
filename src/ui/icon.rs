@@ -16,8 +16,29 @@ use gtk4::gio::{self, prelude::*};
 use md5::{Digest, Md5};
 
 /// The icon name shipped in `data/icons/hicolor/*/apps/`; also the
-/// application id, so desktop environments match the window to the icon.
+/// application id and the program name (see [`set_program_name`]), so
+/// desktop environments match the window to the icon.
 pub const ICON_NAME: &str = "de.dersobi.reoling";
+
+/// Makes the program name the application id. On X11 GTK writes the
+/// program name as both parts of every window's `WM_CLASS`, by which a dock
+/// or panel finds the window's desktop entry (its file name and its
+/// `StartupWMClass` are the application id): the entry's icon and one group
+/// with the launcher. GLib would otherwise take the executable's name,
+/// `reoling`. Wayland's app id is the application id for the main window
+/// either way; a window of no application (Camera control, the settings
+/// windows, the dialogs) gets the program name there as well.
+///
+/// Call first in `main`: GTK reads the name when it opens the display, and
+/// GStreamer's option parsing sets it to the executable's name if nothing
+/// has by then.
+pub fn set_program_name() {
+    glib::set_prgname(Some(ICON_NAME));
+    // The application name falls back to the program name. The sound server
+    // knows the audio stream by it and keeps its volume under that name: it
+    // stays what it was.
+    glib::set_application_name("reoling");
+}
 
 /// Makes the app icon available and sets it as every window's icon. Call
 /// once the display exists (from the application's `startup` handler).
@@ -1111,5 +1132,54 @@ mod tests {
         fs::write(&entry, appimage).unwrap();
         assert!(retire_generated_desktop_entry(&dir).unwrap());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What a window's `WM_CLASS` is matched against: the desktop entry's
+    /// file name and its `StartupWMClass`, both the program name.
+    #[test]
+    fn desktop_entry_names_the_program() {
+        assert_eq!(DESKTOP_FILE.strip_suffix(".desktop"), Some(ICON_NAME));
+        let keyfile = glib::KeyFile::new();
+        keyfile.load_from_data(BUNDLED_ENTRY, glib::KeyFileFlags::NONE).unwrap();
+        assert_eq!(keyfile.string("Desktop Entry", "StartupWMClass").unwrap(), ICON_NAME);
+    }
+
+    /// Needs a display, an X11 one for the check that matters (`GDK_BACKEND=x11`,
+    /// e.g. under `xvfb-run`), and `xprop`: a window opened once the program
+    /// name is set has the application id as both parts of its `WM_CLASS`.
+    /// `gtk4::test`: on the one thread every GTK test shares, which opened the
+    /// display before this runs. So this checks the windows only; that `main`
+    /// sets the name before the display opens (the X11 leader window takes it
+    /// then) is for a run of the app to show.
+    #[gtk4::test]
+    #[ignore = "opens a window on the display; run explicitly"]
+    fn x11_window_class_is_the_application_id() {
+        use gtk4::prelude::{GtkWindowExt, WidgetExt};
+        set_program_name();
+        assert_eq!(glib::prgname().as_deref(), Some(ICON_NAME));
+        assert_eq!(glib::application_name().as_deref(), Some("reoling"));
+        let backend = Display::default().expect("a display").type_().name();
+        if backend != "GdkX11Display" {
+            eprintln!("WM_CLASS is X11's; not checked on {backend}");
+            return;
+        }
+        let title = "Reoling WM_CLASS check";
+        let window = gtk4::Window::builder().title(title).default_width(120).default_height(80).build();
+        window.present();
+        let ctx = glib::MainContext::default();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while !window.is_mapped() && std::time::Instant::now() < until {
+            while ctx.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(window.is_mapped(), "the window is not mapped after 5 s");
+        let out = std::process::Command::new("xprop").args(["-name", title, "WM_CLASS"]).output();
+        window.destroy();
+        let out = out.expect("xprop (x11-utils) runs");
+        assert!(out.status.success(), "xprop: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            format!("WM_CLASS(STRING) = \"{ICON_NAME}\", \"{ICON_NAME}\"")
+        );
     }
 }
