@@ -2044,10 +2044,10 @@ impl MainWindow {
             DeviceEvent::Download(event) => self.playback.on_download(key, event),
             // The settings pages: a camera tab goes to the camera window when
             // it shows that channel of the watched device or, once closed,
-            // while that tab's save or re-read is under way (the read before a
-            // save, or the one after it, may come then; see `takes`) and the
-            // window is still that device's, a device tab to the device window
-            // when it shows this device.
+            // while that tab's save or re-read is under way (the read a save
+            // makes before each row's write, or the one after a save, may come
+            // then; see `takes`) and the window is still that device's, a
+            // device tab to the device window when it shows this device.
             DeviceEvent::Settings { page, read } => match page.target() {
                 target @ SettingsTarget::Camera { .. } => {
                     if self.playing_key().as_deref() == Some(key) && self.camera_settings.takes(key, target) {
@@ -2060,11 +2060,14 @@ impl MainWindow {
                     }
                 }
             },
-            // A save goes on while the camera window is closed: its next
-            // group still goes out while the live video plays (the window
-            // drops the save when it is opened anew). Stop, the Playback page
-            // and a lost connection give it up (see `stop`, `suspend_live`
-            // and `lost_playing`): its answers would no longer come here.
+            // A save goes on while the camera window is closed: after a row's
+            // 200, the read for the next row and that row's write still go
+            // out while the live video plays that channel (the window drops
+            // the save when it is opened anew; on another channel of the
+            // device the read goes out but not the write, see
+            // `write_camera_page`). Stop, the Playback page and a lost
+            // connection give it up (see `stop`, `suspend_live` and
+            // `lost_playing`): its answers would no longer come here.
             DeviceEvent::SettingsWritten { target, group, results } => {
                 if let SettingsTarget::Camera { channel, .. } = target {
                     if self.playing_key().as_deref() == Some(key) && self.camera_settings.is_for(key, channel) {

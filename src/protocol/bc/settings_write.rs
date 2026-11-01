@@ -27,9 +27,11 @@
 //! volume, and noise reduction on/off with its level (a new level only with
 //! noise reduction on).
 //!
-//! Not covered by the capture: a body with several fields of one root
-//! changed at once (one Save of two rows of a tab). The official app wrote
-//! one field per write.
+//! The official app was captured changing one field per write, and the
+//! camera window's Save does the same: one edited row per write, each built
+//! from a read made after the write before was answered. The builders take
+//! several changes of one root at once; a body built so was never captured,
+//! and the window never asks for one.
 //!
 //! Each body ends in a newline after `</body>`, which gives it the length
 //! the capture lists for the official app's (the text plus one byte); the
