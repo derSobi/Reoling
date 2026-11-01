@@ -77,6 +77,10 @@ depends = "$auto, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreame
 # nvcodec decoders) or a VA-API driver; the device passwords live in the
 # desktop keyring (org.freedesktop.secrets).
 recommends = "va-driver-all | mesa-va-drivers | intel-media-va-driver, gnome-keyring | kwalletmanager"
+# The documents keep their places in the repository under /usr/share/doc/reoling,
+# so that the links between README.md, CHANGELOG.md and docs/FEATURES.md work in
+# the installed copy; for that CHANGELOG.md also keeps its name, where lintian
+# would like changelog.gz.
 assets = [
     ["target/release/reoling", "usr/bin/", "755"],
     ["target/gst-gtk4/libgstgtk4.so", "usr/lib/reoling/gstreamer-1.0/", "644"],
@@ -91,6 +95,7 @@ assets = [
     ["data/icons/hicolor/256x256/apps/de.dersobi.reoling.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
     ["data/icons/hicolor/512x512/apps/de.dersobi.reoling.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
     ["README.md", "usr/share/doc/reoling/", "644"],
+    ["docs/FEATURES.md", "usr/share/doc/reoling/docs/", "644"],
     ["CHANGELOG.md", "usr/share/doc/reoling/", "644"],
     ["LICENSE", "usr/share/doc/reoling/", "644"],
 ]
