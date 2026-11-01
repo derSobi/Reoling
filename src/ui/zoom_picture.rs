@@ -469,10 +469,32 @@ impl ZoomPicture {
     /// over the whole widget (false), as
     /// `gtk4::Picture::set_keep_aspect_ratio`. A pan under way ends.
     pub fn set_keep_aspect_ratio(&self, keep: bool) {
+        let changed = self.imp().picture.is_keep_aspect_ratio() != keep;
         self.end_pan();
         self.imp().picture.set_keep_aspect_ratio(keep);
         self.update_cursor();
         self.queue_draw();
+        // The inner picture only redraws; what is placed by `picture_bounds`
+        // (the fullscreen controls) is laid out again when it changes, not on
+        // every other setting saved with it.
+        if changed {
+            self.queue_resize();
+        }
+    }
+
+    /// Where the picture shows in this widget, in whole pixels: letterboxed
+    /// or stretched as `set_keep_aspect_ratio` says, and the same zoomed or
+    /// not (zoom crops inside it). None without a picture, before its first
+    /// frame (a new stream's size is not known yet) or without a size.
+    pub fn picture_bounds(&self) -> Option<gdk::Rectangle> {
+        let aspect = self.paintable()?.intrinsic_aspect_ratio();
+        if !(aspect.is_finite() && aspect > 0.0) {
+            return None;
+        }
+        let rect = self.picture_rect()?;
+        let finite = [rect.x, rect.y, rect.width, rect.height].iter().all(|v| v.is_finite());
+        (finite && rect.width >= 1.0 && rect.height >= 1.0)
+            .then(|| gdk::Rectangle::new(rect.x as i32, rect.y as i32, rect.width as i32, rect.height as i32))
     }
 
     /// While zoomed the paintable is drawn by this widget, not by the inner
@@ -660,9 +682,15 @@ mod tests {
         assert_eq!(original[(10 * 400 + 100) * 4 + 3], 0, "letterbox is empty");
         assert_eq!(original[(100 * 400 + 100) * 4 + 3], 255, "picture is drawn");
 
+        // The picture's place, as the fullscreen controls take it: the same
+        // zoomed or not (checked right below).
+        let bounds = Some(gdk::Rectangle::new(0, 50, 400, 200));
+        assert_eq!(picture.picture_bounds(), bounds);
+
         // Exercise the viewport operations and rendered pixels directly.
         // Mouse event routing and fullscreen gestures need a manual check.
         assert!(picture.scroll_at(-3.0, 100.0, 100.0));
+        assert_eq!(picture.picture_bounds(), bounds, "zoom crops inside the picture");
         let zoomed = render();
         assert_ne!(original, zoomed);
         let anchor = (100 * 400 + 100) * 4;

@@ -10,6 +10,7 @@ use crate::ui::settings_pages;
 use crate::ui::playback_page::{self, PlaybackPage, Readiness};
 use crate::ui::sidebar::{Handlers, Sidebar, Status};
 use crate::ui::video_view::VideoView;
+use crate::ui::zoom_picture::ZoomPicture;
 use crate::ui::audio::{AudioOutput, Microphone};
 use crate::ui::remote::{self, RemoteControl};
 use crate::ui::camera_settings::{self, CameraSettings};
@@ -304,12 +305,13 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         overlay.add_overlay(&notice);
 
         // In fullscreen the controls slide in over the bottom of the video
-        // whenever the pointer moves.
+        // whenever the pointer moves, under the picture and as wide as it.
         let fullscreen_bar = Revealer::new();
         fullscreen_bar.set_transition_type(RevealerTransitionType::SlideUp);
         fullscreen_bar.set_valign(gtk4::Align::End);
         fullscreen_bar.set_visible(false);
         overlay.add_overlay(&fullscreen_bar);
+        place_bar_under_picture(&overlay, &fullscreen_bar, picture);
 
         let stop = Button::from_icon_name("media-playback-stop-symbolic");
         stop.set_tooltip_text(Some("Stop"));
@@ -971,6 +973,64 @@ fn download_names(device: Option<&Device>, channel: u8) -> (String, String) {
         .filter(|name| !name.is_empty())
         .map_or_else(numbered, str::to_string);
     (device.name.clone(), camera)
+}
+
+/// The fullscreen controls' left edge and width over a video `width` wide
+/// whose picture shows at `picture` (left edge, width): under the picture and
+/// as wide as it, but as wide as the controls ask for (`natural`) where the
+/// picture is narrower and the video has room, and never narrower than they
+/// need (`minimum`). Centred under the picture, inside the video where they
+/// fit, else from its left edge as before. Within 2% of the video's width
+/// they take all of it, as before.
+fn bar_span(width: i32, picture: (i32, i32), minimum: i32, natural: i32) -> (i32, i32) {
+    let (left, shown) = picture;
+    let bar = shown.max(natural).min(width).max(minimum);
+    // A stream not quite of the screen's shape (896 x 512 on a 16:9 screen
+    // shows 1890 of 1920 px): the whole width, not a gap at each side.
+    if width.saturating_sub(bar) < width / 50 {
+        return (0, bar.max(width));
+    }
+    let x = left.saturating_add(shown.saturating_sub(bar) / 2).min(width.saturating_sub(bar)).max(0);
+    (x, bar)
+}
+
+/// In fullscreen the controls lie over the bottom of the video, as wide as
+/// the picture and under it rather than across the whole screen: on a screen
+/// wider than the picture (an ultrawide monitor, a 4:3 or portrait stream)
+/// they stay next to it. Stretched, the picture fills the video and so does
+/// the bar, as before. The overlay asks on every allocation, so the bar
+/// follows a resize, a new stream or a new picture size (the picture asks for
+/// one) and each step of its slide, whose height is measured anew every time.
+///
+/// A new stream (another channel, stream or Play) clears the picture until
+/// its first frame: meanwhile the bar stays where the last picture was rather
+/// than spanning the screen for a moment and moving away from the pointer.
+/// That place is forgotten when the bar leaves or comes onto the video
+/// (fullscreen ends or begins) and when the video changes size; without a
+/// picture the bar then spans the video, as before.
+fn place_bar_under_picture(overlay: &Overlay, bar: &Revealer, picture: &ZoomPicture) {
+    // The video's size and the picture's left edge and width on it.
+    let last = Rc::new(Cell::new(None::<((i32, i32), (i32, i32))>));
+    let forget = Rc::clone(&last);
+    bar.connect_visible_notify(move |_| forget.set(None));
+    let bar = bar.downgrade();
+    let picture = picture.downgrade();
+    overlay.connect_get_child_position(move |overlay, child| {
+        let bar = bar.upgrade().filter(|bar| bar.upcast_ref::<gtk4::Widget>() == child)?;
+        let size = (overlay.width(), overlay.height());
+        let shown = picture
+            .upgrade()?
+            .picture_bounds()
+            .map(|shown| (shown.x(), shown.width()))
+            .or_else(|| last.get().filter(|(at, _)| *at == size).map(|(_, shown)| shown));
+        last.set(shown.map(|shown| (size, shown)));
+        let (minimum, natural, _, _) = bar.measure(Orientation::Horizontal, -1);
+        let (x, width) = bar_span(overlay.width(), shown?, minimum, natural);
+        // At the bottom with the height the bar asks for, as by default.
+        let (minimum, natural, _, _) = bar.measure(Orientation::Vertical, width);
+        let height = natural.min(overlay.height()).max(minimum);
+        Some(gtk4::gdk::Rectangle::new(x, overlay.height() - height, width, height))
+    });
 }
 
 /// Whether a popover of a control inside `widget` is on screen.
@@ -2443,7 +2503,274 @@ impl MainWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::{keyring_step, KeyringStep, Remember};
+    use super::{bar_span, keyring_step, place_bar_under_picture, KeyringStep, Remember};
+    use crate::ui::zoom_picture::ZoomPicture;
+    use gtk4::prelude::*;
+    use gtk4::{gdk, Box as GtkBox, Label, Orientation, Overlay, Revealer, RevealerTransitionType, Window};
+
+    #[test]
+    fn the_fullscreen_bar_spans_the_picture() {
+        // A 16:9 picture on a 5120 x 1440 screen: 2560 wide, 1280 from each side.
+        assert_eq!(bar_span(5120, (1280, 2560), 520, 560), (1280, 2560));
+        // On a 16:9 screen it fills the screen, as before, also when the
+        // picture's size rounds up a pixel past it.
+        assert_eq!(bar_span(1920, (0, 1920), 520, 560), (0, 1920));
+        assert_eq!(bar_span(1920, (0, 1921), 520, 560), (0, 1920));
+        // Also within 2% of it: an 896 x 512 stream on 1920 x 1080 and on
+        // 2560 x 1440; a little more than 2% short, under the picture. On the
+        // ultrawide screen that stream is under the picture too.
+        assert_eq!(bar_span(1920, (15, 1890), 520, 560), (0, 1920));
+        assert_eq!(bar_span(2560, (20, 2520), 520, 560), (0, 2560));
+        assert_eq!(bar_span(1920, (20, 1880), 520, 560), (20, 1880));
+        assert_eq!(bar_span(5120, (1300, 2520), 520, 560), (1300, 2520));
+        // 4:3 on 1920 x 1080.
+        assert_eq!(bar_span(1920, (240, 1440), 520, 560), (240, 1440));
+        // A portrait picture narrower than the controls: their natural
+        // width, centred under it.
+        assert_eq!(bar_span(1920, (656, 608), 520, 700), (610, 700));
+        assert_eq!(bar_span(5120, (2155, 810), 520, 900), (2110, 900));
+        // A video narrower than their natural width: all of it, but never
+        // below their minimum, and then from the left edge as by default.
+        assert_eq!(bar_span(650, (21, 608), 520, 700), (0, 650));
+        assert_eq!(bar_span(400, (0, 400), 520, 700), (0, 520));
+        assert_eq!(bar_span(400, (100, 200), 520, 700), (0, 520));
+        // Nonsense in, no panic out.
+        assert_eq!(bar_span(0, (0, 0), 0, 0), (0, 0));
+        assert_eq!(bar_span(i32::MAX, (i32::MAX, i32::MAX), 0, 0).1, i32::MAX);
+        assert_eq!(bar_span(100, (i32::MIN, i32::MIN), 50, 60), (0, 60));
+    }
+
+    /// Runs the main loop until `done`, for up to 5 s: a release build under
+    /// Xvfb can take a while to map a first window.
+    fn pump_until(done: impl Fn() -> bool) {
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            while context.pending() {
+                context.iteration(false);
+            }
+            if done() || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// A blank picture of `width` x `height` pixels.
+    fn texture(width: i32, height: i32) -> gdk::MemoryTexture {
+        let pixels = vec![255; width as usize * height as usize * 4];
+        gdk::MemoryTexture::new(
+            width,
+            height,
+            gdk::MemoryFormat::R8g8b8a8,
+            &glib::Bytes::from_owned(pixels),
+            width as usize * 4,
+        )
+    }
+
+    /// A picture whose size changes, as the video sink's does with a new
+    /// frame size.
+    mod frames {
+        use gtk4::{gdk, prelude::*, subclass::prelude::*};
+        use std::cell::Cell;
+
+        mod imp {
+            use super::*;
+
+            #[derive(Default)]
+            pub struct Frames {
+                pub size: Cell<(i32, i32)>,
+            }
+
+            #[glib::object_subclass]
+            impl ObjectSubclass for Frames {
+                const NAME: &'static str = "ReolingTestFrames";
+                type Type = super::Frames;
+                type Interfaces = (gdk::Paintable,);
+            }
+
+            impl ObjectImpl for Frames {}
+
+            impl PaintableImpl for Frames {
+                fn intrinsic_width(&self) -> i32 {
+                    self.size.get().0
+                }
+
+                fn intrinsic_height(&self) -> i32 {
+                    self.size.get().1
+                }
+
+                fn snapshot(&self, _: &gdk::Snapshot, _: f64, _: f64) {}
+            }
+        }
+
+        glib::wrapper! {
+            pub struct Frames(ObjectSubclass<imp::Frames>) @implements gdk::Paintable;
+        }
+
+        impl Default for Frames {
+            fn default() -> Self {
+                glib::Object::new()
+            }
+        }
+
+        impl Frames {
+            pub fn set_size(&self, width: i32, height: i32) {
+                self.imp().size.set((width, height));
+                self.invalidate_size();
+            }
+        }
+    }
+    use frames::Frames;
+
+    /// Needs a display: the bar of the fullscreen controls over a video, in
+    /// a window of 800 x 450 (`placed` true: under the picture, as in the
+    /// app; false: the overlay's own placement, as before), with a message in
+    /// the middle and a notice at the top as the app has them.
+    fn stage(placed: bool) -> (Window, Overlay, ZoomPicture, Revealer, [Label; 2]) {
+        let picture = ZoomPicture::new();
+        picture.set_hexpand(true);
+        picture.set_vexpand(true);
+        let overlay = Overlay::new();
+        overlay.set_child(Some(&picture));
+        let message = Label::new(Some("Add a device to start"));
+        message.set_halign(gtk4::Align::Center);
+        message.set_valign(gtk4::Align::Center);
+        message.set_wrap(true);
+        overlay.add_overlay(&message);
+        let notice = Label::new(Some("Snapshot saved"));
+        notice.set_halign(gtk4::Align::Center);
+        notice.set_valign(gtk4::Align::Start);
+        notice.set_margin_top(12);
+        overlay.add_overlay(&notice);
+        let controls = GtkBox::new(Orientation::Horizontal, 0);
+        controls.set_size_request(500, 40);
+        let bar = Revealer::new();
+        bar.set_transition_type(RevealerTransitionType::SlideUp);
+        bar.set_valign(gtk4::Align::End);
+        bar.set_child(Some(&controls));
+        bar.set_reveal_child(true);
+        overlay.add_overlay(&bar);
+        if placed {
+            place_bar_under_picture(&overlay, &bar, &picture);
+        }
+        let window = Window::builder().decorated(false).default_width(800).default_height(450).child(&overlay).build();
+        window.present();
+        pump_until(|| (overlay.width(), overlay.height()) == (800, 450));
+        assert_eq!((overlay.width(), overlay.height()), (800, 450));
+        (window, overlay, picture, bar, [message, notice])
+    }
+
+    /// A widget's place in its overlay: x, y, width, height.
+    fn bounds_in(overlay: &Overlay, widget: &impl IsA<gtk4::Widget>) -> (i32, i32, i32, i32) {
+        let bounds = widget.compute_bounds(overlay).expect("the widget is in the overlay");
+        (bounds.x() as i32, bounds.y() as i32, bounds.width() as i32, bounds.height() as i32)
+    }
+
+    /// Needs a display: the overlay puts the bar under the picture as the
+    /// window, the stream, its size and the stretch setting change, and
+    /// where the picture fills the video exactly where it was before.
+    /// `gtk4::test`: on the one thread every GTK test shares.
+    #[gtk4::test]
+    #[ignore = "opens a window on the display; run explicitly"]
+    fn the_fullscreen_bar_follows_the_picture() {
+        gtk4::init().expect("a display");
+        let (window, overlay, picture, bar, labels) = stage(true);
+        let (before_window, before_overlay, before_picture, before_bar, before_labels) = stage(false);
+        let both = |width: i32, height: i32| {
+            overlay.allocate(width, height, -1, None);
+            before_overlay.allocate(width, height, -1, None);
+            // The message and the notice stay where the overlay puts them.
+            for (label, before) in labels.iter().zip(&before_labels) {
+                assert_eq!(bounds_in(&overlay, label), bounds_in(&before_overlay, before), "{}", label.label());
+            }
+            (bounds_in(&overlay, &bar), bounds_in(&before_overlay, &before_bar))
+        };
+
+        // Without a picture, and with one that fills a video of its shape,
+        // the bar is where the overlay put it before.
+        let (now, before) = both(800, 450);
+        assert_eq!(now, (0, 410, 800, 40));
+        assert_eq!(now, before);
+        for paintable in [&picture, &before_picture] {
+            paintable.set_paintable(Some(&texture(160, 90)));
+        }
+        for (width, height) in [(800, 450), (1920, 1080), (1280, 720), (500, 300)] {
+            let (now, before) = both(width, height);
+            assert_eq!(now, before, "16:9 on {width} x {height}");
+        }
+        let (now, _) = both(1920, 1080);
+        assert_eq!(now, (0, 1040, 1920, 40));
+
+        // On an ultrawide screen: under the picture and as wide as it, not
+        // across the screen as before.
+        let (now, before) = both(5120, 1440);
+        assert_eq!(now, (1280, 1400, 2560, 40));
+        assert_eq!(before, (0, 1400, 5120, 40));
+
+        // The window lays itself out again on its own (800 x 450) when the
+        // picture changes: a new stream (4:3), then new frame sizes on the
+        // same paintable, as the video sink reports them.
+        picture.set_paintable(Some(&texture(160, 120)));
+        pump_until(|| bounds_in(&overlay, &bar) == (100, 410, 600, 40));
+        assert_eq!(bounds_in(&overlay, &bar), (100, 410, 600, 40));
+        let frames = Frames::default();
+        frames.set_size(640, 480);
+        picture.set_paintable(Some(&frames));
+        pump_until(|| bounds_in(&overlay, &bar) == (100, 410, 600, 40));
+        assert_eq!(bounds_in(&overlay, &bar), (100, 410, 600, 40));
+        frames.set_size(1600, 900);
+        pump_until(|| bounds_in(&overlay, &bar) == (0, 410, 800, 40));
+        assert_eq!(bounds_in(&overlay, &bar), (0, 410, 800, 40));
+        // Portrait: 254 wide at 273, so the controls' 500, centred under it.
+        frames.set_size(360, 640);
+        pump_until(|| bounds_in(&overlay, &bar) == (150, 410, 500, 40));
+        assert_eq!(bounds_in(&overlay, &bar), (150, 410, 500, 40));
+
+        // Stretched, the picture fills the video and so does the bar.
+        picture.set_keep_aspect_ratio(false);
+        pump_until(|| bounds_in(&overlay, &bar) == (0, 410, 800, 40));
+        assert_eq!(bounds_in(&overlay, &bar), (0, 410, 800, 40));
+        assert_eq!(both(5120, 1440).0, (0, 1400, 5120, 40));
+        picture.set_keep_aspect_ratio(true);
+
+        picture.set_paintable(Some(&texture(160, 90)));
+        assert_eq!(both(5120, 1440).0, (1280, 1400, 2560, 40));
+
+        // Hidden, the bar keeps its width with no height at the bottom.
+        bar.set_transition_duration(0);
+        bar.set_reveal_child(false);
+        assert_eq!(both(5120, 1440).0, (1280, 1440, 2560, 0));
+
+        // A new stream clears the picture, then shows a paintable with no
+        // frame yet: the bar stays where it was meanwhile, and the first
+        // frame places it.
+        bar.set_reveal_child(true);
+        picture.set_paintable(None::<&gdk::Paintable>);
+        assert_eq!(both(5120, 1440).0, (1280, 1400, 2560, 40));
+        let frames = Frames::default();
+        picture.set_paintable(Some(&frames));
+        assert_eq!(both(5120, 1440).0, (1280, 1400, 2560, 40));
+        frames.set_size(640, 480);
+        assert_eq!(both(5120, 1440).0, (1600, 1400, 1920, 40));
+
+        // Without a picture on a video of another size, the whole width, as
+        // before, and the old place is gone when the size comes back.
+        picture.set_paintable(None::<&gdk::Paintable>);
+        assert_eq!(both(3840, 1080).0, (0, 1040, 3840, 40));
+        assert_eq!(both(5120, 1440).0, (0, 1400, 5120, 40));
+        // Nor does it outlast fullscreen: the bar leaves the video and comes
+        // back.
+        picture.set_paintable(Some(&texture(160, 90)));
+        assert_eq!(both(5120, 1440).0, (1280, 1400, 2560, 40));
+        picture.set_paintable(None::<&gdk::Paintable>);
+        bar.set_visible(false);
+        bar.set_visible(true);
+        assert_eq!(both(5120, 1440).0, (0, 1400, 5120, 40));
+
+        window.close();
+        before_window.close();
+    }
 
     #[test]
     fn the_saved_password_goes_only_when_the_device_calls_it_wrong() {
