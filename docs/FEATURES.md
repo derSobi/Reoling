@@ -170,9 +170,6 @@ The full list behind the [README's Status](../README.md#status).
   a whole day at once.
 - PTZ calibration has no separate "finished" signal from the camera — the
   app only knows the request was accepted.
-- Deleting a PTZ preset sends `delPos` (this project's best guess when it
-  was first written, matched only against message counts in a capture; now
-  confirmed working against a real camera).
 - Talk has been built from this project's packet captures but is the least
   tested part.
 - Presets saved by an older Reoling (before 0.1.13) have no picture until
