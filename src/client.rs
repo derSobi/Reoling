@@ -250,6 +250,15 @@ pub struct ReolinkClient {
     /// leaving it unanswered gets the next one `IDLE_KEEPALIVE` later, not
     /// at once.
     keepalive_sent: Option<tokio::time::Instant>,
+    /// The number the subscription (`MSG_ID_SUBSCRIBE`, sent by `identity`)
+    /// went out under: the device sends its alarm events (33) and a few
+    /// other pushes under it for as long as the session lasts, so
+    /// `next_msg_num` does not give it out again.
+    subscribe_msg_num: Option<u16>,
+    /// The number the last `start_video` asked under, which its stream's
+    /// data carry: some may still come in after `stop_video`, so
+    /// `next_msg_num` does not give it out until the next stream starts.
+    live_msg_num: Option<u16>,
 }
 
 /// What an in-flight request was asking for: a `MSG_ID_IMAGE_FILE` request
@@ -274,6 +283,16 @@ struct PlayingStream {
     handle: u32,
     stream_name: &'static str,
     bc_stream_type: u8,
+}
+
+/// `from`, or else the first number after it (65535 is followed by 0) that
+/// is neither 0 nor one of `reserved`; see `ReolinkClient::next_msg_num`.
+fn free_msg_num(from: u16, reserved: [Option<u16>; 2]) -> u16 {
+    let mut n = from;
+    while n == 0 || reserved.contains(&Some(n)) {
+        n = n.wrapping_add(1);
+    }
+    n
 }
 
 fn control_xml(inner: &str) -> Vec<u8> {
@@ -748,6 +767,8 @@ impl ReolinkClient {
             download_task: None,
             download_cancel: None,
             keepalive_sent: None,
+            subscribe_msg_num: None,
+            live_msg_num: None,
         }
     }
 
@@ -784,11 +805,20 @@ impl ReolinkClient {
         self.connection.lock().await.peer_addr()
     }
 
+    /// The number for the next request: 1, 2, 3, ... and, after 65535, round
+    /// again from 1. Once round, it skips the numbers the device sends under
+    /// without being asked: 0, the number of its pushes, and the
+    /// subscription's (both in every capture of ours), and also the last
+    /// live stream's, until the next one starts. Until then none of these
+    /// can come up (0 is never reached, the others were given out earlier),
+    /// so the numbers are the same as without the skip.
     fn next_msg_num(&mut self) -> u16 {
-        let n = self.next_msg_num;
-        self.next_msg_num = self.next_msg_num.wrapping_add(1);
-        // The number comes round again after 65536 requests: an unanswered
-        // settings read left under it must not take this request's reply.
+        let reserved = [self.subscribe_msg_num, self.live_msg_num];
+        let n = free_msg_num(self.next_msg_num, reserved);
+        self.next_msg_num = n.wrapping_add(1);
+        // The number comes round again after about 65535 requests: an
+        // unanswered settings read left under it must not take this
+        // request's reply.
         settings::number_reused(&self.pending_images, n);
         n
     }
@@ -1264,7 +1294,8 @@ impl ReolinkClient {
         self.send_control(MSG_ID_SPOTLIGHT, channel_id, spotlight_xml(channel_id, on)).await
     }
 
-    async fn send_empty_request(&mut self, msg_id: u32) -> crate::Result<()> {
+    /// Sends a bodiless request; returns the number it went out under.
+    async fn send_empty_request(&mut self, msg_id: u32) -> crate::Result<u16> {
         let msg_num = self.next_msg_num();
         let request = Bc {
             meta: BcMeta {
@@ -1277,7 +1308,7 @@ impl ReolinkClient {
             },
             body: BcBody::Modern(ModernMsg { extension_xml: None, payload: None }),
         };
-        self.connection.lock().await.send_bc(&request, &self.encryption).await
+        self.connection.lock().await.send_bc(&request, &self.encryption).await.map(|()| msg_num)
     }
 
     /// Asks the logged-in device for its name and model. Best effort: any
@@ -1288,7 +1319,9 @@ impl ReolinkClient {
         // channel list, with the channels' names, only after these two).
         // Answers are picked up as they come.
         let _ = self.send_empty_request(MSG_ID_STREAM_INFO).await;
-        let _ = self.send_empty_request(MSG_ID_SUBSCRIBE).await;
+        if let Ok(msg_num) = self.send_empty_request(MSG_ID_SUBSCRIBE).await {
+            self.subscribe_msg_num = Some(msg_num);
+        }
         // Which camera can do what: the support table, one row per channel.
         self.request_for_channel(MSG_ID_SUPPORT, 0).await;
         let msg_num = self.next_msg_num();
@@ -1539,7 +1572,9 @@ impl ReolinkClient {
         if self.download_task.is_some() {
             let _ = self.stop_download_within(replay::LIVE_SWITCH_CLOSE_WAIT).await;
         }
+        // Picked while the last stream's number is still kept out.
         let msg_num = self.next_msg_num();
+        self.live_msg_num = Some(msg_num);
         // handle/stream_type per quality. `Main`'s values (handle 0,
         // BcMeta.stream_type 0, XML streamType "mainStream") come straight
         // from our own real capture and are not in question.
@@ -2263,6 +2298,11 @@ mod keepalive_tests {
     /// A client and the device end of a loopback BCUDP connection, both
     /// unencrypted (no login), relay-style (no `C2D_HB`).
     async fn client_and_device() -> (ReolinkClient, BcConnection) {
+        client_and_device_with(EncryptionProtocol::Unencrypted).await
+    }
+
+    /// The same, with the client encrypting as `encryption` says.
+    async fn client_and_device_with(encryption: EncryptionProtocol) -> (ReolinkClient, BcConnection) {
         let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let device_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let client_addr = client_socket.local_addr().unwrap();
@@ -2275,10 +2315,8 @@ mod keepalive_tests {
             is_direct: false,
         };
         let device = BcConnection::new(device_socket, peer(client_addr, 2, 1));
-        let client = ReolinkClient::from_connection(
-            BcConnection::new(client_socket, peer(device_addr, 1, 2)),
-            EncryptionProtocol::Unencrypted,
-        );
+        let client =
+            ReolinkClient::from_connection(BcConnection::new(client_socket, peer(device_addr, 1, 2)), encryption);
         (client, device)
     }
 
@@ -2490,5 +2528,201 @@ mod keepalive_tests {
         let end = download.abort_handle();
         client.download_task = Some(download);
         quiet_until_ended(client, device, end).await;
+    }
+
+    #[test]
+    fn a_free_number_is_never_0_nor_a_reserved_one() {
+        assert_eq!(free_msg_num(1, [None, None]), 1);
+        assert_eq!(free_msg_num(65534, [Some(3), Some(6)]), 65534);
+        assert_eq!(free_msg_num(65535, [Some(3), Some(6)]), 65535);
+        assert_eq!(free_msg_num(0, [None, None]), 1);
+        assert_eq!(free_msg_num(0, [Some(1), None]), 2);
+        assert_eq!(free_msg_num(0, [None, Some(1)]), 2);
+        assert_eq!(free_msg_num(0, [Some(1), Some(2)]), 3);
+        assert_eq!(free_msg_num(3, [Some(3), None]), 4);
+        assert_eq!(free_msg_num(3, [Some(3), Some(4)]), 5);
+        assert_eq!(free_msg_num(65535, [Some(65535), None]), 1);
+        assert_eq!(free_msg_num(65535, [Some(65535), Some(1)]), 2);
+    }
+
+    /// Until the count comes round, the numbers are 1 to 65535 in order
+    /// whatever is reserved; then 0, the subscription's number and the live
+    /// stream's are left out.
+    #[tokio::test]
+    async fn the_count_is_1_to_65535_and_then_goes_round_past_the_reserved_numbers() {
+        let (mut client, _device) = client_and_device().await;
+        for expected in 1..=u16::MAX {
+            let n = client.next_msg_num();
+            assert_eq!(n, expected);
+            // As `identity` and `start_video` keep them.
+            match n {
+                3 => client.subscribe_msg_num = Some(n),
+                6 => client.live_msg_num = Some(n),
+                _ => {}
+            }
+        }
+        let round: Vec<u16> = (0..5).map(|_| client.next_msg_num()).collect();
+        assert_eq!(round, [1, 2, 4, 5, 7]);
+        // The last stream's number stays out after a stop (which keeps it),
+        // until the next stream starts under another one.
+        client.next_msg_num = 6;
+        assert_eq!(client.next_msg_num(), 7);
+        client.live_msg_num = Some(9);
+        client.next_msg_num = 6;
+        assert_eq!(client.next_msg_num(), 6);
+    }
+
+    #[tokio::test]
+    async fn a_count_at_65535_goes_on_with_1_or_the_next_free_number() {
+        let (mut client, _device) = client_and_device().await;
+        client.next_msg_num = u16::MAX;
+        let round: Vec<u16> = (0..3).map(|_| client.next_msg_num()).collect();
+        assert_eq!(round, [65535, 1, 2]);
+        client.next_msg_num = u16::MAX;
+        client.subscribe_msg_num = Some(1);
+        let round: Vec<u16> = (0..3).map(|_| client.next_msg_num()).collect();
+        assert_eq!(round, [65535, 2, 3]);
+        client.next_msg_num = u16::MAX;
+        client.subscribe_msg_num = Some(u16::MAX);
+        client.live_msg_num = Some(1);
+        let round: Vec<u16> = (0..2).map(|_| client.next_msg_num()).collect();
+        assert_eq!(round, [2, 3]);
+    }
+
+    /// A settings read left unanswered under a number is forgotten when the
+    /// number comes round again, so the new request's answer is not taken
+    /// for it.
+    #[tokio::test]
+    async fn a_number_given_out_again_drops_what_was_pending_under_it() {
+        let (mut client, _device) = client_and_device().await;
+        client.pending_images.lock().unwrap().insert(1, ImageKind::Preset(4));
+        client.next_msg_num = u16::MAX;
+        assert_eq!(client.next_msg_num(), 65535);
+        assert!(client.pending_images.lock().unwrap().contains_key(&1));
+        assert_eq!(client.next_msg_num(), 1);
+        assert!(client.pending_images.lock().unwrap().is_empty());
+    }
+
+    /// About 4.5 days of idle keep-alives: the 65535th is followed by 1, not
+    /// 0 (the device's own number for its pushes), and the subscription's
+    /// number (3, as after a login) is left out.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_session_s_keep_alive_goes_round_past_0_and_the_subscription() {
+        let (mut client, mut device) = client_and_device().await;
+        client.subscribe_msg_num = Some(3);
+        client.next_msg_num = u16::MAX;
+        let fake = async move {
+            let mut asked = Vec::new();
+            for _ in 0..4 {
+                let request = device.recv_bc(&PLAIN).await.unwrap();
+                assert_link_type_request(&request);
+                device.send_bc(&link_type_reply(request.meta.msg_num), &PLAIN).await.unwrap();
+                asked.push(request.meta.msg_num);
+            }
+            assert_eq!(asked, [65535, 1, 2, 4]);
+        };
+        tokio::select! {
+            error = client.wait_for_pushes() => panic!("wait_for_pushes ended: {error}"),
+            () = fake => {}
+        }
+    }
+
+    /// `identity` keeps the number its subscription went out under (the
+    /// second request, as no login came first here).
+    #[tokio::test]
+    async fn identity_keeps_the_number_of_the_subscription() {
+        let (mut client, mut device) = client_and_device().await;
+        let fake = tokio::spawn(async move {
+            let mut asked = Vec::new();
+            for _ in 0..4 {
+                let request = device.recv_bc(&PLAIN).await.unwrap();
+                asked.push((request.meta.msg_id, request.meta.msg_num));
+            }
+            let version = device_message(MSG_ID_VERSION, asked[3].1, 200, None, None);
+            device.send_bc(&version, &PLAIN).await.unwrap();
+            asked
+        });
+        client.identity().await;
+        let asked = fake.await.unwrap();
+        assert_eq!(asked[1].0, MSG_ID_SUBSCRIBE);
+        assert_eq!(client.subscribe_msg_num, Some(asked[1].1));
+        assert_eq!(client.subscribe_msg_num, Some(2));
+    }
+
+    /// Once the count has come round, `identity` asks under 65533 to 65535
+    /// and then 1, not 0. An image under 1 left that number marked binary
+    /// long ago; the answer to the version request under it is still read
+    /// as the version, decrypted, and not passed on as image bytes.
+    #[tokio::test]
+    async fn identity_s_answer_is_read_after_the_count_has_come_round() {
+        let enc = EncryptionProtocol::BcEncrypt;
+        let (mut client, mut device) = client_and_device_with(enc.clone()).await;
+        let binary = Extension { version: XML_VERSION.to_string(), binary_data: Some(1), ..Default::default() };
+        let image_end = device_message(MSG_ID_IMAGE_FILE, 1, 201, Some(binary.to_bytes()), None);
+        device.send_bc(&image_end, &enc).await.unwrap();
+        client.connection.lock().await.recv_bc(&enc).await.unwrap();
+        client.next_msg_num = 65533;
+        let fake = tokio::spawn(async move {
+            let mut asked = Vec::new();
+            for _ in 0..4 {
+                let request = device.recv_bc(&enc).await.unwrap();
+                asked.push((request.meta.msg_id, request.meta.msg_num));
+            }
+            let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<VersionInfo version=\"1.1\">\n\
+                       <name>Test hub</name>\n<type>TESTMODEL</type>\n</VersionInfo>\n</body>\n";
+            let version = device_message(MSG_ID_VERSION, asked[3].1, 200, None, Some(xml.as_bytes().to_vec()));
+            device.send_bc(&version, &enc).await.unwrap();
+            asked
+        });
+        let identity = client.identity().await;
+        let asked = fake.await.unwrap();
+        assert_eq!(
+            asked,
+            [(MSG_ID_STREAM_INFO, 65533), (MSG_ID_SUBSCRIBE, 65534), (MSG_ID_SUPPORT, 65535), (MSG_ID_VERSION, 1)]
+        );
+        assert_eq!(client.subscribe_msg_num, Some(65534));
+        assert_eq!((identity.name.as_deref(), identity.model.as_deref()), (Some("Test hub"), Some("TESTMODEL")));
+    }
+
+    /// `start_video` keeps the number it asked under, and a stop keeps it
+    /// too: once the count has come round, the next start does not take it,
+    /// so a frame the old stream still sends under it is not taken for the
+    /// new start's answer (here a refusal).
+    #[tokio::test]
+    async fn a_live_stream_s_number_is_kept_until_the_next_stream_starts() {
+        let (mut client, mut device) = client_and_device().await;
+        let (asked_tx, mut asked) = tokio::sync::mpsc::unbounded_channel();
+        let fake = tokio::spawn(async move {
+            let mut live = None;
+            while let Ok(request) = device.recv_bc(&PLAIN).await {
+                let (msg_id, msg_num) = (request.meta.msg_id, request.meta.msg_num);
+                let _ = asked_tx.send((msg_id, msg_num));
+                if msg_id != MSG_ID_VIDEO {
+                    continue;
+                }
+                let Some(old) = live else {
+                    live = Some(msg_num);
+                    device.send_bc(&device_message(MSG_ID_VIDEO, msg_num, 200, None, None), &PLAIN).await.unwrap();
+                    continue;
+                };
+                let binary = Extension { version: XML_VERSION.to_string(), binary_data: Some(1), ..Default::default() };
+                let frame = device_message(MSG_ID_VIDEO, old, 200, Some(binary.to_bytes()), Some(vec![0; 8]));
+                device.send_bc(&frame, &PLAIN).await.unwrap();
+                device.send_bc(&device_message(MSG_ID_VIDEO, msg_num, 400, None, None), &PLAIN).await.unwrap();
+            }
+        });
+        let _frames = client.start_video(0, StreamProfile::Sub).await.unwrap();
+        let (msg_id, first) = asked.recv().await.unwrap();
+        assert_eq!((msg_id, client.live_msg_num), (MSG_ID_VIDEO, Some(first)));
+        // As if the count had come round.
+        client.next_msg_num = u16::MAX;
+        client.stop_video(0).await.unwrap();
+        assert_eq!(asked.recv().await.unwrap(), (MSG_ID_VIDEO_STOP, u16::MAX));
+        assert_eq!(client.live_msg_num, Some(first));
+        assert!(client.start_video(0, StreamProfile::Sub).await.is_err(), "the old stream's frame taken as the answer");
+        let (msg_id, second) = asked.recv().await.unwrap();
+        assert_eq!((msg_id, second), (MSG_ID_VIDEO, 2));
+        assert_eq!(client.live_msg_num, Some(second));
+        fake.abort();
     }
 }

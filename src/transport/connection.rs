@@ -460,6 +460,15 @@ impl BcConnection {
     }
 
     pub async fn send_bc(&mut self, bc: &Bc, enc: &EncryptionProtocol) -> crate::Result<()> {
+        // A request number comes round again once the client's count has
+        // (see `ReolinkClient::next_msg_num`): what an earlier stream under
+        // it (live video, an image) left marked binary is stale by then, and
+        // the answer to this message is decrypted like any other. Until then
+        // this finds nothing: for the ids kept in `bin_mode` (live video,
+        // images) the device sends binary data only under the number of the
+        // request that asked for it, and in our captures nothing goes out
+        // again under such a number.
+        self.bin_mode.remove(&bc.meta.msg_num);
         let bytes = write_bc(bc, enc);
         match &mut self.socket {
             Socket::Udp { socket, peer, send_state, .. } => {
@@ -973,6 +982,61 @@ mod tests {
         conn_a.send_bc(&bc, &EncryptionProtocol::Unencrypted).await.unwrap();
         let received = conn_b.recv_bc(&EncryptionProtocol::Unencrypted).await.unwrap();
         assert_eq!(received, bc);
+    }
+
+    /// Live video's binary mode stays with its number, whatever goes out
+    /// under other numbers, until a message goes out under that number
+    /// again, as it does once the client's count has come round: the answer
+    /// to that message is decrypted, not passed on as stream bytes.
+    #[tokio::test]
+    async fn a_number_sent_under_again_is_no_longer_binary() {
+        use crate::protocol::bc::xml::Extension;
+        let socket_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr_a = socket_a.local_addr().unwrap();
+        let addr_b = socket_b.local_addr().unwrap();
+        let mut client = BcConnection::new(
+            socket_a,
+            PeerHandle { addr: addr_b, local_connection_id: 1, remote_connection_id: 2, nonce: None, is_direct: false },
+        );
+        let mut device = BcConnection::new(
+            socket_b,
+            PeerHandle { addr: addr_a, local_connection_id: 2, remote_connection_id: 1, nonce: None, is_direct: false },
+        );
+        let enc = EncryptionProtocol::BcEncrypt;
+        let message = |msg_id: u32, extension: Option<Extension>, payload: &[u8]| Bc {
+            meta: BcMeta { msg_id, channel_id: 0, stream_type: 0, msg_num: 7, response_code: 200, class: 0x0000 },
+            body: BcBody::Modern(ModernMsg {
+                extension_xml: extension.map(|e| e.to_bytes()),
+                payload: Some(payload.to_vec()),
+            }),
+        };
+        let request = |msg_num: u16| Bc {
+            meta: BcMeta { msg_id: 56, channel_id: 0, stream_type: 0, msg_num, response_code: 0, class: 0x6414 },
+            body: BcBody::Modern(ModernMsg { extension_xml: None, payload: None }),
+        };
+        let payload_of = |bc: Bc| match bc.body {
+            BcBody::Modern(ModernMsg { payload: Some(payload), .. }) => payload,
+            other => panic!("no payload: {other:?}"),
+        };
+        let binary = Extension { version: "1.1".to_string(), binary_data: Some(1), ..Default::default() };
+        let xml = b"<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n</body>\n";
+
+        device.send_bc(&message(MSG_ID_VIDEO, Some(binary), &[1, 2, 3, 4]), &enc).await.unwrap();
+        client.recv_bc(&enc).await.unwrap();
+        // A later message of the stream, with no Extension: passed on as it came.
+        device.send_bc(&message(MSG_ID_VIDEO, None, xml), &enc).await.unwrap();
+        assert_eq!(payload_of(client.recv_bc(&enc).await.unwrap()), enc.encrypt(0, xml));
+        // A request under another number leaves the stream as it is.
+        client.send_bc(&request(8), &enc).await.unwrap();
+        assert_eq!(device.recv_bc(&enc).await.unwrap(), request(8));
+        device.send_bc(&message(MSG_ID_VIDEO, None, xml), &enc).await.unwrap();
+        assert_eq!(payload_of(client.recv_bc(&enc).await.unwrap()), enc.encrypt(0, xml));
+
+        client.send_bc(&request(7), &enc).await.unwrap();
+        assert_eq!(device.recv_bc(&enc).await.unwrap(), request(7));
+        device.send_bc(&message(56, None, xml), &enc).await.unwrap();
+        assert_eq!(payload_of(client.recv_bc(&enc).await.unwrap()), xml.to_vec());
     }
 
     fn login_bc(msg_num: u16, payload: Vec<u8>) -> Bc {
