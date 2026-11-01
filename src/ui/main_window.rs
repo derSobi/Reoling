@@ -18,7 +18,7 @@ use crate::ui::{dialogs, secrets};
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Button, DropDown, EventControllerKey,
-    GestureClick, HeaderBar, IconTheme, Image, Label, Orientation, Overlay, Paned, ScaleButton,
+    GestureClick, HeaderBar, IconTheme, Image, Label, Orientation, Overlay, Paned, PropagationPhase, ScaleButton,
     Revealer, RevealerTransitionType, Stack, StackSwitcher, ToggleButton,
 };
 use reoling::{
@@ -770,6 +770,31 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             glib::Propagation::Proceed
         });
         window.add_controller(keys);
+        // In fullscreen the window takes Esc before the widget with the
+        // keyboard focus does: the volume button would take it to close its
+        // already closed slider, and the paned, which GTK gives the focus when
+        // the controls hide, to cancel a keyboard move of its divider. An open
+        // popover of the controls still gets it, and closes. Only our own
+        // fullscreen, with the controls on the video, is meant: not one the
+        // window manager made by itself.
+        let w = weak.clone();
+        let escape = EventControllerKey::new();
+        escape.set_propagation_phase(PropagationPhase::Capture);
+        escape.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk4::gdk::Key::Escape {
+                if let Some(m) = w.upgrade() {
+                    if m.window.is_fullscreen()
+                        && m.fullscreen_bar.child().is_some()
+                        && !popover_open_below(&m.bars)
+                    {
+                        m.set_fullscreen(false);
+                        return glib::Propagation::Stop;
+                    }
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        window.add_controller(escape);
         // The window manager makes the window fullscreen after `set_fullscreen`
         // has returned: the controls' hide timer starts from here, so the bar
         // also goes away when the pointer never moves. When the window manager
@@ -993,12 +1018,13 @@ impl MainWindow {
 
     fn set_fullscreen(self: &Rc<Self>, on: bool) {
         if on {
-            // First the keyboard focus goes: a control that has it and moves
-            // onto the video, or hides with the header bar or the sidebar,
-            // makes GTK hand it to the paned on the next frame (clearing it
-            // afterwards does not stop that), and the paned takes the first
-            // Escape for itself. With no focus, Escape reaches the window's
-            // own key handler; an open popover of the bar still closes first.
+            // First the keyboard focus goes, so that keys right after going
+            // fullscreen reach the window rather than the paned: a control
+            // that has the focus and moves onto the video, or hides with the
+            // header bar or the sidebar, makes GTK hand it to the paned on the
+            // next frame (clearing it afterwards does not stop that). Escape
+            // does not depend on it: in fullscreen the window takes it before
+            // any focused widget.
             gtk4::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk4::Widget>);
             self.window.fullscreen();
             // The control rows move onto the video, as a bar that slides in.
