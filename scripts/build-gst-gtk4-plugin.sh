@@ -6,9 +6,10 @@
 #
 #   scripts/build-gst-gtk4-plugin.sh <output directory>
 #
-# writes <output directory>/libgstgtk4.so. Needs the GTK 4 and GStreamer
-# development packages (libgtk-4-dev, libgstreamer1.0-dev,
-# libgstreamer-plugins-base1.0-dev) and Rust 1.92 or newer.
+# writes <output directory>/libgstgtk4.so, stripped. Needs the GTK 4 and
+# GStreamer development packages (libgtk-4-dev, libgstreamer1.0-dev,
+# libgstreamer-plugins-base1.0-dev), Rust 1.92 or newer and binutils
+# (strip).
 #
 # Environment:
 #   GST_GTK4_VERSION   crate version (default below; pinned with its SHA-256)
@@ -62,6 +63,10 @@ cargo build --release --manifest-path "$work/$crate/Cargo.toml" --target-dir "$w
 
 so="$work/target/release/libgstgtk4.so"
 cp "$so" "$out/libgstgtk4.so"
+# Stripped the way cargo deb strips the binary it builds (lintian rejects an
+# unstripped shared object in a package); the dynamic symbols GStreamer loads
+# the plugin by stay, and the check below loads the stripped file.
+strip --strip-unneeded --remove-section=.comment --remove-section=.note "$out/libgstgtk4.so"
 echo "Wrote $out/libgstgtk4.so ($(du -h "$out/libgstgtk4.so" | cut -f1))"
 
 # The plugin must register on this machine's GStreamer: load it alone, into
