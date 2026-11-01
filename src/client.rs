@@ -484,7 +484,12 @@ fn pushed_update(
             == Some(1);
         if !is_chunk {
             // The small metadata reply that precedes the chunks; nothing
-            // this project reads from it yet.
+            // this project reads from it yet. It opens a transfer: what an
+            // unfinished one left under its number goes, once the number has
+            // been given out again (see `ReolinkClient::next_msg_num`). Until
+            // then nothing is kept under it here: in every capture of ours
+            // this reply is the first answer under its number.
+            image_chunks.remove(&bc.meta.msg_num);
             return None;
         }
         if bc.meta.response_code == 200 {
@@ -2724,5 +2729,61 @@ mod keepalive_tests {
         assert_eq!((msg_id, second), (MSG_ID_VIDEO, 2));
         assert_eq!(client.live_msg_num, Some(second));
         fake.abort();
+    }
+
+    /// Live video's reader puts images together for as long as the stream
+    /// runs. An image under 2 that never ended left its first bytes there;
+    /// once the count has come round, the picture asked for under 2 again
+    /// (1 is the stream's) is made of its own bytes only, and is the one
+    /// asked for.
+    #[tokio::test]
+    async fn an_image_under_a_number_given_out_again_is_only_its_own() {
+        let (mut client, mut device) = client_and_device().await;
+        let mut updates = client.take_channel_updates().unwrap();
+        let fake = tokio::spawn(async move {
+            let binary = Extension { version: XML_VERSION.to_string(), binary_data: Some(1), ..Default::default() };
+            let opening = |msg_num: u16| {
+                let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n</body>\n";
+                device_message(MSG_ID_IMAGE_FILE, msg_num, 200, None, Some(xml.as_bytes().to_vec()))
+            };
+            let chunk = |msg_num: u16, code: u16, bytes: Option<&[u8]>| {
+                device_message(MSG_ID_IMAGE_FILE, msg_num, code, Some(binary.to_bytes()), bytes.map(<[u8]>::to_vec))
+            };
+            let mut asked = Vec::new();
+            while let Ok(request) = device.recv_bc(&PLAIN).await {
+                let (msg_id, msg_num) = (request.meta.msg_id, request.meta.msg_num);
+                asked.push((msg_id, msg_num));
+                let answer = match asked.len() {
+                    1 => vec![device_message(MSG_ID_VIDEO, msg_num, 200, None, None)],
+                    // The first image's opening reply and first bytes; its end never comes.
+                    2 => vec![opening(msg_num), chunk(msg_num, 200, Some(&[0xff, 0xd8, 9, 9]))],
+                    _ => vec![
+                        opening(msg_num),
+                        chunk(msg_num, 200, Some(&[0xff, 0xd8, 1, 2, 0xff, 0xd9])),
+                        chunk(msg_num, 201, None),
+                    ],
+                };
+                for bc in answer {
+                    device.send_bc(&bc, &PLAIN).await.unwrap();
+                }
+                if asked.len() == 3 {
+                    break;
+                }
+            }
+            asked
+        });
+        let _frames = client.start_video(0, StreamProfile::Sub).await.unwrap();
+        client.query_preset_image(0, 3).await;
+        // As if 65535 had just been given out.
+        client.next_msg_num = 0;
+        client.query_preset_image(0, 4).await;
+        match updates.recv().await {
+            Some(DeviceUpdate::PresetImage { channel_id: 0, preset_id: 4, jpeg }) => {
+                assert_eq!(jpeg, [0xff, 0xd8, 1, 2, 0xff, 0xd9]);
+            }
+            other => panic!("expected preset 4's image, got {other:?}"),
+        }
+        let asked = fake.await.unwrap();
+        assert_eq!(asked, [(MSG_ID_VIDEO, 1), (MSG_ID_IMAGE_FILE, 2), (MSG_ID_IMAGE_FILE, 2)]);
     }
 }
