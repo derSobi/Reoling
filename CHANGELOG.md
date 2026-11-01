@@ -2,6 +2,63 @@
 
 All notable changes of Reoling, newest first.
 
+## 1.0.2 — 2026-11-01
+
+`reoling_1.0.2-1_amd64.deb` and `Reoling-1.0.2-x86_64.AppImage`,
+built as 1.0.1's were.
+
+- Digital video zoom in live view and playback, contributed by Simon
+  Bechard (@simbesh): the wheel over the picture zooms in at the
+  pointer, up to 16×, and out again; a left drag pans while zoomed in,
+  and a middle click shows the whole picture again. The zoom stays when
+  the window is resized or goes fullscreen; in live view it starts over
+  with each new stream (another camera, channel or stream, Play after
+  Stop), in playback it stays across seeks, speed changes and one day's
+  recordings. The zoomed picture fills the area the whole picture
+  takes, out to its edges, with no empty strip or blended border; the
+  letterbox around it stays unless Stretch Mode is on. A double-click
+  still toggles fullscreen when the mouse moves a pixel or two during
+  it, and snapshots and recordings still hold the whole frame.
+- On Wayland the wheel zooms at the pointer also right after the window
+  went fullscreen, was maximized or moved while the mouse stood still,
+  where the compositor tells the pointer's position, as GNOME Shell 50.1
+  was measured to do; on other compositors it may zoom about the
+  pointer's last known position. On X11 it zooms where the pointer is.
+- Camera settings: on a Home Hub's cameras a few rows can be changed,
+  with Save and Revert on their tab. On an E1 Outdoor PoE these are
+  whether the date is shown, the watermark and the camera name's
+  position on Display, brightness, flip and day and night mode on
+  Image, and the status LED, the infrared lights and the volume on
+  Light & sound; on an RLC-1224A, noise reduction and its level. Save
+  writes one row at a time, as the official Reolink app was captured
+  doing, each built from a fresh read of the tab; a Display Save also
+  sends the flow-data overlay switched off, as that app does. Every
+  other row outside Encoding stays read-only, and on an NVR's cameras or
+  a camera added on its own only Encoding can be changed, as before. The
+  README's [camera settings entry](README.md#status) has the details.
+- A save that goes on with the settings window closed is given up when
+  the camera's live video stops (Stop, the Playback page) or the
+  connection is lost; when the window is opened again for that camera,
+  the tab says so and shows what the camera has.
+- Fullscreen: the controls hide after 2.5 s also when the mouse never
+  moves, no longer keep coming back by themselves on Wayland, and stay
+  up while their volume slider or stream list is open. When the window
+  manager ends fullscreen by itself, the controls go back below the
+  video, and the header bar and, if it was shown, the sidebar return.
+- Escape leaves fullscreen with one press, also right after going
+  fullscreen and after the controls were used. An open volume slider or
+  stream list closes first, and the next Escape leaves fullscreen.
+- A Home Hub or NVR with nothing playing stays connected: while no live
+  video, playback or download runs on it, Reoling sends the keep-alive
+  the official Reolink app sends, after every 6 s without a message
+  from the device. Before, a Home Hub Pro dropped to "Not connected"
+  after about a minute with nothing playing.
+- The version history moved from the README to CHANGELOG.md, which the
+  .deb installs beside the README in `/usr/share/doc/reoling`.
+- Building from source also needs GTK 4 with its Wayland backend and
+  `libwayland-client` 1.20 or newer with its headers (`libwayland-dev`,
+  which `libgtk-4-dev` pulls in).
+
 ## 1.0.1 — 2026-10-25
 
 `reoling_1.0.1-1_amd64.deb` and `Reoling-1.0.1-x86_64.AppImage`,
