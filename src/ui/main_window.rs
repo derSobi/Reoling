@@ -993,6 +993,13 @@ impl MainWindow {
 
     fn set_fullscreen(self: &Rc<Self>, on: bool) {
         if on {
+            // First the keyboard focus goes: a control that has it and moves
+            // onto the video, or hides with the header bar or the sidebar,
+            // makes GTK hand it to the paned on the next frame (clearing it
+            // afterwards does not stop that), and the paned takes the first
+            // Escape for itself. With no focus, Escape reaches the window's
+            // own key handler; an open popover of the bar still closes first.
+            gtk4::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk4::Widget>);
             self.window.fullscreen();
             // The control rows move onto the video, as a bar that slides in.
             self.live.remove(&self.bars);
