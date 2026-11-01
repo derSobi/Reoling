@@ -24,7 +24,7 @@ More on <https://reoling.eu>.
 
 ## Status
 
-Version **1.0.2**, with installable packages since 1.0.0 (see
+Version **1.0.3**, with installable packages since 1.0.0 (see
 [Installation](#installation)). Login, live video, PTZ, the camera and
 device settings pages, and playback with sound, events and downloads
 work end to end on a real Home Hub, NVR and their cameras, over UDP/P2P
@@ -76,14 +76,14 @@ Each of these in full: [docs/FEATURES.md](docs/FEATURES.md).
 
 **Version history**
 
-- 1.0.2 — the .deb and the AppImage, built as 1.0.1's were. Video zoom
-  in live view and playback, contributed by Simon Bechard (@simbesh).
-  Save and Revert for a few Home Hub camera settings, one row per write
-  as the official Reolink app sends them. A Home Hub or NVR with nothing
-  playing stays connected. Fullscreen controls also hide when the mouse
-  never moves; one Escape leaves fullscreen (an open popup closes first).
-  The .deb also installs CHANGELOG.md; a source build needs GTK 4's
-  Wayland backend and `libwayland-client` 1.20 or newer.
+- 1.0.3 — the .deb and the AppImage, built as 1.0.2's were. Fullscreen
+  controls lie under the picture, as wide as it, so on an ultrawide
+  monitor they no longer sit beside it. On X11 the windows' `WM_CLASS`
+  is `de.dersobi.reoling`, as the desktop entries say, so a dock can
+  show Reoling's icon. A connection that stays up for days skips the
+  request numbers the device sends its own messages under. The .deb
+  also installs docs/FEATURES.md, and both packages carry the GTK 4 sink
+  stripped; Cargo.toml names Rust 1.88 as the minimum.
 
 The full history, with the date of every version, is in
 [CHANGELOG.md](CHANGELOG.md).
@@ -134,9 +134,9 @@ carries two packages for x86_64 Linux, both built on Ubuntu 24.04 LTS by
 the release workflow (`.github/workflows/release.yml`) so that they run on
 24.04 and everything newer:
 
-- **`reoling_1.0.2-1_amd64.deb`** for Ubuntu 24.04 LTS or newer and
+- **`reoling_1.0.3-1_amd64.deb`** for Ubuntu 24.04 LTS or newer and
   Debian 13 or newer (and derivatives with at least those library
-  versions): `sudo apt install ./reoling_1.0.2-1_amd64.deb`. apt
+  versions): `sudo apt install ./reoling_1.0.3-1_amd64.deb`. apt
   installs the GTK 4 and GStreamer runtime with it — the base, good and
   bad plugin sets (parsers, muxers, the nvcodec and va hardware decoders),
   the libav software decoders and a PulseAudio, PipeWire or ALSA sink —
@@ -147,9 +147,9 @@ the release workflow (`.github/workflows/release.yml`) so that they run on
   `/usr/lib/reoling/gstreamer-1.0`, a directory `reoling` adds to its
   plugin registry when it starts. Reoling then appears in the
   applications menu; `reoling --version` prints the installed version.
-- **`Reoling-1.0.2-x86_64.AppImage`** for any other distribution with
+- **`Reoling-1.0.3-x86_64.AppImage`** for any other distribution with
   glibc 2.39 and GLib 2.80 or newer (Ubuntu 24.04, Fedora 40, Debian 13
-  and later): `chmod +x Reoling-1.0.2-x86_64.AppImage` and run it.
+  and later): `chmod +x Reoling-1.0.3-x86_64.AppImage` and run it.
   The AppImage mounts itself with FUSE 2 (`libfuse2` or `libfuse2t64`);
   without it, `--appimage-extract-and-run` unpacks it to a
   temporary directory for that run, and `--appimage-extract` unpacks it
@@ -233,7 +233,7 @@ whole release in an `ubuntu:24.04` container and runs the container tests:
 
 ```bash
 scripts/build-gst-gtk4-plugin.sh target/gst-gtk4   # the GTK 4 sink, where the distribution has none
-cargo install cargo-deb && cargo deb                # target/debian/reoling_1.0.2-1_amd64.deb
+cargo install cargo-deb && cargo deb                # target/debian/reoling_1.0.3-1_amd64.deb
 scripts/fetch-appimage-tools.sh ~/appimage-tools    # linuxdeploy, its plugins, appimagetool (pinned)
 APPIMAGE_TOOLS=~/appimage-tools scripts/build-appimage.sh target/release/reoling dist
 ```

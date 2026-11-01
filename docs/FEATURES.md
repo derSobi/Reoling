@@ -13,9 +13,12 @@ The full list behind the [README's Status](../README.md#status).
   restarts on the next start; fullscreen with a control bar that slides in
   on entering it and whenever the pointer moves, and out again after 2.5 s
   without movement (it stays while the pointer is on it and while its
-  volume slider or stream list is open); a latency setting
-  (Low / Balanced / Smooth) trades reaction time for smoothness over a
-  poor connection.
+  volume slider or stream list is open); the bar lies under the picture
+  and is as wide as it (its own width, centred, under a narrower picture;
+  the whole width in Stretch Mode or when the picture is within 2% of the
+  screen's width), and beside it the pointer is over the video; a latency
+  setting (Low / Balanced / Smooth) trades reaction time for smoothness
+  over a poor connection.
 - Digital video zoom in live view and playback: scroll up over the picture
   to zoom in at the pointer, and down to zoom out, up to 16×. Left-click and
   drag to pan while zoomed in; middle-click restores the whole picture.
