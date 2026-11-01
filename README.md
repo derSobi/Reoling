@@ -163,9 +163,12 @@ the release workflow (`.github/workflows/release.yml`) so that they run on
   (`reoling: GTK and GStreamer core: host` or `bundled`), and
   `REOLING_GTK_STACK=bundled` or `host` forces the choice. From the system
   it always takes glibc, GLib (whose GIO modules read the desktop's
-  settings), Mesa (OpenGL/EGL) or the NVIDIA driver's GL, the X11 or
-  Wayland client libraries, fontconfig and the fonts, PulseAudio or
-  PipeWire (`pipewire-pulse`) or ALSA for sound, `libva` (the FFmpeg
+  settings), Mesa (OpenGL/EGL) or the NVIDIA driver's GL, the core X11
+  client libraries (`libX11`, `libX11-xcb`, `libxcb`) and
+  `libwayland-client` (GTK links `libX11` and `libwayland-client`, and
+  Reoling `libwayland-client` too, so a session needs them on X11 and on
+  Wayland alike), fontconfig and the fonts, PulseAudio or PipeWire
+  (`pipewire-pulse`) or ALSA for sound, `libva` (the FFmpeg
   libraries behind the software decoders need it too, with `libva-drm` and
   `libva-x11`; any of them the system lacks comes from the AppImage), the
   hardware decoding driver — NVIDIA's `libcuda`/`libnvcuvid` for NVDEC, or

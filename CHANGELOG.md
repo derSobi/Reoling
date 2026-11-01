@@ -34,8 +34,8 @@ built as 1.0.1's were.
   doing, each built from a fresh read of the tab; a Display Save also
   sends the flow-data overlay switched off, as that app does. Every
   other row outside Encoding stays read-only, and on an NVR's cameras or
-  a camera added on its own only Encoding can be changed, as before. The
-  README's [camera settings entry](README.md#status) has the details.
+  a camera added on its own only Encoding can be changed, as before.
+  [docs/FEATURES.md](docs/FEATURES.md) has the details.
 - A save that goes on with the settings window closed is given up when
   the camera's live video stops (Stop, the Playback page) or the
   connection is lost; when the window is opened again for that camera,
