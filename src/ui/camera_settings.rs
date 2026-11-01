@@ -58,6 +58,10 @@ struct EditTab {
     awaited: Option<u64>,
     /// The footer line on this tab.
     status: String,
+    /// Its save was given up while the window was closed: what the tab
+    /// says once the window is opened again for its channel (see
+    /// `reopened`).
+    dropped: Option<&'static str>,
 }
 
 impl EditTab {
@@ -83,6 +87,44 @@ impl EditTab {
     fn saving(&self) -> bool {
         self.refreshing || self.run.is_some()
     }
+
+    /// A save or re-read under way is given up, the tab saying `reason`;
+    /// whether it had one.
+    fn give_up(&mut self, reason: &str) -> bool {
+        let had = self.run.take().is_some() || self.rereading || self.refreshing;
+        if had {
+            self.status = reason.to_string();
+        }
+        self.refreshing = false;
+        self.rereading = false;
+        self.awaited = None;
+        self.check.clear();
+        had
+    }
+
+    /// The same while the window is closed: a save given up says `note`
+    /// once the window is opened again (a re-read after a save that was
+    /// over is only given up, as before).
+    fn give_up_closed(&mut self, note: &'static str) {
+        if self.saving() {
+            self.dropped = Some(note);
+        }
+        self.give_up(note);
+    }
+
+    /// What the tab says when the window is opened again for its channel,
+    /// which drops its save and its edits; `None` when it had neither.
+    fn reopened(&self) -> Option<&'static str> {
+        if self.saving() {
+            Some(SAVE_DROPPED)
+        } else if self.dropped.is_some() {
+            self.dropped
+        } else if !self.edits.is_empty() {
+            Some(UNSAVED_DROPPED)
+        } else {
+            None
+        }
+    }
 }
 
 /// A Save's read first had no answer for what it writes.
@@ -104,6 +146,13 @@ const UNSAVED_DROPPED: &str = "Unsaved changes dropped.";
 /// out on it, is gone.
 const RELOGIN_DROPPED: &str =
     "The device is logging in again; what was not sent yet was dropped. Reload to see what the camera has.";
+/// The live video was stopped (Stop, the Playback page) while the window
+/// was closed during a save.
+const STOPPED_DURING_SAVE: &str =
+    "Live video was stopped during a save: what was not sent yet was dropped. The tab shows what the camera has.";
+/// The connection was lost while the window was closed during a save.
+const LOST_DURING_SAVE: &str =
+    "The connection was lost during a save: what was not sent yet was dropped. The tab shows what the camera has.";
 
 /// The stack name of the Encoding tab; the read-only tabs go by `page_name`.
 const ENCODING_TAB: &str = "encoding";
@@ -453,23 +502,12 @@ impl CameraSettings {
     ) {
         // Opened again for the same camera: a save still under way is given
         // up (what it has not sent yet is dropped) and unsaved edits go, each
-        // such tab saying so (the tab is read again when shown). A save's
-        // state could also be left over from a connection lost while the
-        // window was closed. Another camera's edits go without a word.
+        // such tab saying so (the tab is read again when shown); a tab whose
+        // save was given up while the window was closed says why (see
+        // `EditTab::reopened`). Another camera's edits go without a word.
         let dropped: Vec<(CameraPage, &str)> = if self.is_for(key, channel) {
             let tabs = self.edit_tabs.borrow();
-            tabs.iter()
-                .filter_map(|(page, t)| {
-                    let status = if t.saving() {
-                        SAVE_DROPPED
-                    } else if !t.edits.is_empty() {
-                        UNSAVED_DROPPED
-                    } else {
-                        return None;
-                    };
-                    Some((*page, status))
-                })
-                .collect()
+            tabs.iter().filter_map(|(page, t)| Some((*page, t.reopened()?))).collect()
         } else {
             Vec::new()
         };
@@ -926,7 +964,8 @@ impl CameraSettings {
     }
 
     /// Whether the window was last opened for this device's (by key)
-    /// `channel`, on screen or not (a save goes on while it is closed).
+    /// `channel`, on screen or not (a save goes on while it is closed, as
+    /// long as the channel's live video plays).
     pub fn is_for(&self, key: &str, channel: u8) -> bool {
         self.key.borrow().as_deref() == Some(key) && self.channel.get() == Some(channel)
     }
@@ -981,16 +1020,38 @@ impl CameraSettings {
     fn give_up_saves(&self, reason: &str) -> Vec<CameraPage> {
         let mut given_up = Vec::new();
         for (page, tab) in self.edit_tabs.borrow_mut().iter_mut() {
-            if tab.run.take().is_some() || tab.rereading || tab.refreshing {
-                tab.status = reason.to_string();
+            if tab.give_up(reason) {
                 given_up.push(*page);
             }
-            tab.refreshing = false;
-            tab.rereading = false;
-            tab.awaited = None;
-            tab.check.clear();
         }
         given_up
+    }
+
+    /// The watched channel's live video was stopped (the Stop button, the
+    /// Playback page) while the window was closed: a save of the device's
+    /// (by key) under way is given up, as `live_stopped` does on screen. Its
+    /// answers would no longer be taken, so it would wait for good.
+    pub fn stopped_while_closed(&self, key: &str) {
+        self.give_up_closed(key, STOPPED_DURING_SAVE);
+    }
+
+    /// The watched channel's connection is gone while the window was
+    /// closed: a save of the device's (by key) under way is given up, as
+    /// `lost` does on screen. Nothing answers it any more.
+    pub fn lost_while_closed(&self, key: &str) {
+        self.give_up_closed(key, LOST_DURING_SAVE);
+    }
+
+    /// A closed window's save for device `key` is given up, each such tab
+    /// saying `note` once the window is opened again for its channel (see
+    /// `EditTab::reopened`); nothing is drawn now.
+    fn give_up_closed(&self, key: &str, note: &'static str) {
+        if self.window.is_visible() || self.key.borrow().as_deref() != Some(key) {
+            return;
+        }
+        for tab in self.edit_tabs.borrow_mut().values_mut() {
+            tab.give_up_closed(note);
+        }
     }
 
     /// The device (by key) logs in again, with a new login: its old
@@ -1268,6 +1329,7 @@ fn describe(s: &StreamEncoding) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reoling::{CameraInfoPage, ReadFailure};
 
     #[test]
     fn only_the_awaited_read_ends_a_tabs_wait() {
@@ -1294,5 +1356,60 @@ mod tests {
         let mut tab = EditTab::default();
         assert!(tab.ends_wait(3));
         assert!(!tab.busy());
+    }
+
+    #[test]
+    fn a_save_given_up_with_the_window_closed_says_so_when_it_opens() {
+        // Two edits whose save has its first group out.
+        let page = SettingsPage::CameraInfo { channel: 1, page: CameraInfoPage { version: Err(ReadFailure::NoReply) } };
+        let mut edits = Edits::default();
+        edits.set(Edit::DateShown(false), &page);
+        edits.set(Edit::Watermark(true), &page);
+        let groups = vec![
+            settings_edit::WriteGroup { writes: Vec::new(), edits: vec![Edit::DateShown(false)] },
+            settings_edit::WriteGroup { writes: Vec::new(), edits: vec![Edit::Watermark(true)] },
+        ];
+        let target = SettingsTarget::Camera { channel: 1, page: CameraPage::Display };
+        let (mut run, _) = SaveRun::start(target, groups).expect("a first group");
+        run.sent_as(5);
+        // Stop or the Playback page with the window closed: the save is
+        // given up, and the tab says why when the window is opened again.
+        let mut tab = EditTab { edits: edits.clone(), run: Some(run.clone()), ..EditTab::default() };
+        assert_eq!(tab.reopened(), Some(SAVE_DROPPED));
+        tab.give_up_closed(STOPPED_DURING_SAVE);
+        assert!(tab.run.is_none() && !tab.busy());
+        assert_eq!(tab.reopened(), Some(STOPPED_DURING_SAVE));
+        // The connection lost after that: nothing is left to give up, the
+        // first reason stays.
+        tab.give_up_closed(LOST_DURING_SAVE);
+        assert_eq!(tab.reopened(), Some(STOPPED_DURING_SAVE));
+        // The read a Save makes first counts as the save too.
+        let mut tab = EditTab { edits: edits.clone(), refreshing: true, awaited: Some(4), ..EditTab::default() };
+        tab.give_up_closed(LOST_DURING_SAVE);
+        assert!(!tab.busy());
+        assert_eq!(tab.awaited, None);
+        assert_eq!(tab.reopened(), Some(LOST_DURING_SAVE));
+        // The read after a save that was over is only given up: the window
+        // opened again says what it said before.
+        let check = vec![Edit::DateShown(false)];
+        let mut tab =
+            EditTab { edits: edits.clone(), rereading: true, awaited: Some(9), check, ..EditTab::default() };
+        tab.give_up_closed(STOPPED_DURING_SAVE);
+        assert!(!tab.busy() && tab.check.is_empty());
+        assert_eq!(tab.reopened(), Some(UNSAVED_DROPPED));
+        // With nothing under way the reopened tab says what it said before.
+        let mut tab = EditTab { edits: edits.clone(), ..EditTab::default() };
+        tab.give_up_closed(STOPPED_DURING_SAVE);
+        assert_eq!(tab.reopened(), Some(UNSAVED_DROPPED));
+        let mut tab = EditTab::default();
+        tab.give_up_closed(STOPPED_DURING_SAVE);
+        assert_eq!(tab.reopened(), None);
+        // On screen (`lost`, `live_stopped`) the tab says why at once, and
+        // opening the window again drops its edits as before.
+        let mut tab = EditTab { edits, run: Some(run), ..EditTab::default() };
+        assert!(tab.give_up("Not connected: placeholder"));
+        assert_eq!(tab.status, "Not connected: placeholder");
+        assert!(!tab.busy());
+        assert_eq!(tab.reopened(), Some(UNSAVED_DROPPED));
     }
 }
