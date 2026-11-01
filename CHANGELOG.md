@@ -2,6 +2,54 @@
 
 All notable changes of Reoling, newest first.
 
+## 1.0.3 — 2026-11-01
+
+`reoling_1.0.3-1_amd64.deb` and `Reoling-1.0.3-x86_64.AppImage`,
+built as 1.0.2's were.
+
+- Fullscreen: the controls lie under the picture and are as wide as it,
+  not across the whole screen. On a 5120 × 1440 monitor a 16:9 picture
+  shows 2560 px wide in the middle, and the buttons sat about 1280 px
+  beside it. Where the picture is narrower than the controls (a portrait
+  stream, or 4:3 on a small screen) they keep their own width, centred
+  under it. A picture as wide as the screen or within 2% of it, and
+  Stretch Mode, keep the full-width bar. Beside a narrower bar the
+  pointer is over the video: the bar hides after 2.5 s there, a
+  double-click leaves fullscreen and a middle click shows the whole
+  picture again. While a new stream starts, the bar stays where the
+  last picture was; when a stream of another shape shows, it narrows or
+  widens about its centre.
+- On X11 every Reoling window has the `WM_CLASS` `de.dersobi.reoling`,
+  the `StartupWMClass` of its desktop entries, in place of `reoling`, so
+  a dock or panel that matches windows on it can show Reoling's icon and
+  group the windows with the launcher. On Wayland the main window had
+  this app id already; Camera control, the settings windows and the
+  dialogs now have it too. The accessible application name is
+  `de.dersobi.reoling` as well (it was `reoling`), and GLib and GTK
+  warnings in the terminal start with `(de.dersobi.reoling:PID)`.
+- A connection that stays up for days keeps reading what the device
+  sends. Every request takes the next of 65535 numbers; with a device
+  idle and a keep-alive every 6 s, the count came round after about 4.5
+  days, to 0 and to the subscription's number, under which the device
+  sends channel lists and alarm events of its own: a live stream started
+  under one of them would have left those unread. The count now skips
+  them and the last live stream's number, and a number given out again
+  starts clean: its answer is decrypted, and a preset's or Monitor
+  Point's picture is made of its own bytes only. Tests run the count
+  round; no device has been connected that long.
+- The .deb also installs docs/FEATURES.md, in
+  `/usr/share/doc/reoling/docs`, so the README's link to it works in the
+  installed copy.
+- The GTK 4 sink plugin in the .deb and in the AppImage is stripped,
+  about a third smaller; lintian no longer reports it as unstripped.
+  `scripts/build-gst-gtk4-plugin.sh` strips what it builds.
+- Building from source: `Cargo.toml` names Rust 1.88 as the minimum
+  (the locked dependencies have needed it since 1.0.0; it said 1.75),
+  and `scripts/build-gst-gtk4-plugin.sh` needs Rust 1.92 or newer.
+- README: it names the libraries the AppImage takes from the system,
+  as 1.0.2's AppImage did too: `libX11`, `libX11-xcb`, `libxcb` and
+  `libwayland-client`, on X11 and on Wayland alike.
+
 ## 1.0.2 — 2026-11-01
 
 `reoling_1.0.2-1_amd64.deb` and `Reoling-1.0.2-x86_64.AppImage`,
