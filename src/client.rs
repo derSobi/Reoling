@@ -151,6 +151,13 @@ pub fn looks_multi_channel(name: &str, model: &str) -> bool {
 /// without: the name is a nicety, the video must not wait for it.
 const IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long the session may carry no BC message before `wait_for_pushes`
+/// sends `MSG_ID_LINK_TYPE`, and then how often while none comes: about the
+/// official app's own period while it streams nothing. A Home Hub Pro ends a
+/// session that carried no BC message for about 62 s (BCUDP acks do not
+/// count, device pushes do).
+const IDLE_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(6);
+
 /// Which of the device's streams to request in `start_video`. `Main` is
 /// full resolution/bitrate; `Sub` is the lowest-bitrate one; `Extern` sits
 /// between them on many cameras (on some it is another lens). Which of them
@@ -239,6 +246,10 @@ pub struct ReolinkClient {
     /// `download_range`).
     download_task: Option<tokio::task::JoinHandle<replay::DownloadSummary>>,
     download_cancel: Option<replay::DownloadCancel>,
+    /// When `wait_for_pushes` last sent `MSG_ID_LINK_TYPE`, so that a device
+    /// leaving it unanswered gets the next one `IDLE_KEEPALIVE` later, not
+    /// at once.
+    keepalive_sent: Option<tokio::time::Instant>,
 }
 
 /// What an in-flight request was asking for: a `MSG_ID_IMAGE_FILE` request
@@ -736,6 +747,7 @@ impl ReolinkClient {
             event_search_unanswered: false,
             download_task: None,
             download_cancel: None,
+            keepalive_sent: None,
         }
     }
 
@@ -1825,7 +1837,16 @@ impl ReolinkClient {
     /// Reads whatever the device sends while no video is running (pushed
     /// channel lists, alarm events), forwarding channel lists to
     /// `take_channel_updates`. Returns only when the connection fails.
-    /// Cancel-safe: partial messages are kept by the connection.
+    /// Cancel-safe: partial messages are kept by the connection. Dropped
+    /// while sending the keep-alive, it skips that one or uses up a message
+    /// number; nothing else is lost.
+    ///
+    /// Once the connection has carried no BC message for `IDLE_KEEPALIVE`,
+    /// sends a bodiless `MSG_ID_LINK_TYPE`, and another each
+    /// `IDLE_KEEPALIVE` for as long as nothing comes, as the official app
+    /// does while it streams nothing: a Home Hub ends a session that stays
+    /// silent for about a minute. Any message (the answer, a push, data of
+    /// another reader) starts the wait over; the answer itself is dropped.
     pub async fn wait_for_pushes(&mut self) -> crate::Error {
         // While a playback runs, its reader is the one reading (and passes
         // the pushes on); reading here as well would take its data.
@@ -1834,15 +1855,32 @@ impl ReolinkClient {
         }
         let mut image_chunks = HashMap::new();
         loop {
-            let received = self.connection.lock().await.recv_bc(&self.encryption).await;
+            // The quiet time is kept by the connection and the client, not
+            // by this call: the caller drops it and calls again whenever
+            // something else needs the client.
+            let received = {
+                let mut connection = self.connection.lock().await;
+                let quiet_since = match self.keepalive_sent {
+                    Some(sent) => sent.max(connection.last_received()),
+                    None => connection.last_received(),
+                };
+                tokio::time::timeout_at(quiet_since + IDLE_KEEPALIVE, connection.recv_bc(&self.encryption)).await
+            };
             match received {
-                Ok(bc) => {
+                Ok(Ok(bc)) => {
                     if let Some(update) = pushed_update(&bc, &mut image_chunks, &self.pending_images, &self.channel_uids) {
                         let _ = self.channel_updates_tx.send(update);
                     }
                 }
-                Err(Error::ReplyTimeout) => {}
-                Err(e) => return e,
+                Ok(Err(Error::ReplyTimeout)) => {}
+                Ok(Err(e)) => return e,
+                Err(_) => {
+                    // Under a number of its own, like every request (a
+                    // settings answer is routed by its number). A send that
+                    // fails is not retried before the next period.
+                    let _ = self.send_empty_request(MSG_ID_LINK_TYPE).await;
+                    self.keepalive_sent = Some(tokio::time::Instant::now());
+                }
             }
         }
     }
@@ -2210,5 +2248,247 @@ mod control_tests {
         assert!(!edit.contains("<command>"));
         let save = String::from_utf8(preset_full_xml(0, 0, Some("setPos"), "Test5", true)).unwrap();
         assert!(save.contains("<id>0</id><command>setPos</command><name>Test5</name><imageName>preset_00</imageName>"));
+    }
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::net::UdpSocket;
+    use tokio::time::Instant;
+
+    const PLAIN: EncryptionProtocol = EncryptionProtocol::Unencrypted;
+
+    /// A client and the device end of a loopback BCUDP connection, both
+    /// unencrypted (no login), relay-style (no `C2D_HB`).
+    async fn client_and_device() -> (ReolinkClient, BcConnection) {
+        let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let device_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_addr = client_socket.local_addr().unwrap();
+        let device_addr = device_socket.local_addr().unwrap();
+        let peer = |addr, local_connection_id, remote_connection_id| PeerHandle {
+            addr,
+            local_connection_id,
+            remote_connection_id,
+            nonce: None,
+            is_direct: false,
+        };
+        let device = BcConnection::new(device_socket, peer(client_addr, 2, 1));
+        let client = ReolinkClient::from_connection(
+            BcConnection::new(client_socket, peer(device_addr, 1, 2)),
+            EncryptionProtocol::Unencrypted,
+        );
+        (client, device)
+    }
+
+    fn device_message(
+        msg_id: u32,
+        msg_num: u16,
+        code: u16,
+        extension: Option<Vec<u8>>,
+        payload: Option<Vec<u8>>,
+    ) -> Bc {
+        Bc {
+            meta: BcMeta { msg_id, channel_id: 0, stream_type: 0, msg_num, response_code: code, class: 0x0000 },
+            body: BcBody::Modern(ModernMsg { extension_xml: extension, payload }),
+        }
+    }
+
+    /// The answer as captured: 200 and a `LinkType` body naming the link,
+    /// 109 bytes long like the captured one.
+    fn link_type_reply(msg_num: u16) -> Bc {
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<LinkType version=\"1.1\">\n\
+                   <type>LAN</type>\n</LinkType>\n</body>\n";
+        assert_eq!(xml.len(), 109);
+        device_message(MSG_ID_LINK_TYPE, msg_num, 200, None, Some(xml.as_bytes().to_vec()))
+    }
+
+    /// An alarm-event push (33), which nothing in the client reads.
+    fn alarm_push() -> Bc {
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<AlarmEventList version=\"1.1\">\n\
+                   </AlarmEventList>\n</body>\n";
+        device_message(33, 0, 200, None, Some(xml.as_bytes().to_vec()))
+    }
+
+    /// Reoling's own bodiless request: channel 0, no Extension, no body.
+    fn assert_link_type_request(bc: &Bc) {
+        assert_eq!(bc.meta.msg_id, MSG_ID_LINK_TYPE);
+        assert_eq!((bc.meta.channel_id, bc.meta.stream_type, bc.meta.class), (0, 0, 0x6414));
+        assert_ne!(bc.meta.msg_num, 0);
+        assert!(matches!(&bc.body, BcBody::Modern(ModernMsg { extension_xml: None, payload: None })), "{:?}", bc.body);
+    }
+
+    #[track_caller]
+    fn assert_about_6_s(from: Instant, to: Instant) {
+        let waited = to - from;
+        assert!(waited >= IDLE_KEEPALIVE && waited < IDLE_KEEPALIVE + Duration::from_millis(500), "{waited:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_session_asks_for_the_link_type_every_6_s() {
+        let (mut client, mut device) = client_and_device().await;
+        let mut updates = client.take_channel_updates().unwrap();
+        let start = Instant::now();
+        let fake = async move {
+            let first = device.recv_bc(&PLAIN).await.unwrap();
+            assert_about_6_s(start, Instant::now());
+            assert_link_type_request(&first);
+            device.send_bc(&link_type_reply(first.meta.msg_num), &PLAIN).await.unwrap();
+            let replied = Instant::now();
+
+            let second = device.recv_bc(&PLAIN).await.unwrap();
+            let asked = Instant::now();
+            assert_about_6_s(replied, asked);
+            assert_link_type_request(&second);
+            assert_eq!(second.meta.msg_num, first.meta.msg_num + 1);
+
+            // Left unanswered, the next one still waits its 6 s, counted
+            // from when the client sent the last one (which reached the
+            // device a little later).
+            let third = device.recv_bc(&PLAIN).await.unwrap();
+            assert_about_6_s(asked - Duration::from_millis(100), Instant::now());
+            assert_link_type_request(&third);
+        };
+        tokio::select! {
+            error = client.wait_for_pushes() => panic!("wait_for_pushes ended: {error}"),
+            () = fake => {}
+        }
+        assert!(updates.try_recv().is_err(), "the answer is dropped");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_sent_while_messages_come_more_often_than_every_6_s() {
+        let (mut client, mut device) = client_and_device().await;
+        let fake = async move {
+            for _ in 0..8 {
+                let quiet = tokio::time::timeout(Duration::from_secs(5), device.recv_bc(&PLAIN)).await;
+                assert!(quiet.is_err(), "sent while pushes came: {:?}", quiet.map(|r| r.map(|bc| bc.meta)));
+                device.send_bc(&alarm_push(), &PLAIN).await.unwrap();
+            }
+            let pushed = Instant::now();
+            let asked = device.recv_bc(&PLAIN).await.unwrap();
+            assert_about_6_s(pushed, Instant::now());
+            assert_link_type_request(&asked);
+        };
+        tokio::select! {
+            error = client.wait_for_pushes() => panic!("wait_for_pushes ended: {error}"),
+            () = fake => {}
+        }
+    }
+
+    /// The caller (the device's task in the UI) drops `wait_for_pushes` and
+    /// calls it again whenever another of its events comes; that must not
+    /// put the request off.
+    #[tokio::test(start_paused = true)]
+    async fn calling_again_does_not_start_the_wait_over() {
+        let (mut client, mut device) = client_and_device().await;
+        let start = Instant::now();
+        let fake = async move {
+            let asked = device.recv_bc(&PLAIN).await.unwrap();
+            assert_about_6_s(start, Instant::now());
+            assert_link_type_request(&asked);
+        };
+        let restarted = async {
+            loop {
+                let _ = tokio::time::timeout(Duration::from_millis(700), client.wait_for_pushes()).await;
+            }
+        };
+        tokio::select! {
+            () = restarted => unreachable!(),
+            () = fake => {}
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_message_another_reader_took_counts_too() {
+        let (mut client, mut device) = client_and_device().await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        device.send_bc(&alarm_push(), &PLAIN).await.unwrap();
+        // As live video's reader, or a search waiting for its answer, would.
+        client.connection.lock().await.recv_bc(&PLAIN).await.unwrap();
+        let read = Instant::now();
+        let fake = async move {
+            let asked = device.recv_bc(&PLAIN).await.unwrap();
+            assert_about_6_s(read, Instant::now());
+            assert_link_type_request(&asked);
+        };
+        tokio::select! {
+            error = client.wait_for_pushes() => panic!("wait_for_pushes ended: {error}"),
+            () = fake => {}
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_image_whose_chunks_are_more_than_6_s_apart_is_still_put_together() {
+        let (mut client, mut device) = client_and_device().await;
+        let mut updates = client.take_channel_updates().unwrap();
+        client.query_monitor_point_image(0).await;
+        let chunk = |msg_num: u16, code: u16, bytes: Option<&[u8]>| {
+            let binary = Extension { version: XML_VERSION.to_string(), binary_data: Some(1), ..Default::default() };
+            device_message(MSG_ID_IMAGE_FILE, msg_num, code, Some(binary.to_bytes()), bytes.map(<[u8]>::to_vec))
+        };
+        let fake = async move {
+            let request = device.recv_bc(&PLAIN).await.unwrap();
+            assert_eq!(request.meta.msg_id, MSG_ID_IMAGE_FILE);
+            let image = request.meta.msg_num;
+            device.send_bc(&chunk(image, 200, Some(&[0xff, 0xd8, 1, 2])), &PLAIN).await.unwrap();
+            let first = Instant::now();
+            let asked = device.recv_bc(&PLAIN).await.unwrap();
+            assert_about_6_s(first, Instant::now());
+            assert_link_type_request(&asked);
+            device.send_bc(&link_type_reply(asked.meta.msg_num), &PLAIN).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            device.send_bc(&chunk(image, 200, Some(&[3, 4, 0xff, 0xd9])), &PLAIN).await.unwrap();
+            // Any code other than 200 ends the transfer.
+            device.send_bc(&chunk(image, 201, None), &PLAIN).await.unwrap();
+            match updates.recv().await {
+                Some(DeviceUpdate::MonitorPointImage { channel_id: 0, jpeg }) => {
+                    assert_eq!(jpeg, vec![0xff, 0xd8, 1, 2, 3, 4, 0xff, 0xd9]);
+                }
+                other => panic!("expected the image, got {other:?}"),
+            }
+        };
+        tokio::select! {
+            error = client.wait_for_pushes() => panic!("wait_for_pushes ended: {error}"),
+            () = fake => {}
+        }
+    }
+
+    /// 30 s without a request while the task behind `end` runs, then one at
+    /// once when it ends: nothing has come for far more than 6 s by then (in
+    /// a real session the task's own data count).
+    async fn quiet_until_ended(mut client: ReolinkClient, mut device: BcConnection, end: tokio::task::AbortHandle) {
+        let fake = async move {
+            // `recv_bc` gives up after 15 s with nothing at all.
+            for _ in 0..2 {
+                assert!(matches!(device.recv_bc(&PLAIN).await, Err(Error::ReplyTimeout)), "sent while it ran");
+            }
+            end.abort();
+            let asked = tokio::time::timeout(Duration::from_secs(1), device.recv_bc(&PLAIN)).await;
+            assert_link_type_request(&asked.expect("asked once it had ended").unwrap());
+        };
+        tokio::select! {
+            error = client.wait_for_pushes() => panic!("wait_for_pushes ended: {error}"),
+            () = fake => {}
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_sent_while_a_playback_runs() {
+        let (mut client, device) = client_and_device().await;
+        let playback = tokio::spawn(std::future::pending::<()>());
+        let end = playback.abort_handle();
+        client.replay_task = Some(playback);
+        quiet_until_ended(client, device, end).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_sent_while_a_download_runs() {
+        let (mut client, device) = client_and_device().await;
+        let download = tokio::spawn(std::future::pending::<replay::DownloadSummary>());
+        let end = download.abort_handle();
+        client.download_task = Some(download);
+        quiet_until_ended(client, device, end).await;
     }
 }

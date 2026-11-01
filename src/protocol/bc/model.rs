@@ -58,6 +58,12 @@ pub const MSG_ID_STREAM_INFO: u32 = 146;
 pub const MSG_ID_SUBSCRIBE: u32 = 192;
 /// Pushed by NVRs / Home Hubs: the channel list. Not requestable.
 pub const MSG_ID_CHANNEL_INFO: u32 = 145;
+/// Bodiless request the official app sends about every 6 s while it streams
+/// nothing, to a Home Hub and an NVR alike (seen in our captures). The
+/// device answers 200 with a `LinkType` body naming its network link (`LAN`
+/// in our captures, relay sessions included). Reoling sends it to keep an
+/// idle session open.
+pub const MSG_ID_LINK_TYPE: u32 = 93;
 
 /// Opens a recorded file for playback, by the `Id` a file search returned,
 /// right after a `MSG_ID_REPLAY_SEEK`. There is no XML reply. The device

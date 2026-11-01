@@ -293,6 +293,10 @@ pub struct BcConnection {
     // stream — see `read_bc`'s own doc comment for why this matters for
     // decryption of the chunks that follow.
     bin_mode: HashSet<u16>,
+    /// When `recv_bc` last returned a message, whichever reader asked (or
+    /// when the connection was made). BCUDP acks and discovery packets
+    /// leave it alone. See `last_received`.
+    last_received: tokio::time::Instant,
 }
 
 impl BcConnection {
@@ -314,6 +318,7 @@ impl BcConnection {
             socket: Socket::Udp { socket, peer, send_state, rx, rx_task, replay_buffering },
             reassembly: Vec::new(),
             bin_mode: HashSet::new(),
+            last_received: tokio::time::Instant::now(),
         }
     }
 
@@ -415,6 +420,7 @@ impl BcConnection {
             socket: Socket::Tcp { stream },
             reassembly: Vec::new(),
             bin_mode: HashSet::new(),
+            last_received: tokio::time::Instant::now(),
         }
     }
 
@@ -488,12 +494,23 @@ impl BcConnection {
         // A message already fully reassembled from a previous call?
         if let Some((bc, used)) = read_bc(&self.reassembly, enc, &mut self.bin_mode)? {
             self.reassembly.drain(..used);
+            self.last_received = tokio::time::Instant::now();
             return Ok(bc);
         }
 
-        tokio::time::timeout(RECV_TIMEOUT, self.recv_bc_loop(enc))
+        let bc = tokio::time::timeout(RECV_TIMEOUT, self.recv_bc_loop(enc))
             .await
-            .map_err(|_| Error::ReplyTimeout)?
+            .map_err(|_| Error::ReplyTimeout)??;
+        self.last_received = tokio::time::Instant::now();
+        Ok(bc)
+    }
+
+    /// When `recv_bc` last returned a message, whichever task was reading
+    /// (live video's reader included), or when the connection was made if
+    /// none has come yet. What keeps an idle session open is measured from
+    /// it (see `ReolinkClient::wait_for_pushes`).
+    pub(crate) fn last_received(&self) -> tokio::time::Instant {
+        self.last_received
     }
 
     async fn recv_bc_loop(&mut self, enc: &EncryptionProtocol) -> crate::Result<Bc> {
