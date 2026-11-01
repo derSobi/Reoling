@@ -1251,9 +1251,9 @@ pub(super) fn settings_reply(bc: &Bc, pending: &Mutex<HashMap<u16, ImageKind>>) 
 }
 
 /// A request is about to go out under `msg_num`, a number that comes round
-/// again after 65536 requests: whatever an unanswered read of long ago left
-/// under it goes, so the new request's reply is routed as its own and not
-/// taken for the old read's (the two can share an id: the Light & sound
+/// again after about 65535 requests: whatever an unanswered read of long ago
+/// left under it goes, so the new request's reply is routed as its own and
+/// not taken for the old read's (the two can share an id: the Light & sound
 /// page reads 56, as the Encoding tab's query does).
 pub(super) fn number_reused(pending: &Mutex<HashMap<u16, ImageKind>>, msg_num: u16) {
     lock(pending).remove(&msg_num);
