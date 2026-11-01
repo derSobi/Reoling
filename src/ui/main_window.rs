@@ -2054,8 +2054,10 @@ impl MainWindow {
                 }
             },
             // A save goes on while the camera window is closed: its next
-            // group still goes out (the window drops the save when it is
-            // opened anew).
+            // group still goes out while the live video plays (the window
+            // drops the save when it is opened anew). Stop, the Playback page
+            // and a lost connection give it up (see `stop`, `suspend_live`
+            // and `lost_playing`): its answers would no longer come here.
             DeviceEvent::SettingsWritten { target, group, results } => {
                 if let SettingsTarget::Camera { channel, .. } = target {
                     if self.playing_key().as_deref() == Some(key) && self.camera_settings.is_for(key, channel) {
@@ -2107,9 +2109,12 @@ impl MainWindow {
         self.streaming.set(false);
         self.update_controls();
         // The camera window reads over the watched channel's connection:
-        // none is watched now (the device itself stays connected).
+        // none is watched now (the device itself stays connected). Closed,
+        // it gives up a save under way, whose answers are no longer taken.
         if self.camera_settings.is_visible() {
             self.camera_settings.live_stopped();
+        } else {
+            self.camera_settings.stopped_while_closed(&key);
         }
     }
 
@@ -2167,6 +2172,8 @@ impl MainWindow {
             self.update_controls();
             if self.camera_settings.is_visible() {
                 self.camera_settings.lost(reason);
+            } else {
+                self.camera_settings.lost_while_closed(key);
             }
         }
     }
@@ -2316,7 +2323,7 @@ impl MainWindow {
         self.audio.reset();
         *self.playing.borrow_mut() = None;
         *self.last_played.borrow_mut() = None;
-        *self.stopped.borrow_mut() = Some(key);
+        *self.stopped.borrow_mut() = Some(key.clone());
         self.streaming.set(false);
         self.persist();
         self.update_controls();
@@ -2324,6 +2331,8 @@ impl MainWindow {
         // read now, while the device stays connected.
         if self.camera_settings.is_visible() {
             self.camera_settings.live_stopped();
+        } else {
+            self.camera_settings.stopped_while_closed(&key);
         }
     }
 
