@@ -129,20 +129,26 @@ answers first.
   RLC-1224A it is noise reduction on Light & sound, with its level
   (1 to 5, locked while noise reduction is off). Each of these rows was
   confirmed working against a Home Hub Pro. Such a tab has Save and
-  Revert. Save reads the tab again first and builds its writes from that
-  read: the edited values change, every other value the read returned
-  goes back as it was, so another value changed elsewhere in the
-  meantime is kept; the parts no read returns go out as the official app
-  sends them (on Display, the flow-data overlay switched off). When
-  that read already has one of the edited values, finds a row that can
-  no longer be changed, or gets no answer, nothing is written and the
-  footer says so. The writes go one after the other, each once the one
-  before was answered 200 (an Image change is followed at once by the day
-  and night threshold, sent back unchanged as the official app does; the
-  change counts as saved once its own write is answered 200); a refusal,
-  or no answer within 10 s, stops the rest, and the changes not saved
-  stay for another Save. The tab is then read again, and the footer names
-  a saved value the camera did not keep or that could not be read back.
+  Revert. Save writes the edited rows one at a time, as the official app
+  was captured changing one value per write, in a fixed order: on Display
+  the name's position, the date, the watermark; on Image brightness, flip,
+  day and night; on Light & sound the status LED, the infrared lights, the
+  volume, noise reduction and its level. Before each write it reads the
+  tab again and builds that row's write from that read: only that row's
+  value changes, every other value the read returned goes back as it was,
+  so a value changed elsewhere in the meantime, or by a row written just
+  before, is kept; the parts no read returns go out as the official app
+  sends them (on Display, the flow-data overlay switched off). A row whose
+  value the camera already has when its turn comes is skipped. When the
+  read finds a row that can no longer be changed, or gets no answer for
+  the next row, nothing more is written and the footer says so. A row goes
+  once the write before it was answered 200 (an Image change is followed
+  at once by the day and night threshold, sent back unchanged as the
+  official app does; the change counts as saved once its own write is
+  answered 200); a refusal, or no answer within 10 s, stops the rest, and
+  the changes not saved stay for another Save. The tab is then read again,
+  and the footer names a saved value the camera did not keep or that could
+  not be read back.
   Revert drops the changes not saved yet, and so do Reload and the window
   opening anew (the gear button pressed again, another camera or channel,
   Play after Stop). Every other row outside Encoding stays read-only, and
@@ -183,10 +189,7 @@ answers first.
 **Not done yet**
 
 - Changing the other settings on the new pages: beyond Encoding and the
-  few camera rows above, the camera and device pages are read-only. A
-  Save of several rows that share one write (two Display rows, say) sends
-  them in one message, which the capture does not show: the official app
-  was captured changing one value per write.
+  few camera rows above, the camera and device pages are read-only.
 - Playback of several cameras at once (one camera per page today), and
   thumbnails: the device list and the recordings show names and times,
   no pictures.

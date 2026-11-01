@@ -1048,16 +1048,15 @@ fn page_writes(page: CameraPage) -> &'static [u32] {
 /// Whether a group of writes may go out for `target` on a device of `kind`:
 /// a camera page of a Home Hub (the only device the writes were captured
 /// on), every write one of `CAPTURED_WRITES` that page sends, for that
-/// page's channel, and the picture's writes only as the official app sends
-/// them: the 25, then its 297.
+/// page's channel, and one write, or the picture's two as the official app
+/// sends them: the 25, then its 297. A Save sends one group per edited row.
 fn sendable(target: SettingsTarget, kind: DeviceKind, writes: &[SettingsWrite]) -> bool {
     let SettingsTarget::Camera { channel, page } = target else { return false };
     let ids: Vec<u32> = writes.iter().map(|w| w.msg_id).collect();
     let pair = [MSG_ID_SET_VIDEO_INPUT, MSG_ID_SET_DAY_NIGHT_THRESHOLD];
-    let paired = !ids.iter().any(|id| pair.contains(id)) || ids == pair;
+    let shaped = ids == pair || matches!(ids.as_slice(), [id] if !pair.contains(id));
     kind == DeviceKind::Hub
-        && !writes.is_empty()
-        && paired
+        && shaped
         && writes.iter().all(|w| {
             CAPTURED_WRITES.contains(&w.msg_id) && page_writes(page).contains(&w.msg_id) && w.channel == channel
         })
@@ -1321,8 +1320,10 @@ impl ReolinkClient {
 
     /// Writes one group of settings built by `settings_write` (the picture
     /// write with its threshold echo, or one other write) for `target`'s
-    /// channel. The messages go out back to back, as the official app sends
-    /// a 25 with its 297, each with an Extension naming the channel alone.
+    /// channel: the camera window sends one group per edited row, each built
+    /// from a read made after the group before was answered. The messages
+    /// go out back to back, as the official app sends a 25 with its 297,
+    /// each with an Extension naming the channel alone.
     /// The answers come as one `DeviceUpdate::SettingsWritten` once every
     /// write has its code, or after `SETTINGS_WRITE_TIMEOUT` with `NoReply`
     /// for the rest. A group holding a write Reoling may not send (on a
@@ -1918,7 +1919,8 @@ mod tests {
         assert!(!sendable(target, hub, &[]));
         assert!(!sendable(target, hub, &[osd_write_for(2)]), "another channel");
         assert!(!sendable(device(DevicePage::LightSound), hub, &[osd_write_for(0)]), "a device page");
-        assert!(!sendable(target, hub, &[osd_write_for(1), with_id(57)]), "not one of the captured writes");
+        assert!(!sendable(target, hub, &[with_id(57)]), "not one of the captured writes");
+        assert!(!sendable(target, hub, &[osd_write_for(1), osd_write_for(1)]), "two writes in one group");
         // Only a Home Hub's cameras.
         for kind in [DeviceKind::Nvr, DeviceKind::Camera] {
             assert!(!sendable(target, kind, &[osd_write_for(1)]), "{kind:?}");
@@ -1930,13 +1932,16 @@ mod tests {
         assert!(!sendable(target, hub, &[with_id(MSG_ID_SET_LED_STATE)]), "a light write for the Display page");
         assert!(sendable(light, hub, &[with_id(MSG_ID_SET_LED_STATE)]));
         assert!(sendable(light, hub, &[with_id(MSG_ID_SET_AI_DENOISE)]));
+        let (led, volume) = (with_id(MSG_ID_SET_LED_STATE), with_id(MSG_ID_SET_AUDIO_CFG));
+        assert!(!sendable(light, hub, &[led, volume]), "two rows' writes in one group");
         assert!(!sendable(camera(1, CameraPage::Detection), hub, &[with_id(MSG_ID_SET_AUDIO_CFG)]));
         // The picture's writes only as the pair, the 25 first.
         let (picture, threshold) = (with_id(MSG_ID_SET_VIDEO_INPUT), with_id(MSG_ID_SET_DAY_NIGHT_THRESHOLD));
         assert!(sendable(image, hub, &[picture.clone(), threshold.clone()]));
         assert!(!sendable(image, hub, &[picture.clone()]), "a 25 without its 297");
         assert!(!sendable(image, hub, &[threshold.clone()]), "a 297 alone");
-        assert!(!sendable(image, hub, &[threshold, picture]), "the other order");
+        assert!(!sendable(image, hub, &[threshold.clone(), picture.clone()]), "the other order");
+        assert!(!sendable(image, hub, &[picture.clone(), threshold.clone(), picture, threshold]), "two pairs");
     }
 
     #[test]
@@ -1992,6 +1997,71 @@ mod tests {
         assert!(c.record(80, 200));
         let Some(DeviceUpdate::SettingsWritten { results, .. }) = c.finish_if_complete() else { panic!("complete") };
         assert_eq!(results.iter().map(|r| r.reply).collect::<Vec<_>>(), [WriteReply::Code(200), WriteReply::NotSent]);
+    }
+
+    /// The lines of `ours` that differ from `theirs` (two bodies of one
+    /// write): what `ours` changes.
+    fn changed_lines(ours: &str, theirs: &str) -> Vec<String> {
+        assert_eq!(ours.lines().count(), theirs.lines().count());
+        ours.lines().zip(theirs.lines()).filter(|(a, b)| a != b).map(|(a, _)| a.to_string()).collect()
+    }
+
+    #[test]
+    fn two_rows_of_one_write_go_as_two_writes_each_from_a_read_after_the_one_before() {
+        use crate::protocol::bc::settings_write::{osd_write, OsdChange};
+        let target = camera(1, CameraPage::Display);
+        let reads = page_reads(target, &hub());
+        let pending = Mutex::new(HashMap::new());
+        // A read of the tab under the caller's `number`, its 44 sent under
+        // `msg_num` and answered with `text`: the reply a write is built from.
+        let read = |number: u64, msg_num: u16, text: &str| -> RawBody {
+            let collector = Arc::new(Mutex::new(PageCollector { number, ..PageCollector::new(target, &reads) }));
+            lock(&collector).sent(0, msg_num);
+            lock(&pending).insert(msg_num, ImageKind::SettingsPage(Arc::clone(&collector)));
+            let Routed::Consumed(Some(DeviceUpdate::Settings { page, read })) =
+                settings_reply(&reply(44, msg_num, 200, Some(text)), &pending)
+            else {
+                panic!("the page")
+            };
+            let SettingsPage::CameraDisplay { page, .. } = page else { panic!("wrong page") };
+            assert_eq!(read, number);
+            page.osd_reply().cloned().unwrap()
+        };
+        // A write sent alone as the caller's `group` under `msg_num`, and
+        // answered 200 under that number.
+        let write = |group: u64, msg_num: u16, write: &SettingsWrite| {
+            assert!(sendable(target, DeviceKind::Hub, std::slice::from_ref(write)));
+            let collector = Arc::new(Mutex::new(WriteCollector::new(target, group, std::slice::from_ref(write))));
+            lock(&collector).sent(0, msg_num);
+            lock(&pending).insert(msg_num, ImageKind::SettingsWrite(Arc::clone(&collector)));
+            let Routed::Consumed(Some(DeviceUpdate::SettingsWritten { group: g, results, .. })) =
+                settings_reply(&reply(write.msg_id, msg_num, 200, None), &pending)
+            else {
+                panic!("the write is answered")
+            };
+            let answered = vec![WriteOutcome { msg_id: MSG_ID_SET_OSD, reply: WriteReply::Code(200) }];
+            assert_eq!((g, results), (group, answered));
+        };
+        let unchanged = |reply: &RawBody| osd_write(reply, 1, &OsdChange::default()).unwrap();
+        // The date hidden, then the watermark on: two 45s, each changing one
+        // value of the read made just before it. Reads and writes go under
+        // numbers of their own.
+        let first_read = read(1, 100, OSD_READ);
+        let hide = OsdChange { date_shown: Some(false), ..OsdChange::default() };
+        let first = osd_write(&first_read, 1, &hide).unwrap();
+        assert_eq!(changed_lines(first.body(), unchanged(&first_read).body()), ["<enable>0</enable>"]);
+        write(1, 101, &first);
+        let hidden = OSD_READ.replacen("<enable>1</enable>", "<enable>0</enable>", 1);
+        let second_read = read(2, 102, &hidden);
+        let watermark = OsdChange { watermark: Some(true), ..OsdChange::default() };
+        let second = osd_write(&second_read, 1, &watermark).unwrap();
+        assert_eq!(changed_lines(second.body(), unchanged(&second_read).body()), ["<enWatermark>1</enWatermark>"]);
+        write(2, 103, &second);
+        assert!(lock(&pending).is_empty());
+        // The date stays hidden in the second write because its read says
+        // so: built from the first read, it would show the date again.
+        let stale = osd_write(&first_read, 1, &watermark).unwrap();
+        assert_eq!(changed_lines(second.body(), stale.body()), ["<enable>0</enable>"]);
     }
 
     #[test]

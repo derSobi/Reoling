@@ -44,17 +44,19 @@ pub struct Handlers {
 #[derive(Default)]
 struct EditTab {
     edits: Edits,
-    /// Save was pressed and the tab is being read again first: the writes
-    /// are built from that read (see `set_page`).
+    /// A Save is reading the tab again, when Save was pressed or after a
+    /// row's write was answered 200: the next row's write is built from that
+    /// read (see `set_page`).
     refreshing: bool,
+    /// The Save under way, from the answer to its first read on.
     run: Option<SaveRun>,
     /// A save ended and the tab is being read again: Save waits for that
     /// read, which every next write is built from.
     rereading: bool,
     /// What the save wrote, to compare with that read.
     check: Vec<Edit>,
-    /// The number of the read the tab waits for (a Save's read first, the
-    /// read after a save, a Reload's): only its page ends the wait.
+    /// The number of the read the tab waits for (a Save's reads, the read
+    /// after a save, a Reload's): only its page ends the wait.
     awaited: Option<u64>,
     /// The footer line on this tab.
     status: String,
@@ -83,15 +85,21 @@ impl EditTab {
         true
     }
 
-    /// A Save is under way: its read first, or its writes.
+    /// A Save is under way: one of its reads, or a row's write.
     fn saving(&self) -> bool {
         self.refreshing || self.run.is_some()
     }
 
     /// A save or re-read under way is given up, the tab saying `reason`;
-    /// whether it had one.
-    fn give_up(&mut self, reason: &str) -> bool {
-        let had = self.run.take().is_some() || self.rereading || self.refreshing;
+    /// whether it had one. A save with rows left shows the rows it saved as
+    /// edits again, checked against the tab's last answer `answer` (see
+    /// `SaveRun::given_up`).
+    fn give_up(&mut self, reason: &str, answer: Option<&SettingsPage>) -> bool {
+        let run = self.run.take();
+        if let (Some(run), Some(answer)) = (&run, answer) {
+            run.given_up(&mut self.edits, answer);
+        }
+        let had = run.is_some() || self.rereading || self.refreshing;
         if had {
             self.status = reason.to_string();
         }
@@ -105,11 +113,11 @@ impl EditTab {
     /// The same while the window is closed: a save given up says `note`
     /// once the window is opened again (a re-read after a save that was
     /// over is only given up, as before).
-    fn give_up_closed(&mut self, note: &'static str) {
+    fn give_up_closed(&mut self, note: &'static str, answer: Option<&SettingsPage>) {
         if self.saving() {
             self.dropped = Some(note);
         }
-        self.give_up(note);
+        self.give_up(note, answer);
     }
 
     /// What the tab says when the window is opened again for its channel,
@@ -137,6 +145,16 @@ const CHANGED_BEFORE_SAVE: &str =
     "The camera's values changed since the tab was read; nothing was written. Check the tab and Save again.";
 /// The same, and no edit is left to save.
 const CHANGED_NOTHING_LEFT: &str = "The camera's values changed since the tab was read; nothing was written.";
+/// A Save's read after a row was saved had no answer for the next row.
+const NOT_READ_DURING_SAVE: &str =
+    "The camera did not answer the read before the next change; the rest was not written. Save to try again.";
+/// A Save's read after a row was saved showed other values than the tab did.
+const CHANGED_DURING_SAVE: &str =
+    "The camera's values changed during the save; the rest was not written. Check the tab and Save again.";
+/// The same, and no edit is left to save.
+const CHANGED_DURING_SAVE_NOTHING_LEFT: &str = "The camera's values changed during the save; the rest was not written.";
+/// Every edited row of a Save was saved, or the camera had its value.
+const SAVED: &str = "Saved (the camera answered 200).";
 /// The window was opened again while a save of its channel was under way.
 const SAVE_DROPPED: &str =
     "The window was opened again during a save: what was not sent yet was dropped. The tab shows what the camera has.";
@@ -153,6 +171,26 @@ const STOPPED_DURING_SAVE: &str =
 /// The connection was lost while the window was closed during a save.
 const LOST_DURING_SAVE: &str =
     "The connection was lost during a save: what was not sent yet was dropped. The tab shows what the camera has.";
+
+/// The footer line once a read of a Save has come: `wrote` tells whether a
+/// row of the Save was written before it, `left` whether edits are left.
+/// Before the first write a stop says nothing was written; after it, that
+/// the rest was not.
+fn save_status(next: &Refreshed, wrote: bool, left: bool) -> String {
+    match next {
+        Refreshed::Save(_) => "Saving…".to_string(),
+        Refreshed::Done => SAVED.to_string(),
+        Refreshed::NotRead if wrote => NOT_READ_DURING_SAVE.to_string(),
+        Refreshed::NotRead => NOT_READ_BEFORE_SAVE.to_string(),
+        Refreshed::Already => ALREADY_BEFORE_SAVE.to_string(),
+        Refreshed::Changed if wrote && left => CHANGED_DURING_SAVE.to_string(),
+        Refreshed::Changed if wrote => CHANGED_DURING_SAVE_NOTHING_LEFT.to_string(),
+        Refreshed::Changed if left => CHANGED_BEFORE_SAVE.to_string(),
+        Refreshed::Changed => CHANGED_NOTHING_LEFT.to_string(),
+        Refreshed::Cannot(e) if wrote => format!("Cannot save the rest: {e}."),
+        Refreshed::Cannot(e) => format!("Cannot save: {e}."),
+    }
+}
 
 /// The stack name of the Encoding tab; the read-only tabs go by `page_name`.
 const ENCODING_TAB: &str = "encoding";
@@ -577,32 +615,36 @@ impl CameraSettings {
     }
 
     /// One tab's answer to the read sent under `read`; ignored unless it is
-    /// this channel's. On a writable tab it may be the read a Save makes
-    /// first, which the writes are then built from, or the read after a
-    /// save: the edits the device now has go, and what it did not keep is
-    /// said. Either is taken only from the read the tab waits for (see
-    /// `EditTab::ends_wait`).
+    /// this channel's. On a writable tab it may be a read a Save makes before
+    /// each row's write, which that write is then built from, or the read
+    /// after a save: the edits the device now has go, and what it did not
+    /// keep is said. Either is taken only from the read the tab waits for
+    /// (see `EditTab::ends_wait`).
     pub fn set_page(&self, page: &SettingsPage, read: u64) {
         let SettingsTarget::Camera { channel, page: which } = page.target() else { return };
         if self.channel.get() != Some(channel) {
             return;
         }
         self.answers.borrow_mut().insert(which, page.clone());
-        let mut groups = None;
+        let mut writes = None;
         if settings_edit::editable_page(which) {
             let gate = self.gate();
             let mut tabs = self.edit_tabs.borrow_mut();
             let tab = tabs.entry(which).or_default();
             if tab.ends_wait(read) {
                 if std::mem::take(&mut tab.refreshing) {
-                    // The read a Save made first: the writes are built from it.
-                    match settings_edit::refreshed(&mut tab.edits, page, &gate) {
-                        Refreshed::Save(g) => groups = Some(g),
-                        Refreshed::NotRead => tab.status = NOT_READ_BEFORE_SAVE.to_string(),
-                        Refreshed::Already => tab.status = ALREADY_BEFORE_SAVE.to_string(),
-                        Refreshed::Changed if tab.edits.is_empty() => tab.status = CHANGED_NOTHING_LEFT.to_string(),
-                        Refreshed::Changed => tab.status = CHANGED_BEFORE_SAVE.to_string(),
-                        Refreshed::Cannot(e) => tab.status = format!("Cannot save: {e}."),
+                    // A read the Save made: the next row's write is built
+                    // from it. Once nothing more goes, this read is also the
+                    // one that tells what the rows saved before were kept as.
+                    let run = tab.run.get_or_insert_with(|| SaveRun::new(page.target()));
+                    let next = run.read(&mut tab.edits, page, &gate);
+                    let saved = run.saved();
+                    if let Refreshed::Save(g) = next {
+                        writes = Some(g.writes);
+                    } else {
+                        tab.run = None;
+                        tab.status = save_status(&next, !saved.is_empty(), !tab.edits.is_empty());
+                        tab.check = saved;
                     }
                 } else {
                     tab.edits.settle(page, &gate);
@@ -616,10 +658,10 @@ impl CameraSettings {
                 }
             }
         }
-        // The save goes out before the tab is drawn, so its controls come
+        // The write goes out before the tab is drawn, so its controls come
         // back turned off.
-        if let Some(groups) = groups {
-            self.send_save(which, groups);
+        if let Some(writes) = writes {
+            self.send_row(which, writes);
         }
         self.render(page);
         self.update_footer();
@@ -703,11 +745,14 @@ impl CameraSettings {
         }
     }
 
-    /// Save on a writable tab: the tab is read again first, as the official
-    /// app reads the OSD again before each OSD write, and the changed
-    /// settings go out built from that read (see `set_page`), one write (or
-    /// the picture's pair) after the other. A change made elsewhere since
-    /// the tab was shown is thus kept, not written back.
+    /// Save on a writable tab: one edited row at a time, as the official app
+    /// was captured changing one value per write. The tab is read again
+    /// first, as the official app reads the OSD again before each OSD write,
+    /// and the first row's write goes out built from that read with only
+    /// that row changed (see `set_page`); once it is answered 200 the tab is
+    /// read again for the next row (see `written`). A change made elsewhere
+    /// since the tab was shown, and a row this Save wrote before, are thus
+    /// kept, not written back.
     fn apply(&self) {
         let Some(which) = self.current_page() else { return };
         if !self.can_write() {
@@ -738,29 +783,29 @@ impl CameraSettings {
         self.update_footer();
     }
 
-    /// Sends the first group of a save built from the read before it; the
-    /// others follow as each is answered (see `written`).
-    fn send_save(&self, which: CameraPage, groups: Vec<settings_edit::WriteGroup>) {
-        let Some(channel) = self.channel.get() else { return };
-        let target = SettingsTarget::Camera { channel, page: which };
-        let status = match SaveRun::start(target, groups) {
-            None => "Nothing changed.",
-            Some((mut run, writes)) => {
-                let group = self.next_group();
-                if self.send_group(which, group, writes) {
-                    run.sent_as(group);
-                    if let Some(tab) = self.edit_tabs.borrow_mut().get_mut(&which) {
-                        tab.run = Some(run);
-                    }
-                    "Saving…"
-                } else {
-                    NOT_CONNECTED
-                }
+    /// Sends the write of a save's next row, built from the read before it;
+    /// its answer comes to `written`.
+    fn send_row(&self, which: CameraPage, writes: Vec<SettingsWrite>) {
+        let group = self.next_group();
+        let sent = self.send_group(which, group, writes);
+        let saved = {
+            let mut tabs = self.edit_tabs.borrow_mut();
+            let Some(tab) = tabs.get_mut(&which) else { return };
+            let Some(run) = tab.run.as_mut() else { return };
+            if sent {
+                run.sent_as(group);
+                tab.status = "Saving…".to_string();
+                return;
             }
+            let saved = run.saved();
+            if saved.is_empty() {
+                tab.run = None;
+                tab.status = NOT_CONNECTED.to_string();
+                return;
+            }
+            saved
         };
-        if let Some(tab) = self.edit_tabs.borrow_mut().get_mut(&which) {
-            tab.status = status.to_string();
-        }
+        self.save_ended(which, saved, NOT_CONNECTED.to_string());
     }
 
     fn next_group(&self) -> u64 {
@@ -776,8 +821,10 @@ impl CameraSettings {
         self.can_write() && (self.handlers.on_write)(&key, channel, which, group, writes)
     }
 
-    /// The device's answers to one group of a save; ignored unless they are
-    /// for the group of this channel's save that is out.
+    /// The device's answers to one write of a save; ignored unless they are
+    /// for the write of this channel's save that is out. Answered 200, the
+    /// tab is read again and the next row's write is built from that read
+    /// (see `set_page`).
     pub fn written(&self, target: SettingsTarget, group: u64, results: &[WriteOutcome]) {
         let SettingsTarget::Camera { channel, page: which } = target else { return };
         if self.channel.get() != Some(channel) {
@@ -785,27 +832,28 @@ impl CameraSettings {
         }
         let step = {
             let mut tabs = self.edit_tabs.borrow_mut();
-            let Some(run) = tabs.get_mut(&which).and_then(|t| t.run.as_mut()) else { return };
+            let Some(EditTab { run: Some(run), edits, .. }) = tabs.get_mut(&which) else { return };
             if run.target != target {
                 return;
             }
-            let Some(step) = run.answered(group, results) else { return };
+            let Some(step) = run.answered(group, results, edits) else { return };
             step
         };
         match step {
-            SaveStep::Send(writes) => {
-                let next = self.next_group();
-                if let Some(run) = self.edit_tabs.borrow_mut().get_mut(&which).and_then(|t| t.run.as_mut()) {
-                    run.sent_as(next);
+            SaveStep::ReadAgain => match self.read_page(which) {
+                Some(read) => {
+                    if let Some(tab) = self.edit_tabs.borrow_mut().get_mut(&which) {
+                        tab.refreshing = true;
+                        tab.awaited = Some(read);
+                    }
                 }
-                if !self.send_group(which, next, writes) {
+                None => {
                     let saved = self.edit_tabs.borrow().get(&which).and_then(|t| t.run.as_ref()).map(SaveRun::saved);
                     self.save_ended(which, saved.unwrap_or_default(), NOT_CONNECTED.to_string());
                 }
-            }
-            SaveStep::Done { saved } => self.save_ended(which, saved, "Saved (the camera answered 200).".to_string()),
-            SaveStep::Refused { code, msg_id, saved } => {
-                let status = settings_edit::refusal(code, msg_id, &saved);
+            },
+            SaveStep::Refused { code, msg_id, saved, row_saved } => {
+                let status = settings_edit::refusal(code, msg_id, row_saved);
                 self.save_ended(which, saved, status);
             }
             SaveStep::NoAnswer { saved } => {
@@ -972,9 +1020,9 @@ impl CameraSettings {
 
     /// Whether a tab's answer from this device (or the notice that it waits
     /// for a download) is the window's: it is on screen for that channel, or
-    /// it was closed while that tab's save (the read before it, its writes,
-    /// the read after it) or re-read is under way. A closed window takes no
-    /// other.
+    /// it was closed while that tab's save (the read before each row's
+    /// write, those writes) or re-read is under way. A closed window takes
+    /// no other.
     pub fn takes(&self, key: &str, target: SettingsTarget) -> bool {
         let SettingsTarget::Camera { channel, page } = target else { return false };
         self.is_for(key, channel)
@@ -1016,11 +1064,13 @@ impl CameraSettings {
     }
 
     /// Every save and re-read under way is given up, its tab saying
-    /// `reason`; the tabs that had one.
+    /// `reason`; the tabs that had one. A save with rows left shows the rows
+    /// it saved as edits again (see `SaveRun::given_up`).
     fn give_up_saves(&self, reason: &str) -> Vec<CameraPage> {
+        let answers = self.answers.borrow();
         let mut given_up = Vec::new();
         for (page, tab) in self.edit_tabs.borrow_mut().iter_mut() {
-            if tab.give_up(reason) {
+            if tab.give_up(reason, answers.get(page)) {
                 given_up.push(*page);
             }
         }
@@ -1049,8 +1099,9 @@ impl CameraSettings {
         if self.window.is_visible() || self.key.borrow().as_deref() != Some(key) {
             return;
         }
-        for tab in self.edit_tabs.borrow_mut().values_mut() {
-            tab.give_up_closed(note);
+        let answers = self.answers.borrow();
+        for (page, tab) in self.edit_tabs.borrow_mut().iter_mut() {
+            tab.give_up_closed(note, answers.get(page));
         }
     }
 
@@ -1329,7 +1380,7 @@ fn describe(s: &StreamEncoding) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reoling::{CameraInfoPage, ReadFailure};
+    use reoling::{OsdPosition, WriteReply};
 
     #[test]
     fn only_the_awaited_read_ends_a_tabs_wait() {
@@ -1360,32 +1411,34 @@ mod tests {
 
     #[test]
     fn a_save_given_up_with_the_window_closed_says_so_when_it_opens() {
-        // Two edits whose save has its first group out.
-        let page = SettingsPage::CameraInfo { channel: 1, page: CameraInfoPage { version: Err(ReadFailure::NoReply) } };
+        use settings_edit::tests::{display, HUB};
+        // Two edits whose save has its first row's write out, nothing of it
+        // saved yet (so the tab's last answer brings no row back; see the
+        // next test).
+        let page = display();
         let mut edits = Edits::default();
         edits.set(Edit::DateShown(false), &page);
         edits.set(Edit::Watermark(true), &page);
-        let groups = vec![
-            settings_edit::WriteGroup { writes: Vec::new(), edits: vec![Edit::DateShown(false)] },
-            settings_edit::WriteGroup { writes: Vec::new(), edits: vec![Edit::Watermark(true)] },
-        ];
         let target = SettingsTarget::Camera { channel: 1, page: CameraPage::Display };
-        let (mut run, _) = SaveRun::start(target, groups).expect("a first group");
+        let mut run = SaveRun::new(target);
+        let Refreshed::Save(first) = run.read(&mut edits, &page, &HUB) else { panic!("the date") };
+        assert_eq!(first.edit, Edit::DateShown(false));
         run.sent_as(5);
         // Stop or the Playback page with the window closed: the save is
         // given up, and the tab says why when the window is opened again.
         let mut tab = EditTab { edits: edits.clone(), run: Some(run.clone()), ..EditTab::default() };
         assert_eq!(tab.reopened(), Some(SAVE_DROPPED));
-        tab.give_up_closed(STOPPED_DURING_SAVE);
+        tab.give_up_closed(STOPPED_DURING_SAVE, Some(&page));
         assert!(tab.run.is_none() && !tab.busy());
+        assert_eq!(tab.edits, edits);
         assert_eq!(tab.reopened(), Some(STOPPED_DURING_SAVE));
         // The connection lost after that: nothing is left to give up, the
         // first reason stays.
-        tab.give_up_closed(LOST_DURING_SAVE);
+        tab.give_up_closed(LOST_DURING_SAVE, Some(&page));
         assert_eq!(tab.reopened(), Some(STOPPED_DURING_SAVE));
         // The read a Save makes first counts as the save too.
         let mut tab = EditTab { edits: edits.clone(), refreshing: true, awaited: Some(4), ..EditTab::default() };
-        tab.give_up_closed(LOST_DURING_SAVE);
+        tab.give_up_closed(LOST_DURING_SAVE, Some(&page));
         assert!(!tab.busy());
         assert_eq!(tab.awaited, None);
         assert_eq!(tab.reopened(), Some(LOST_DURING_SAVE));
@@ -1394,22 +1447,100 @@ mod tests {
         let check = vec![Edit::DateShown(false)];
         let mut tab =
             EditTab { edits: edits.clone(), rereading: true, awaited: Some(9), check, ..EditTab::default() };
-        tab.give_up_closed(STOPPED_DURING_SAVE);
+        tab.give_up_closed(STOPPED_DURING_SAVE, Some(&page));
         assert!(!tab.busy() && tab.check.is_empty());
         assert_eq!(tab.reopened(), Some(UNSAVED_DROPPED));
         // With nothing under way the reopened tab says what it said before.
         let mut tab = EditTab { edits: edits.clone(), ..EditTab::default() };
-        tab.give_up_closed(STOPPED_DURING_SAVE);
+        tab.give_up_closed(STOPPED_DURING_SAVE, Some(&page));
         assert_eq!(tab.reopened(), Some(UNSAVED_DROPPED));
         let mut tab = EditTab::default();
-        tab.give_up_closed(STOPPED_DURING_SAVE);
+        tab.give_up_closed(STOPPED_DURING_SAVE, Some(&page));
         assert_eq!(tab.reopened(), None);
         // On screen (`lost`, `live_stopped`) the tab says why at once, and
         // opening the window again drops its edits as before.
-        let mut tab = EditTab { edits, run: Some(run), ..EditTab::default() };
-        assert!(tab.give_up("Not connected: placeholder"));
+        let mut tab = EditTab { edits: edits.clone(), run: Some(run), ..EditTab::default() };
+        assert!(tab.give_up("Not connected: placeholder", Some(&page)));
         assert_eq!(tab.status, "Not connected: placeholder");
         assert!(!tab.busy());
+        assert_eq!(tab.edits, edits);
         assert_eq!(tab.reopened(), Some(UNSAVED_DROPPED));
+    }
+
+    #[test]
+    fn a_save_given_up_with_the_window_closed_between_two_rows_shows_the_saved_row_as_an_edit() {
+        use settings_edit::tests::{answer, display, HUB};
+        // A Save of two Display rows: the name's position went first and was
+        // answered 200, and the read the date's write would be built from is
+        // out.
+        let page = display();
+        let target = SettingsTarget::Camera { channel: 1, page: CameraPage::Display };
+        let mut edits = Edits::default();
+        edits.set(Edit::NamePosition(OsdPosition::TopLeft), &page);
+        edits.set(Edit::DateShown(false), &page);
+        let mut run = SaveRun::new(target);
+        let Refreshed::Save(first) = run.read(&mut edits, &page, &HUB) else { panic!("the name") };
+        assert_eq!(first.edit, Edit::NamePosition(OsdPosition::TopLeft));
+        run.sent_as(5);
+        assert_eq!(run.answered(5, &answer(&first, WriteReply::Code(200)), &mut edits), Some(SaveStep::ReadAgain));
+        assert_eq!(edits.list(), [Edit::DateShown(false)]);
+        let between = || EditTab {
+            edits: edits.clone(),
+            run: Some(run.clone()),
+            refreshing: true,
+            awaited: Some(6),
+            ..EditTab::default()
+        };
+        // Stop or the Playback page with the window closed: the tab's last
+        // answer is the read before the name's write, with the name at the
+        // bottom right, so the name shows as an edit not saved again, next to
+        // the date.
+        let mut tab = between();
+        tab.give_up_closed(STOPPED_DURING_SAVE, Some(&page));
+        assert_eq!(tab.edits.list(), [Edit::DateShown(false), Edit::NamePosition(OsdPosition::TopLeft)]);
+        assert_eq!(tab.reopened(), Some(STOPPED_DURING_SAVE));
+        // Nothing more is written: no Save is left and no read awaited, so a
+        // closed window takes no late page of the tab (see `takes`), a page
+        // that comes builds no write (`set_page` builds one only while the
+        // tab is refreshing) and a late answer finds no Save (see `written`).
+        assert!(tab.run.is_none() && !tab.refreshing && tab.awaited.is_none() && !tab.busy());
+        // The connection lost after that leaves the edits as they are.
+        tab.give_up_closed(LOST_DURING_SAVE, Some(&page));
+        assert_eq!(tab.edits.list(), [Edit::DateShown(false), Edit::NamePosition(OsdPosition::TopLeft)]);
+        assert_eq!(tab.reopened(), Some(STOPPED_DURING_SAVE));
+        // A last answer that has the name at the top left already shows it
+        // as the camera's: only the date is left as an edit.
+        let SettingsPage::CameraDisplay { channel, page: mut read } = display() else { unreachable!() };
+        let name = read.name.as_mut().unwrap();
+        (name.top_left_x, name.top_left_y) = (Some(1), Some(1));
+        let moved = SettingsPage::CameraDisplay { channel, page: read };
+        let mut tab = between();
+        tab.give_up_closed(LOST_DURING_SAVE, Some(&moved));
+        assert_eq!(tab.edits.list(), [Edit::DateShown(false)]);
+        assert_eq!(tab.reopened(), Some(LOST_DURING_SAVE));
+        // On screen (`lost`, `live_stopped`, a new login) the same.
+        let mut tab = between();
+        assert!(tab.give_up("Not connected: placeholder", Some(&page)));
+        assert_eq!(tab.edits.list(), [Edit::DateShown(false), Edit::NamePosition(OsdPosition::TopLeft)]);
+        assert!(tab.run.is_none() && !tab.busy());
+    }
+
+    #[test]
+    fn a_saves_footer_says_whether_a_row_was_written_before_it_stopped() {
+        let cannot = Refreshed::Cannot(reoling::WriteError::NotCaptured);
+        // Before the first write: nothing was written.
+        assert_eq!(save_status(&Refreshed::NotRead, false, true), NOT_READ_BEFORE_SAVE);
+        assert_eq!(save_status(&Refreshed::Already, false, false), ALREADY_BEFORE_SAVE);
+        assert_eq!(save_status(&Refreshed::Changed, false, true), CHANGED_BEFORE_SAVE);
+        assert_eq!(save_status(&Refreshed::Changed, false, false), CHANGED_NOTHING_LEFT);
+        let text = "Cannot save: this camera's reply or the change differs from what Reoling knows how to write.";
+        assert_eq!(save_status(&cannot, false, true), text);
+        // After a row's write: the rest was not written.
+        assert_eq!(save_status(&Refreshed::NotRead, true, true), NOT_READ_DURING_SAVE);
+        assert_eq!(save_status(&Refreshed::Changed, true, true), CHANGED_DURING_SAVE);
+        assert_eq!(save_status(&Refreshed::Changed, true, false), CHANGED_DURING_SAVE_NOTHING_LEFT);
+        assert!(save_status(&cannot, true, true).starts_with("Cannot save the rest: this camera's reply"));
+        // Every row written, or the camera had the ones after the last write.
+        assert_eq!(save_status(&Refreshed::Done, true, false), "Saved (the camera answered 200).");
     }
 }

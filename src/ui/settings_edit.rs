@@ -8,9 +8,12 @@
 //! until its own capture confirms the shapes on its firmware), on the camera
 //! model each write was captured on, for a row whose current value is one the
 //! capture shows, and only when the page's reply has exactly the captured
-//! shape. A Save reads the tab again first and builds its writes from that
-//! read, so a change made elsewhere since the tab was shown is not written
-//! back.
+//! shape. A Save writes one edited row at a time, as the official app was
+//! captured changing one value per write: before each write it reads the tab
+//! again and builds the write from that read with only that row changed, so
+//! a change made elsewhere since the tab was shown, and the rows the same
+//! Save wrote before, are not written back. A row the camera has by its
+//! turn is skipped.
 
 use reoling::protocol::bc::settings_write::{
     denoise_write, led_write, osd_write, picture_writes, volume_write, CapturedCamera, BRIGHTNESS_RANGE,
@@ -22,7 +25,6 @@ use reoling::{
     OsdPosition, PictureChange, SettingsPage, SettingsTarget, SettingsWrite, StatusLed, WriteError, WriteOutcome,
     WriteReply,
 };
-use std::collections::VecDeque;
 
 /// One setting the user may change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -41,6 +43,10 @@ pub enum Field {
 }
 
 impl Field {
+    /// Every field, in the order a Save writes them, one write each. Noise
+    /// reduction goes before its level: a new level is written only with
+    /// noise reduction on (see `locked`), which the write before has then
+    /// switched on.
     pub const ALL: [Field; 11] = [
         Field::NamePosition,
         Field::DateShown,
@@ -162,9 +168,6 @@ enum Root {
 }
 
 impl Root {
-    /// The order a Save sends them in.
-    const ALL: [Root; 5] = [Root::Osd, Root::Picture, Root::Led, Root::Audio, Root::Denoise];
-
     /// The writes it goes out as.
     fn writes(self) -> &'static [u32] {
         match self {
@@ -439,102 +442,127 @@ fn build(page: &SettingsPage, root: Root, edits: &Edits) -> Result<Vec<SettingsW
     }
 }
 
-/// One step of a Save: the writes that go together (one message, or the
-/// picture's 25 with its 297) and the edits they carry.
+/// One write of a Save: the message that changes one edited row (or the
+/// picture's 25 with its 297), and that row's new value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriteGroup {
     pub writes: Vec<SettingsWrite>,
-    pub edits: Vec<Edit>,
+    pub edit: Edit,
 }
 
-/// The groups a Save of `edits` sends, in order: OSD, picture, lights,
-/// volume, noise reduction. Each is built from the page's own replies with
-/// only the edited values changed.
-pub fn save_groups(page: &SettingsPage, edits: &Edits) -> Result<Vec<WriteGroup>, WriteError> {
-    let mut groups = Vec::new();
-    for root in Root::ALL {
-        let mine: Vec<Edit> = edits.list().iter().copied().filter(|e| e.field().root() == root).collect();
-        if mine.is_empty() {
-            continue;
-        }
-        groups.push(WriteGroup { writes: build(page, root, edits)?, edits: mine });
-    }
-    Ok(groups)
+/// The write of `edit`'s row, built from the page's own replies with only
+/// that row's value changed.
+fn row_write(page: &SettingsPage, edit: Edit) -> Result<WriteGroup, WriteError> {
+    Ok(WriteGroup { writes: build(page, edit.field().root(), &Edits(vec![edit]))?, edit })
 }
 
-/// What a Save does once the read it makes first has come.
+/// What a Save does with a read it made: the first, made when Save was
+/// pressed, or one made after a row's write was answered 200.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Refreshed {
-    /// Send these groups, built from that read.
-    Save(Vec<WriteGroup>),
-    /// A read the edits are built from did not answer: nothing is written,
-    /// and the edits stay.
+    /// Send this row's write, built from that read.
+    Save(WriteGroup),
+    /// Every edited row of the Save was written, or the camera has its value
+    /// now: nothing is left to write.
+    Done,
+    /// The read the next row's write is built from did not answer: it is
+    /// not written, and the edits not saved stay.
     NotRead,
-    /// The camera already has every edited value: nothing is written.
+    /// Nothing was written yet and the camera already has every edited
+    /// value: nothing is written.
     Already,
-    /// The camera's values moved under the edits (it has some of them now,
-    /// or a row can no longer be written): nothing is written, and the
-    /// other edits stay to be looked at and saved again.
+    /// The camera's values moved under the edits (a row can no longer be
+    /// written, or is locked now): nothing more is written, and the other
+    /// edits stay to be looked at and saved again.
     Changed,
-    /// The writes could not be built from that read.
+    /// The next row's write could not be built from that read.
     Cannot(WriteError),
 }
 
-/// The read a Save makes first has come: the edits settle on it, and the
-/// writes, built from it, go only when that leaves the edits as they were.
-pub fn refreshed(edits: &mut Edits, page: &SettingsPage, gate: &WriteGate) -> Refreshed {
-    let before = edits.clone();
-    edits.settle(page, gate);
-    if edits.list().iter().any(|e| !answered(page, e.field().root())) {
-        return Refreshed::NotRead;
+/// A read the Save made has come. The rows go in `Field::ALL` order, each
+/// looked at on the read made before its own write: a row whose value the
+/// camera has by its turn is skipped, and the next one is looked at on the
+/// same read (nothing was written since); the first other row gets its
+/// write, built from that read. The rows after it wait for their turn, so
+/// one the camera had on an earlier read is still written when its value
+/// moved since. Nothing more goes when the next row's read did not answer,
+/// or when any edit can no longer be written (or is locked now); the edits
+/// left then settle on that read. `wrote` tells whether a row of this Save
+/// was written already.
+fn refreshed(edits: &mut Edits, page: &SettingsPage, gate: &WriteGate, wrote: bool) -> Refreshed {
+    let mut settled = edits.clone();
+    settled.settle(page, gate);
+    // An edit gone for another reason than the camera having its value.
+    let changed = edits.list().iter().any(|e| settled.get(e.field()).is_none() && current(page, e.field()) != Some(*e));
+    while let Some(edit) = Field::ALL.into_iter().find_map(|field| edits.get(field)) {
+        let stop = if !answered(page, edit.field().root()) {
+            Refreshed::NotRead
+        } else if changed {
+            Refreshed::Changed
+        } else if current(page, edit.field()) == Some(edit) {
+            edits.remove(&[edit.field()]);
+            continue;
+        } else {
+            match row_write(page, edit) {
+                Ok(group) => return Refreshed::Save(group),
+                Err(e) => Refreshed::Cannot(e),
+            }
+        };
+        *edits = settled;
+        return stop;
     }
-    if edits.is_empty() && before.list().iter().all(|e| current(page, e.field()) == Some(*e)) {
-        return Refreshed::Already;
-    }
-    if *edits != before {
-        return Refreshed::Changed;
-    }
-    match save_groups(page, edits) {
-        Ok(groups) => Refreshed::Save(groups),
-        Err(e) => Refreshed::Cannot(e),
+    if wrote {
+        Refreshed::Done
+    } else {
+        Refreshed::Already
     }
 }
 
-/// What the camera window does next with a Save.
+/// What the camera window does next with a Save, once a row's write was
+/// answered.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SaveStep {
-    /// Send these writes (the next group).
-    Send(Vec<SettingsWrite>),
-    /// Every group answered 200; these edits were saved.
-    Done { saved: Vec<Edit> },
-    /// The device refused the write `msg_id` with this code; the groups
-    /// before it were saved (and this one too when only the picture's 297
-    /// was refused, after its 25 answered 200), the rest not sent.
-    Refused { code: u16, msg_id: u32, saved: Vec<Edit> },
-    /// A write had no answer (or could not be sent); the groups before it
-    /// were saved, the rest not sent.
+    /// Answered 200: the row is saved and its edit gone. The tab is read
+    /// again, and the next row's write is built from that read.
+    ReadAgain,
+    /// The device refused the write `msg_id` with this code; the rows before
+    /// were saved, and this one too (`row_saved`) when only the picture's
+    /// 297 was refused, after its 25 answered 200. The rest is not sent.
+    Refused { code: u16, msg_id: u32, saved: Vec<Edit>, row_saved: bool },
+    /// The write had no answer (or could not be sent); the rows before it
+    /// were saved (and this one when only the picture's 297 went
+    /// unanswered), the rest is not sent.
     NoAnswer { saved: Vec<Edit> },
 }
 
-/// A Save under way: the groups go one after the other, each once the
-/// previous one was answered 200, and the first other answer ends it.
+/// A Save under way, one edited row at a time: each row's write is built
+/// from a read of the tab made after the write before it was answered 200,
+/// and the first other answer ends it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SaveRun {
     pub target: SettingsTarget,
-    /// The number the group that is out went under (see `sent_as`).
+    /// The number the write that is out went under (see `sent_as`).
     group: u64,
-    waiting: Vec<Edit>,
-    rest: VecDeque<WriteGroup>,
+    /// The row whose write is out; `None` while the Save waits for a read.
+    out: Option<Edit>,
     saved: Vec<Edit>,
 }
 
 impl SaveRun {
-    /// The run and the first group's writes; `None` without any group.
-    pub fn start(target: SettingsTarget, groups: Vec<WriteGroup>) -> Option<(SaveRun, Vec<SettingsWrite>)> {
-        let mut rest: VecDeque<WriteGroup> = groups.into();
-        let first = rest.pop_front()?;
-        let run = SaveRun { target, group: 0, waiting: first.edits, rest, saved: Vec::new() };
-        Some((run, first.writes))
+    /// A Save of `target`'s edits, nothing written yet.
+    pub fn new(target: SettingsTarget) -> SaveRun {
+        SaveRun { target, group: 0, out: None, saved: Vec::new() }
+    }
+
+    /// A read the Save made has come: `edits` settle on it, and the next
+    /// row's write is built from it (see `refreshed`).
+    pub fn read(&mut self, edits: &mut Edits, page: &SettingsPage, gate: &WriteGate) -> Refreshed {
+        let next = refreshed(edits, page, gate, !self.saved.is_empty());
+        self.out = match &next {
+            Refreshed::Save(group) => Some(group.edit),
+            _ => None,
+        };
+        next
     }
 
     /// The edits saved so far.
@@ -542,56 +570,63 @@ impl SaveRun {
         self.saved.clone()
     }
 
-    /// The edits whose writes are out, or not sent yet.
-    #[cfg(test)]
-    fn unsaved(&self) -> Vec<Edit> {
-        self.waiting.iter().copied().chain(self.rest.iter().flat_map(|g| g.edits.iter().copied())).collect()
-    }
-
-    /// The group that is out went under this number.
+    /// The write that is out went under this number.
     pub fn sent_as(&mut self, group: u64) {
         self.group = group;
     }
 
-    /// The device's answers to the group sent under `group`; `None` when
-    /// that is not the group that is out (an earlier save's, answered late).
-    pub fn answered(&mut self, group: u64, results: &[WriteOutcome]) -> Option<SaveStep> {
-        (group == self.group).then(|| self.step(results))
+    /// The Save is given up before it ended (the device logs in again, the
+    /// connection or the live video is gone). While rows are left, the rows
+    /// it saved come back to `edits`, checked against the tab's last answer
+    /// `page`: that answer may be a read made before their writes, and the
+    /// tab then shows the values the Save was for, as edits not saved, not
+    /// the old ones. With no row left (only the read after the last write
+    /// was out) they stay gone, as after a Save that ended.
+    pub fn given_up(&self, edits: &mut Edits, page: &SettingsPage) {
+        if edits.is_empty() {
+            return;
+        }
+        for edit in &self.saved {
+            edits.set(*edit, page);
+        }
     }
 
-    fn step(&mut self, results: &[WriteOutcome]) -> SaveStep {
-        // A group's first write carries its edits (the picture's 297 after
+    /// The device's answers to the write sent under `group`; `None` when
+    /// that is not the write that is out (an earlier one's, answered late).
+    /// A saved row's edit leaves `edits` at once, so a read after it never
+    /// offers it again, even when the camera did not keep the value.
+    pub fn answered(&mut self, group: u64, results: &[WriteOutcome], edits: &mut Edits) -> Option<SaveStep> {
+        if group != self.group {
+            return None;
+        }
+        let row = self.out.take()?;
+        // The row's first write carries its value (the picture's 297 after
         // it sends the threshold back unchanged): once that one answered
-        // 200, the edits are saved, whatever the next one's answer.
-        if results.first().is_some_and(|r| r.reply == WriteReply::Code(200)) {
-            self.saved.append(&mut self.waiting);
+        // 200, the row is saved, whatever the next one's answer.
+        let row_saved = results.first().is_some_and(|r| r.reply == WriteReply::Code(200));
+        if row_saved {
+            edits.remove(&[row.field()]);
+            self.saved.push(row);
         }
         let refused = results.iter().find_map(|r| match r.reply {
             WriteReply::Code(code) if code != 200 => Some((code, r.msg_id)),
             _ => None,
         });
         let unanswered = results.is_empty() || results.iter().any(|r| !matches!(r.reply, WriteReply::Code(_)));
-        if let Some((code, msg_id)) = refused {
-            return SaveStep::Refused { code, msg_id, saved: self.saved.clone() };
-        }
-        if unanswered {
-            return SaveStep::NoAnswer { saved: self.saved.clone() };
-        }
-        match self.rest.pop_front() {
-            Some(next) => {
-                self.waiting = next.edits;
-                SaveStep::Send(next.writes)
-            }
-            None => SaveStep::Done { saved: self.saved.clone() },
-        }
+        Some(if let Some((code, msg_id)) = refused {
+            SaveStep::Refused { code, msg_id, saved: self.saved.clone(), row_saved }
+        } else if unanswered {
+            SaveStep::NoAnswer { saved: self.saved.clone() }
+        } else {
+            SaveStep::ReadAgain
+        })
     }
 }
 
 /// The footer line for a refused write: the picture's 297 refused after its
-/// 25 answered 200 says the picture change went through.
-pub fn refusal(code: u16, msg_id: u32, saved: &[Edit]) -> String {
-    let picture = saved.iter().any(|e| e.field().root() == Root::Picture);
-    if msg_id == MSG_ID_SET_DAY_NIGHT_THRESHOLD && picture {
+/// own 25 answered 200 (`row_saved`) says the picture change went through.
+pub fn refusal(code: u16, msg_id: u32, row_saved: bool) -> String {
+    if msg_id == MSG_ID_SET_DAY_NIGHT_THRESHOLD && row_saved {
         format!("The picture change was saved; the camera refused the day/night threshold sent with it (code {code}).")
     } else {
         format!("The camera refused the change (code {code}).")
@@ -680,7 +715,7 @@ pub fn editable_page(page: CameraPage) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use reoling::{
         AiDenoise, AudioCfg, CameraDisplayPage, CameraImagePage, CameraLightSoundPage, DayNight, DayNightThreshold,
@@ -701,7 +736,7 @@ mod tests {
 
     // A Hub's channel with the camera the OSD, picture, light and volume
     // writes were captured on, and one with the noise-reduction camera.
-    const HUB: WriteGate =
+    pub(crate) const HUB: WriteGate =
         WriteGate { kind: DeviceKind::Hub, abilities: None, camera: Some(CapturedCamera::E1OutdoorPoe) };
     const HUB_RLC: WriteGate = WriteGate { camera: Some(CapturedCamera::Rlc1224a), ..HUB };
 
@@ -709,7 +744,7 @@ mod tests {
         RawReplies::new(replies.iter().map(|(id, text)| (*id, RawBody::new(*text))).collect())
     }
 
-    fn display() -> SettingsPage {
+    pub(crate) fn display() -> SettingsPage {
         SettingsPage::CameraDisplay {
             channel: 1,
             page: CameraDisplayPage {
@@ -895,6 +930,54 @@ mod tests {
         assert_eq!(edits.list(), [Edit::StatusLed(StatusLed::Off)]);
     }
 
+    /// The lines of a row's first write that differ from the write the same
+    /// read gives with nothing changed: what the write changes. The writes
+    /// after it (the picture's 297) are those of nothing changed.
+    fn changes(page: &SettingsPage, group: &WriteGroup) -> Vec<String> {
+        let plain = build(page, group.edit.field().root(), &Edits::default()).unwrap();
+        assert_eq!(group.writes.len(), plain.len());
+        assert_eq!(group.writes[1..], plain[1..]);
+        let (ours, theirs) = (group.writes[0].body(), plain[0].body());
+        assert_eq!(ours.lines().count(), theirs.lines().count());
+        ours.lines().zip(theirs.lines()).filter(|(a, b)| a != b).map(|(a, _)| a.to_string()).collect()
+    }
+
+    /// Every write of the group answered with `reply`.
+    pub(crate) fn answer(group: &WriteGroup, reply: WriteReply) -> Vec<WriteOutcome> {
+        group.writes.iter().map(|w| WriteOutcome { msg_id: w.msg_id, reply }).collect()
+    }
+
+    fn ids(group: &WriteGroup) -> Vec<u32> {
+        group.writes.iter().map(|w| w.msg_id).collect()
+    }
+
+    /// The light & sound page as read after the status LED was turned off.
+    fn led_off() -> SettingsPage {
+        let SettingsPage::CameraLightSound { channel, mut page } = light_sound() else { unreachable!() };
+        page.led.as_mut().unwrap().light_state = Some("close".into());
+        let led = LED_READ.replace("<lightState>open</lightState>", "<lightState>close</lightState>");
+        page.raw = raw(&[(208, led.as_str()), (264, AUDIO_READ), (439, DENOISE_READ)]);
+        SettingsPage::CameraLightSound { channel, page }
+    }
+
+    /// `page` with the volume at 50, and the 264 reply as `audio` (`None`:
+    /// no answer to it).
+    fn with_volume_50(page: SettingsPage, audio: Option<&str>) -> SettingsPage {
+        let SettingsPage::CameraLightSound { channel, mut page } = page else { unreachable!() };
+        let led = page.raw.get(208).map(|r| r.as_str().to_string()).unwrap();
+        match audio {
+            Some(audio) => {
+                page.audio.as_mut().unwrap().volume = Some(50);
+                page.raw = raw(&[(208, led.as_str()), (264, audio), (439, DENOISE_READ)]);
+            }
+            None => {
+                page.audio = Err(ReadFailure::NoReply);
+                page.raw = raw(&[(208, led.as_str()), (439, DENOISE_READ)]);
+            }
+        }
+        SettingsPage::CameraLightSound { channel, page }
+    }
+
     #[test]
     fn a_save_writes_from_the_read_it_makes_first() {
         let page = light_sound();
@@ -908,14 +991,16 @@ mod tests {
         read.raw = raw(&[(208, led.as_str()), (264, AUDIO_READ), (439, DENOISE_READ)]);
         let fresh = SettingsPage::CameraLightSound { channel, page: read };
         let mut mine = edits.clone();
-        let Refreshed::Save(groups) = refreshed(&mut mine, &fresh, &HUB) else { panic!("saved") };
+        let Refreshed::Save(group) = refreshed(&mut mine, &fresh, &HUB, false) else { panic!("saved") };
         assert_eq!(mine, edits);
-        let body = groups[0].writes[0].body();
+        assert_eq!(group.edit, Edit::StatusLed(StatusLed::Off));
+        let body = group.writes[0].body();
         assert!(body.contains("<state>close</state>\n<lightState>close</lightState>"), "{}", body.len());
-        // The same edits against the page as first read would have sent the
+        assert_eq!(changes(&fresh, &group), ["<lightState>close</lightState>"]);
+        // The same edit against the page as first read would have sent the
         // old infrared value back.
-        let stale = save_groups(&page, &edits).unwrap();
-        assert!(stale[0].writes[0].body().contains("<state>auto</state>"));
+        let stale = row_write(&page, Edit::StatusLed(StatusLed::Off)).unwrap();
+        assert!(stale.writes[0].body().contains("<state>auto</state>"));
 
         // The read did not answer: nothing goes, the edit stays.
         let SettingsPage::CameraLightSound { channel, page: mut read } = light_sound() else { unreachable!() };
@@ -923,22 +1008,21 @@ mod tests {
         read.raw = raw(&[(264, AUDIO_READ)]);
         let unread = SettingsPage::CameraLightSound { channel, page: read };
         let mut mine = edits.clone();
-        assert_eq!(refreshed(&mut mine, &unread, &HUB), Refreshed::NotRead);
+        assert_eq!(refreshed(&mut mine, &unread, &HUB, false), Refreshed::NotRead);
         assert_eq!(mine, edits);
 
         // The camera has the value already: nothing goes.
-        let SettingsPage::CameraLightSound { channel, page: mut read } = light_sound() else { unreachable!() };
-        read.led.as_mut().unwrap().light_state = Some("close".into());
-        let has_it = SettingsPage::CameraLightSound { channel, page: read };
         let mut mine = edits.clone();
-        assert_eq!(refreshed(&mut mine, &has_it, &HUB), Refreshed::Already);
+        assert_eq!(refreshed(&mut mine, &led_off(), &HUB, false), Refreshed::Already);
         assert!(mine.is_empty());
 
-        // One of two edits is there already: nothing goes, the other stays.
+        // One of two edits is there already: that row is skipped, the other
+        // one goes.
         let mut two = edits.clone();
         two.set(Edit::Volume(50), &page);
         let mut mine = two.clone();
-        assert_eq!(refreshed(&mut mine, &has_it, &HUB), Refreshed::Changed);
+        let Refreshed::Save(group) = refreshed(&mut mine, &led_off(), &HUB, false) else { panic!("the volume") };
+        assert_eq!((group.edit, ids(&group)), (Edit::Volume(50), vec![265]));
         assert_eq!(mine.list(), [Edit::Volume(50)]);
 
         // The row can no longer be written (another shape): nothing goes.
@@ -947,126 +1031,335 @@ mod tests {
         read.raw = raw(&[(208, led.as_str()), (264, AUDIO_READ), (439, DENOISE_READ)]);
         let other = SettingsPage::CameraLightSound { channel, page: read };
         let mut mine = edits.clone();
-        assert_eq!(refreshed(&mut mine, &other, &HUB), Refreshed::Changed);
+        assert_eq!(refreshed(&mut mine, &other, &HUB, false), Refreshed::Changed);
         assert!(mine.is_empty());
+        // Nor does the volume behind it.
+        let mut mine = two.clone();
+        assert_eq!(refreshed(&mut mine, &other, &HUB, false), Refreshed::Changed);
+        assert_eq!(mine.list(), [Edit::Volume(50)]);
     }
 
     #[test]
-    fn a_save_builds_one_group_per_write_in_order() {
-        // OSD: one 45 with all three roots, however many of its rows changed.
+    fn a_save_writes_one_row_at_a_time_each_from_a_read_after_the_write_before() {
+        // Display: two rows of the one 45 make two 45s. The name goes first
+        // (`Field::ALL`), then the date, from a read that has the name moved.
         let page = display();
+        let target = SettingsTarget::Camera { channel: 1, page: CameraPage::Display };
         let mut edits = Edits::default();
         edits.set(Edit::DateShown(false), &page);
         edits.set(Edit::NamePosition(OsdPosition::TopLeft), &page);
-        let groups = save_groups(&page, &edits).unwrap();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].writes.len(), 1);
-        let body = groups[0].writes[0].body();
-        assert_eq!(groups[0].writes[0].msg_id, 45);
-        assert!(body.contains("<topLeftX>1</topLeftX>\n<topLeftY>1</topLeftY>") && body.contains("<OsdFlowData"));
+        let mut run = SaveRun::new(target);
+        let Refreshed::Save(first) = run.read(&mut edits, &page, &HUB) else { panic!("the name") };
+        assert_eq!((first.edit, ids(&first)), (Edit::NamePosition(OsdPosition::TopLeft), vec![45]));
+        assert_eq!(changes(&page, &first), ["<topLeftX>1</topLeftX>", "<topLeftY>1</topLeftY>"]);
+        assert!(first.writes[0].body().contains("<OsdFlowData"));
+        run.sent_as(1);
+        assert_eq!(run.answered(1, &answer(&first, WriteReply::Code(200)), &mut edits), Some(SaveStep::ReadAgain));
+        assert_eq!(edits.list(), [Edit::DateShown(false)]);
+        let SettingsPage::CameraDisplay { channel, page: mut read } = display() else { unreachable!() };
+        let name = read.name.as_mut().unwrap();
+        (name.top_left_x, name.top_left_y) = (Some(1), Some(1));
+        let at = "<topLeftX>1</topLeftX>\n<topLeftY>1</topLeftY>";
+        let osd = OSD_READ.replace("<topLeftX>65536</topLeftX>\n<topLeftY>65536</topLeftY>", at);
+        read.raw = raw(&[(44, osd.as_str())]);
+        let moved = SettingsPage::CameraDisplay { channel, page: read };
+        let Refreshed::Save(second) = run.read(&mut edits, &moved, &HUB) else { panic!("the date") };
+        assert_eq!((second.edit, ids(&second)), (Edit::DateShown(false), vec![45]));
+        assert_eq!(changes(&moved, &second), ["<enable>0</enable>"]);
+        let body = second.writes[0].body();
+        assert!(body.contains(at), "the name as the read after the first write has it");
         assert!(body.contains("<OsdDatetime version=\"1.1\">\n<channelId>1</channelId>\n<enable>0</enable>"));
-        assert_eq!(groups[0].edits.len(), 2);
-        // The picture: the 25, then the 297 echo, as one group.
+        run.sent_as(2);
+        assert_eq!(run.answered(2, &answer(&second, WriteReply::Code(200)), &mut edits), Some(SaveStep::ReadAgain));
+        assert!(edits.is_empty());
+        let SettingsPage::CameraDisplay { channel, page: mut read } = moved else { unreachable!() };
+        read.datetime.as_mut().unwrap().enable = Some(0);
+        let after = SettingsPage::CameraDisplay { channel, page: read };
+        assert_eq!(run.read(&mut edits, &after, &HUB), Refreshed::Done);
+        assert_eq!(run.saved(), [Edit::NamePosition(OsdPosition::TopLeft), Edit::DateShown(false)]);
+        assert!(not_kept(&run.saved(), &after).is_empty());
+
+        // The picture: each row its own 25, each with the 297 right behind.
         let page = image();
+        let target = SettingsTarget::Camera { channel: 1, page: CameraPage::Image };
         let mut edits = Edits::default();
         edits.set(Edit::Flip(true), &page);
         edits.set(Edit::Brightness(140), &page);
-        let groups = save_groups(&page, &edits).unwrap();
-        assert_eq!(groups.len(), 1);
-        let ids: Vec<u32> = groups[0].writes.iter().map(|w| w.msg_id).collect();
-        assert_eq!(ids, [25, 297]);
-        let body = groups[0].writes[0].body();
-        assert!(body.contains("<bright>140</bright>") && body.contains("<flip>1</flip>"));
-        assert_eq!(groups[0].writes[1].body(), THRESHOLD_WRITE);
-        // Light & sound: up to three groups, lights first.
+        let mut run = SaveRun::new(target);
+        let Refreshed::Save(first) = run.read(&mut edits, &page, &HUB) else { panic!("the brightness") };
+        assert_eq!((first.edit, ids(&first)), (Edit::Brightness(140), vec![25, 297]));
+        assert_eq!(changes(&page, &first), ["<bright>140</bright>"]);
+        assert_eq!(first.writes[1].body(), THRESHOLD_WRITE);
+        assert_eq!(run.answered(0, &answer(&first, WriteReply::Code(200)), &mut edits), Some(SaveStep::ReadAgain));
+        let SettingsPage::CameraImage { channel, page: mut read } = image() else { unreachable!() };
+        read.video_input.as_mut().unwrap().bright = Some(140);
+        let picture = PICTURE_READ.replace("<bright>128</bright>", "<bright>140</bright>");
+        read.raw = raw(&[(26, picture.as_str()), (296, THRESHOLD_READ)]);
+        let brighter = SettingsPage::CameraImage { channel, page: read };
+        let Refreshed::Save(second) = run.read(&mut edits, &brighter, &HUB) else { panic!("the flip") };
+        assert_eq!((second.edit, ids(&second)), (Edit::Flip(true), vec![25, 297]));
+        assert_eq!(changes(&brighter, &second), ["<flip>1</flip>"]);
+        assert!(second.writes[0].body().contains("<bright>140</bright>"));
+        assert_eq!(second.writes[1].body(), THRESHOLD_WRITE);
+
+        // Rows of different writes go one at a time too: the lights, then
+        // the volume, each from a read of its own.
         let page = light_sound();
+        let target = SettingsTarget::Camera { channel: 1, page: CameraPage::LightSound };
         let mut edits = Edits::default();
-        edits.set(Edit::DenoiseLevel(3), &page);
         edits.set(Edit::Volume(50), &page);
         edits.set(Edit::StatusLed(StatusLed::Off), &page);
-        let groups = save_groups(&page, &edits).unwrap();
-        let ids: Vec<Vec<u32>> = groups.iter().map(|g| g.writes.iter().map(|w| w.msg_id).collect()).collect();
-        assert_eq!(ids, [vec![209], vec![265], vec![440]]);
-        assert_eq!(groups[0].writes[0].body(), LED_STATUS_OFF);
-        assert!(groups.iter().all(|g| g.writes.iter().all(|w| w.channel == 1)));
-        assert!(save_groups(&page, &Edits::default()).unwrap().is_empty());
-    }
-
-    fn answer(ids: &[u32], reply: WriteReply) -> Vec<WriteOutcome> {
-        ids.iter().map(|id| WriteOutcome { msg_id: *id, reply }).collect()
+        let mut run = SaveRun::new(target);
+        let Refreshed::Save(first) = run.read(&mut edits, &page, &HUB) else { panic!("the lights") };
+        assert_eq!(first.writes[0].body(), LED_STATUS_OFF);
+        assert_eq!(changes(&page, &first), ["<lightState>close</lightState>"]);
+        assert_eq!(run.answered(0, &answer(&first, WriteReply::Code(200)), &mut edits), Some(SaveStep::ReadAgain));
+        let Refreshed::Save(second) = run.read(&mut edits, &led_off(), &HUB) else { panic!("the volume") };
+        assert_eq!((second.edit, ids(&second)), (Edit::Volume(50), vec![265]));
+        assert_eq!(changes(&led_off(), &second), ["<volume>50</volume>"]);
+        assert!(first.writes.iter().chain(&second.writes).all(|w| w.channel == 1));
+        assert_eq!(run.answered(0, &answer(&second, WriteReply::Code(200)), &mut edits), Some(SaveStep::ReadAgain));
+        let audio = AUDIO_READ.replace("<volume>92</volume>", "<volume>50</volume>");
+        assert_eq!(run.read(&mut edits, &with_volume_50(led_off(), Some(audio.as_str())), &HUB), Refreshed::Done);
+        assert_eq!(run.saved(), [Edit::StatusLed(StatusLed::Off), Edit::Volume(50)]);
     }
 
     #[test]
-    fn a_save_runs_its_groups_one_after_the_other_and_stops_at_a_refusal() {
+    fn a_row_the_camera_has_by_its_turn_is_skipped_and_one_changed_ends_the_save() {
+        let page = light_sound();
+        let target = SettingsTarget::Camera { channel: 1, page: CameraPage::LightSound };
+        let mut two = Edits::default();
+        two.set(Edit::StatusLed(StatusLed::Off), &page);
+        two.set(Edit::Volume(50), &page);
+        let start = |edits: &mut Edits| {
+            let mut run = SaveRun::new(target);
+            let Refreshed::Save(first) = run.read(edits, &page, &HUB) else { panic!("the lights") };
+            assert_eq!(run.answered(0, &answer(&first, WriteReply::Code(200)), edits), Some(SaveStep::ReadAgain));
+            run
+        };
+        // The volume is at 50 by the read after the lights: nothing more goes.
+        let audio = AUDIO_READ.replace("<volume>92</volume>", "<volume>50</volume>");
+        let mut edits = two.clone();
+        let mut run = start(&mut edits);
+        assert_eq!(run.read(&mut edits, &with_volume_50(led_off(), Some(audio.as_str())), &HUB), Refreshed::Done);
+        assert!(edits.is_empty());
+        assert_eq!(run.saved(), [Edit::StatusLed(StatusLed::Off)]);
+        // That read has no answer for the volume: it is not written and stays.
+        let mut edits = two.clone();
+        let mut run = start(&mut edits);
+        assert_eq!(run.read(&mut edits, &with_volume_50(led_off(), None), &HUB), Refreshed::NotRead);
+        assert_eq!(edits.list(), [Edit::Volume(50)]);
+        // Its reply has another shape now: the volume is no longer written.
+        let other = AUDIO_READ.replace("<timeout>0</timeout>\n", "");
+        let mut edits = two.clone();
+        let mut run = start(&mut edits);
+        let SettingsPage::CameraLightSound { channel, page: mut read } = led_off() else { unreachable!() };
+        let led = read.raw.get(208).map(|r| r.as_str().to_string()).unwrap();
+        read.raw = raw(&[(208, led.as_str()), (264, other.as_str()), (439, DENOISE_READ)]);
+        let changed = SettingsPage::CameraLightSound { channel, page: read };
+        assert_eq!(run.read(&mut edits, &changed, &HUB), Refreshed::Changed);
+        assert!(edits.is_empty());
+        assert_eq!(run.saved(), [Edit::StatusLed(StatusLed::Off)]);
+    }
+
+    #[test]
+    fn a_row_is_skipped_only_on_the_read_made_at_its_turn() {
+        // The volume is at 50 on the read Save makes first, but the lights go
+        // first. By the read after them it is back at 92 (changed elsewhere):
+        // it is written then, built from that read.
+        let page = light_sound();
+        let target = SettingsTarget::Camera { channel: 1, page: CameraPage::LightSound };
+        let mut two = Edits::default();
+        two.set(Edit::StatusLed(StatusLed::Off), &page);
+        two.set(Edit::Volume(50), &page);
+        let audio = AUDIO_READ.replace("<volume>92</volume>", "<volume>50</volume>");
+        let at_50 = with_volume_50(light_sound(), Some(audio.as_str()));
+        let mut edits = two.clone();
+        let mut run = SaveRun::new(target);
+        let Refreshed::Save(first) = run.read(&mut edits, &at_50, &HUB) else { panic!("the lights") };
+        assert_eq!(first.edit, Edit::StatusLed(StatusLed::Off));
+        assert_eq!(edits, two, "the volume waits for its turn");
+        assert_eq!(run.answered(0, &answer(&first, WriteReply::Code(200)), &mut edits), Some(SaveStep::ReadAgain));
+        let Refreshed::Save(second) = run.read(&mut edits, &led_off(), &HUB) else { panic!("the volume") };
+        assert_eq!((second.edit, ids(&second)), (Edit::Volume(50), vec![265]));
+        assert_eq!(changes(&led_off(), &second), ["<volume>50</volume>"]);
+        assert_eq!(run.answered(0, &answer(&second, WriteReply::Code(200)), &mut edits), Some(SaveStep::ReadAgain));
+        let after = with_volume_50(led_off(), Some(audio.as_str()));
+        assert_eq!(run.read(&mut edits, &after, &HUB), Refreshed::Done);
+        assert_eq!(run.saved(), [Edit::StatusLed(StatusLed::Off), Edit::Volume(50)]);
+        // A Save that stops on a read leaves the edits settled on it: a later
+        // row the camera has by then goes, an unanswered one stays.
+        let SettingsPage::CameraLightSound { channel, page: mut read } = at_50 else { unreachable!() };
+        read.led = Err(ReadFailure::NoReply);
+        read.raw = raw(&[(264, audio.as_str()), (439, DENOISE_READ)]);
+        let mut edits = two.clone();
+        let mut run = SaveRun::new(target);
+        let unread = SettingsPage::CameraLightSound { channel, page: read };
+        assert_eq!(run.read(&mut edits, &unread, &HUB), Refreshed::NotRead);
+        assert_eq!(edits.list(), [Edit::StatusLed(StatusLed::Off)]);
+    }
+
+    #[test]
+    fn a_save_given_up_with_rows_left_shows_its_saved_rows_as_edits() {
         let page = light_sound();
         let target = SettingsTarget::Camera { channel: 1, page: CameraPage::LightSound };
         let mut edits = Edits::default();
         edits.set(Edit::StatusLed(StatusLed::Off), &page);
         edits.set(Edit::Volume(50), &page);
-        edits.set(Edit::Denoise(false), &page);
-        let (mut run, first) = SaveRun::start(target, save_groups(&page, &edits).unwrap()).unwrap();
+        let mut run = SaveRun::new(target);
+        let Refreshed::Save(first) = run.read(&mut edits, &page, &HUB) else { panic!("the lights") };
+        assert_eq!(run.answered(0, &answer(&first, WriteReply::Code(200)), &mut edits), Some(SaveStep::ReadAgain));
+        assert_eq!(edits.list(), [Edit::Volume(50)]);
+        // Given up while the read for the volume is out: the tab's answer is
+        // still the read before the lights' write, which has the LED on.
+        let mut shown = edits.clone();
+        run.given_up(&mut shown, &page);
+        assert_eq!(shown.list(), [Edit::Volume(50), Edit::StatusLed(StatusLed::Off)]);
+        // An answer that has the LED off already shows it as the camera's.
+        let mut shown = edits.clone();
+        run.given_up(&mut shown, &led_off());
+        assert_eq!(shown.list(), [Edit::Volume(50)]);
+        // The volume saved too: only the read after it was out, and the
+        // saved rows stay gone.
+        let Refreshed::Save(second) = run.read(&mut edits, &led_off(), &HUB) else { panic!("the volume") };
+        assert_eq!(run.answered(0, &answer(&second, WriteReply::Code(200)), &mut edits), Some(SaveStep::ReadAgain));
+        let mut shown = edits.clone();
+        run.given_up(&mut shown, &page);
+        assert!(shown.is_empty());
+    }
+
+    #[test]
+    fn a_row_the_camera_did_not_keep_is_not_written_again() {
+        // The lights are answered 200, but the read after them still has the
+        // LED on: the next write is the volume's, built from that read, and
+        // the read after the save names the LED.
+        let page = light_sound();
+        let target = SettingsTarget::Camera { channel: 1, page: CameraPage::LightSound };
+        let mut edits = Edits::default();
+        edits.set(Edit::StatusLed(StatusLed::Off), &page);
+        edits.set(Edit::Volume(50), &page);
+        let mut run = SaveRun::new(target);
+        let Refreshed::Save(first) = run.read(&mut edits, &page, &HUB) else { panic!("the lights") };
+        assert_eq!(run.answered(0, &answer(&first, WriteReply::Code(200)), &mut edits), Some(SaveStep::ReadAgain));
+        let Refreshed::Save(second) = run.read(&mut edits, &page, &HUB) else { panic!("the volume") };
+        assert_eq!(second.edit, Edit::Volume(50));
+        assert!(second.writes[0].body().contains("<volume>50</volume>"));
+        assert_eq!(run.answered(0, &answer(&second, WriteReply::Code(200)), &mut edits), Some(SaveStep::ReadAgain));
+        let audio = AUDIO_READ.replace("<volume>92</volume>", "<volume>50</volume>");
+        let after = with_volume_50(light_sound(), Some(audio.as_str()));
+        assert_eq!(run.read(&mut edits, &after, &HUB), Refreshed::Done);
+        assert_eq!(not_kept(&run.saved(), &after), ["Status LED: the camera has On"]);
+    }
+
+    #[test]
+    fn a_save_stops_at_the_first_answer_other_than_200() {
+        // Two rows of the one 45: the name's write is refused, the date's
+        // never goes, and both edits stay.
+        let page = display();
+        let mut both = Edits::default();
+        both.set(Edit::NamePosition(OsdPosition::TopLeft), &page);
+        both.set(Edit::DateShown(false), &page);
+        let mut edits = both.clone();
+        let mut run = SaveRun::new(SettingsTarget::Camera { channel: 1, page: CameraPage::Display });
+        let Refreshed::Save(first) = run.read(&mut edits, &page, &HUB) else { panic!("the name") };
+        assert_eq!((first.edit, ids(&first)), (Edit::NamePosition(OsdPosition::TopLeft), vec![45]));
         run.sent_as(1);
-        assert_eq!(first[0].msg_id, 209);
-        assert_eq!(run.unsaved().len(), 3);
+        let step = run.answered(1, &answer(&first, WriteReply::Code(400)), &mut edits);
+        assert_eq!(step, Some(SaveStep::Refused { code: 400, msg_id: 45, saved: Vec::new(), row_saved: false }));
+        assert_eq!(edits, both);
+
+        let page = light_sound();
+        let target = SettingsTarget::Camera { channel: 1, page: CameraPage::LightSound };
+        let mut two = Edits::default();
+        two.set(Edit::StatusLed(StatusLed::Off), &page);
+        two.set(Edit::Volume(50), &page);
+        // The lights are refused: nothing is saved, the volume never goes.
+        let mut edits = two.clone();
+        let mut run = SaveRun::new(target);
+        let Refreshed::Save(first) = run.read(&mut edits, &page, &HUB) else { panic!("the lights") };
+        run.sent_as(1);
         // An answer under another number (an earlier save's, late) is not
-        // this save's.
-        assert_eq!(run.answered(7, &answer(&[209], WriteReply::Code(200))), None);
-        assert_eq!(run.unsaved().len(), 3);
-        let Some(SaveStep::Send(next)) = run.answered(1, &answer(&[209], WriteReply::Code(200))) else {
-            panic!("next group")
-        };
-        assert_eq!(next[0].msg_id, 265);
+        // this write's.
+        assert_eq!(run.answered(7, &answer(&first, WriteReply::Code(200)), &mut edits), None);
+        assert_eq!(edits, two);
+        let step = run.answered(1, &answer(&first, WriteReply::Code(400)), &mut edits);
+        assert_eq!(step, Some(SaveStep::Refused { code: 400, msg_id: 209, saved: Vec::new(), row_saved: false }));
+        assert_eq!(refusal(400, 209, false), "The camera refused the change (code 400).");
+        assert_eq!(edits, two);
+        assert_eq!(run.answered(1, &answer(&first, WriteReply::Code(200)), &mut edits), None, "answered already");
+        // The lights saved, the volume refused: the lights stay saved.
+        let mut edits = two.clone();
+        let mut run = SaveRun::new(target);
+        let Refreshed::Save(first) = run.read(&mut edits, &page, &HUB) else { panic!("the lights") };
         run.sent_as(2);
-        assert_eq!(run.answered(1, &answer(&[209], WriteReply::Code(200))), None, "the first group's again");
-        // The volume is refused: the lights stay saved, noise reduction is
-        // never sent.
-        let step = run.answered(2, &answer(&[265], WriteReply::Code(400)));
+        assert_eq!(run.answered(2, &answer(&first, WriteReply::Code(200)), &mut edits), Some(SaveStep::ReadAgain));
+        // Waiting for the read: no write is out.
+        assert_eq!(run.answered(2, &answer(&first, WriteReply::Code(200)), &mut edits), None);
+        let Refreshed::Save(second) = run.read(&mut edits, &led_off(), &HUB) else { panic!("the volume") };
+        run.sent_as(3);
+        assert_eq!(run.answered(2, &answer(&first, WriteReply::Code(200)), &mut edits), None, "the lights' again");
+        let step = run.answered(3, &answer(&second, WriteReply::Code(400)), &mut edits);
         let saved = vec![Edit::StatusLed(StatusLed::Off)];
-        assert_eq!(step, Some(SaveStep::Refused { code: 400, msg_id: 265, saved: saved.clone() }));
-        assert_eq!(refusal(400, 265, &saved), "The camera refused the change (code 400).");
-        assert_eq!(run.unsaved(), [Edit::Volume(50), Edit::Denoise(false)]);
+        assert_eq!(step, Some(SaveStep::Refused { code: 400, msg_id: 265, saved, row_saved: false }));
+        assert_eq!(edits.list(), [Edit::Volume(50)]);
 
-        // All answered 200.
-        let (mut run, _) = SaveRun::start(target, save_groups(&page, &edits).unwrap()).unwrap();
-        assert!(matches!(run.answered(0, &answer(&[209], WriteReply::Code(200))), Some(SaveStep::Send(_))));
-        assert!(matches!(run.answered(0, &answer(&[265], WriteReply::Code(200))), Some(SaveStep::Send(_))));
-        let Some(SaveStep::Done { saved }) = run.answered(0, &answer(&[440], WriteReply::Code(200))) else {
-            panic!("done")
-        };
-        assert_eq!(saved.len(), 3);
-
-        // The picture pair: the 25 carries the edits, so they are saved once
-        // it answered 200, even when its 297 then has no answer or is
+        // The picture pair: the 25 carries the row, so it is saved once the
+        // 25 answered 200, even when its 297 then has no answer or is
         // refused; the status says which.
         let page = image();
         let target = SettingsTarget::Camera { channel: 1, page: CameraPage::Image };
-        let mut edits = Edits::default();
-        edits.set(Edit::Flip(true), &page);
-        let (mut run, writes) = SaveRun::start(target, save_groups(&page, &edits).unwrap()).unwrap();
-        assert_eq!(writes.len(), 2);
+        let mut flip = Edits::default();
+        flip.set(Edit::Flip(true), &page);
+        let start = |edits: &mut Edits| {
+            let mut run = SaveRun::new(target);
+            let Refreshed::Save(group) = run.read(edits, &page, &HUB) else { panic!("the flip") };
+            assert_eq!(ids(&group), [25, 297]);
+            run
+        };
         let mut results = [
             WriteOutcome { msg_id: 25, reply: WriteReply::Code(200) },
             WriteOutcome { msg_id: 297, reply: WriteReply::NoReply },
         ];
-        assert_eq!(run.answered(0, &results), Some(SaveStep::NoAnswer { saved: vec![Edit::Flip(true)] }));
-        let (mut run, _) = SaveRun::start(target, save_groups(&page, &edits).unwrap()).unwrap();
+        let mut edits = flip.clone();
+        let step = start(&mut edits).answered(0, &results, &mut edits);
+        assert_eq!(step, Some(SaveStep::NoAnswer { saved: vec![Edit::Flip(true)] }));
+        assert!(edits.is_empty());
         results[1].reply = WriteReply::Code(400);
-        let step = run.answered(0, &results);
-        assert_eq!(step, Some(SaveStep::Refused { code: 400, msg_id: 297, saved: vec![Edit::Flip(true)] }));
-        assert!(refusal(400, 297, &[Edit::Flip(true)]).starts_with("The picture change was saved;"));
+        let mut edits = flip.clone();
+        let step = start(&mut edits).answered(0, &results, &mut edits);
+        let saved = vec![Edit::Flip(true)];
+        assert_eq!(step, Some(SaveStep::Refused { code: 400, msg_id: 297, saved, row_saved: true }));
+        assert!(refusal(400, 297, true).starts_with("The picture change was saved;"));
         // The 25 itself refused, or not answered: nothing saved.
-        let (mut run, _) = SaveRun::start(target, save_groups(&page, &edits).unwrap()).unwrap();
         results[0].reply = WriteReply::Code(401);
-        assert_eq!(run.answered(0, &results), Some(SaveStep::Refused { code: 401, msg_id: 25, saved: Vec::new() }));
-        let (mut run, _) = SaveRun::start(target, save_groups(&page, &edits).unwrap()).unwrap();
+        let mut edits = flip.clone();
+        let step = start(&mut edits).answered(0, &results, &mut edits);
+        assert_eq!(step, Some(SaveStep::Refused { code: 401, msg_id: 25, saved: Vec::new(), row_saved: false }));
         results[0].reply = WriteReply::NoReply;
-        let step = run.answered(0, &results);
-        assert_eq!(step, Some(SaveStep::Refused { code: 400, msg_id: 297, saved: Vec::new() }));
-        assert_eq!(refusal(400, 297, &[]), "The camera refused the change (code 400).");
-        let (mut run, _) = SaveRun::start(target, save_groups(&page, &edits).unwrap()).unwrap();
-        let none_sent = run.answered(0, &answer(&[25, 297], WriteReply::NotSent));
-        assert_eq!(none_sent, Some(SaveStep::NoAnswer { saved: Vec::new() }));
-        assert!(SaveRun::start(target, Vec::new()).is_none());
+        let mut edits = flip.clone();
+        let step = start(&mut edits).answered(0, &results, &mut edits);
+        assert_eq!(step, Some(SaveStep::Refused { code: 400, msg_id: 297, saved: Vec::new(), row_saved: false }));
+        assert_eq!(refusal(400, 297, false), "The camera refused the change (code 400).");
+        assert_eq!(edits, flip);
+        let mut edits = flip.clone();
+        let mut run = start(&mut edits);
+        let none_sent = [25, 297].map(|msg_id| WriteOutcome { msg_id, reply: WriteReply::NotSent });
+        assert_eq!(run.answered(0, &none_sent, &mut edits), Some(SaveStep::NoAnswer { saved: Vec::new() }));
+        // A second picture row whose 297 is refused after its own 25 had no
+        // answer: the first row is saved, this one is not, and the status
+        // does not say the picture change was.
+        let mut edits = flip.clone();
+        edits.set(Edit::Brightness(140), &page);
+        let mut run = SaveRun::new(target);
+        let Refreshed::Save(first) = run.read(&mut edits, &page, &HUB) else { panic!("the brightness") };
+        assert_eq!(run.answered(0, &answer(&first, WriteReply::Code(200)), &mut edits), Some(SaveStep::ReadAgain));
+        let Refreshed::Save(second) = run.read(&mut edits, &page, &HUB) else { panic!("the flip") };
+        assert_eq!(second.edit, Edit::Flip(true));
+        let step = run.answered(0, &results, &mut edits);
+        let saved = vec![Edit::Brightness(140)];
+        assert_eq!(step, Some(SaveStep::Refused { code: 400, msg_id: 297, saved, row_saved: false }));
+        assert_eq!(refusal(400, 297, false), "The camera refused the change (code 400).");
+        assert_eq!(edits, flip);
     }
 
     #[test]
@@ -1127,7 +1420,10 @@ mod tests {
     #[test]
     fn the_noise_reduction_level_is_locked_while_noise_reduction_is_off() {
         let body = |page: &SettingsPage, edits: &Edits| {
-            save_groups(page, edits).unwrap()[0].writes[0].body().to_string()
+            let Refreshed::Save(group) = refreshed(&mut edits.clone(), page, &HUB_RLC, false) else {
+                panic!("a write")
+            };
+            group.writes[0].body().to_string()
         };
         // On: the level is free. A new level, then noise reduction turned
         // off: the level goes, and the write is enable 0 with the device's
@@ -1141,8 +1437,9 @@ mod tests {
         assert!(locked(&on, Field::DenoiseLevel, &edits));
         assert!(body(&on, &edits).contains("<enable>0</enable>\n<level>4</level>"));
         // Off: the level is locked and takes no edit. Turned on, a new level
-        // goes with it (enable 1 with the new level); off again, nothing is
-        // left to save.
+        // goes after it: the first write turns noise reduction on with the
+        // device's own level, the next, built from a read with it on, sets
+        // the new level. Off again, nothing is left to save.
         let off = denoise_off();
         let mut edits = Edits::default();
         assert!(locked(&off, Field::DenoiseLevel, &edits));
@@ -1152,7 +1449,27 @@ mod tests {
         assert!(!locked(&off, Field::DenoiseLevel, &edits));
         edits.set(Edit::DenoiseLevel(3), &off);
         assert_eq!(edits.list(), [Edit::Denoise(true), Edit::DenoiseLevel(3)]);
-        assert!(body(&off, &edits).contains("<enable>1</enable>\n<level>3</level>"));
+        let target = SettingsTarget::Camera { channel: 1, page: CameraPage::LightSound };
+        let start = |saving: &mut Edits| {
+            let mut run = SaveRun::new(target);
+            let Refreshed::Save(first) = run.read(saving, &off, &HUB_RLC) else { panic!("noise reduction") };
+            assert_eq!((first.edit, ids(&first)), (Edit::Denoise(true), vec![440]));
+            assert!(first.writes[0].body().contains("<enable>1</enable>\n<level>4</level>"));
+            assert_eq!(run.answered(0, &answer(&first, WriteReply::Code(200)), saving), Some(SaveStep::ReadAgain));
+            run
+        };
+        let mut saving = edits.clone();
+        let mut run = start(&mut saving);
+        let Refreshed::Save(then) = run.read(&mut saving, &on, &HUB_RLC) else { panic!("the level") };
+        assert_eq!(then.edit, Edit::DenoiseLevel(3));
+        assert!(then.writes[0].body().contains("<enable>1</enable>\n<level>3</level>"));
+        assert_eq!(changes(&on, &then), ["<level>3</level>"]);
+        // Still off by the read after that write: the level is locked again
+        // and not written.
+        let mut saving = edits.clone();
+        let mut run = start(&mut saving);
+        assert_eq!(run.read(&mut saving, &off, &HUB_RLC), Refreshed::Changed);
+        assert!(saving.is_empty());
         edits.set(Edit::Denoise(false), &off);
         assert!(edits.is_empty());
         let view = EditView { gate: HUB_RLC, edits: &edits, enabled: true };
@@ -1162,7 +1479,7 @@ mod tests {
         let mut level = Edits::default();
         level.set(Edit::DenoiseLevel(3), &on);
         let mut mine = level.clone();
-        assert_eq!(refreshed(&mut mine, &off, &HUB_RLC), Refreshed::Changed);
+        assert_eq!(refreshed(&mut mine, &off, &HUB_RLC, false), Refreshed::Changed);
         assert!(mine.is_empty());
         // The 439 read failed: noise reduction is not known to be off, so
         // the level edit stays and nothing goes.
@@ -1172,7 +1489,7 @@ mod tests {
         let unread = SettingsPage::CameraLightSound { channel, page: read };
         assert!(!locked(&unread, Field::DenoiseLevel, &level));
         let mut mine = level.clone();
-        assert_eq!(refreshed(&mut mine, &unread, &HUB_RLC), Refreshed::NotRead);
+        assert_eq!(refreshed(&mut mine, &unread, &HUB_RLC, false), Refreshed::NotRead);
         assert_eq!(mine, level);
         // A 439 answered 200 without its root tells no more than a failed
         // read: the edit stays, nothing goes.
@@ -1182,7 +1499,7 @@ mod tests {
         read.raw = raw(&[(208, LED_READ), (264, AUDIO_READ), (439, empty)]);
         let rootless = SettingsPage::CameraLightSound { channel, page: read };
         let mut mine = level.clone();
-        assert_eq!(refreshed(&mut mine, &rootless, &HUB_RLC), Refreshed::NotRead);
+        assert_eq!(refreshed(&mut mine, &rootless, &HUB_RLC, false), Refreshed::NotRead);
         assert_eq!(mine, level);
         mine.settle(&rootless, &HUB_RLC);
         assert_eq!(mine, level);
