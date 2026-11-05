@@ -151,6 +151,54 @@ pub fn looks_multi_channel(name: &str, model: &str) -> bool {
 /// without: the name is a nicety, the video must not wait for it.
 const IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How `identity`'s version request ended, for the negotiation debug output.
+#[derive(Debug)]
+enum VersionAnswer {
+    /// The request could not be sent.
+    NotSent(Error),
+    /// The reply came, with this code; `body` says what its body gave.
+    Reply { code: u16, body: VersionBody },
+    /// Reading the connection failed.
+    RecvError(Error),
+    /// Only other messages came, as many as `identity` reads.
+    OnlyOthers,
+    /// Nothing within `IDENTITY_TIMEOUT`.
+    TimedOut,
+}
+
+/// What the body of the version reply gave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionBody {
+    Empty,
+    Unparsed,
+    NoVersionInfo,
+    VersionInfo,
+}
+
+impl VersionAnswer {
+    /// The debug line's text: how the request ended, `elapsed` after it was
+    /// sent, with `others` other messages read meanwhile.
+    fn describe(&self, elapsed: std::time::Duration, others: usize) -> String {
+        let ms = elapsed.as_millis();
+        let others = if others == 1 { "1 other message".to_string() } else { format!("{others} other messages") };
+        match self {
+            Self::Reply { code, body } => {
+                let body = match body {
+                    VersionBody::Empty => "no body",
+                    VersionBody::Unparsed => "the body did not parse",
+                    VersionBody::NoVersionInfo => "no VersionInfo in the body",
+                    VersionBody::VersionInfo => "VersionInfo read",
+                };
+                format!("version reply code {code} after {ms} ms ({others}), {body}")
+            }
+            Self::NotSent(e) => format!("version request not sent: {e}"),
+            Self::RecvError(e) => format!("receive error after {ms} ms ({others}): {e}"),
+            Self::OnlyOthers => format!("no version reply among {others} ({ms} ms)"),
+            Self::TimedOut => format!("no version reply within {} s ({others})", IDENTITY_TIMEOUT.as_secs()),
+        }
+    }
+}
+
 /// How long the session may carry no BC message before `wait_for_pushes`
 /// sends `MSG_ID_LINK_TYPE`, and then how often while none comes: about the
 /// official app's own period while it streams nothing. A Home Hub Pro ends a
@@ -1343,46 +1391,13 @@ impl ReolinkClient {
         }
         // Which camera can do what: the support table, one row per channel.
         self.request_for_channel(MSG_ID_SUPPORT, 0).await;
-        let msg_num = self.next_msg_num();
-        let request = Bc {
-            meta: BcMeta {
-                msg_id: MSG_ID_VERSION,
-                channel_id: 0,
-                stream_type: 0,
-                msg_num,
-                response_code: 0,
-                class: 0x6414,
-            },
-            body: BcBody::Modern(ModernMsg { extension_xml: None, payload: None }),
-        };
-        let mut info: Option<VersionInfo> = None;
-        let exchange = async {
-            if self.connection.lock().await.send_bc(&request, &self.encryption).await.is_err() {
-                return;
-            }
-            let mut image_chunks = HashMap::new();
-            for _ in 0..16 {
-                let Ok(reply) = self.connection.lock().await.recv_bc(&self.encryption).await
-                else {
-                    return;
-                };
-                if let Some(update) = pushed_update(&reply, &mut image_chunks, &self.pending_images, &self.channel_uids) {
-                    let _ = self.channel_updates_tx.send(update);
-                    continue;
-                }
-                if reply.meta.msg_id != MSG_ID_VERSION {
-                    continue;
-                }
-                if let BcBody::Modern(ModernMsg { payload: Some(payload), .. }) = reply.body {
-                    info = BcXml::from_bytes(&payload).ok().and_then(|x| x.version_info);
-                }
-                return;
-            }
-        };
-        let _ = tokio::time::timeout(IDENTITY_TIMEOUT, exchange).await;
+        let asked = std::time::Instant::now();
+        let (info, answer, others) = self.ask_version().await;
         let (name, model) = info.map(|i| (i.name, i.model)).unwrap_or_default();
         if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
-            eprintln!("{}DEBUG identity reply: name={name:?} model={model:?}", since_login(self.logged_in_at));
+            let at = since_login(self.logged_in_at);
+            eprintln!("{at}DEBUG identity version: {}", answer.describe(asked.elapsed(), others));
+            eprintln!("{at}DEBUG identity reply: name={name:?} model={model:?}");
         }
         // Diagnostic-only: a scripted recorded-video session on one channel
         // (see `probe_replay`), or an event search (see `probe_events`).
@@ -1397,6 +1412,73 @@ impl ReolinkClient {
             self.probe_events(channel_id, &tag).await;
         }
         DeviceIdentity { name, model }
+    }
+
+    /// Sends the version request (80) and reads until its reply, for at most
+    /// `IDENTITY_TIMEOUT` and 16 other messages, passing pushes on. Returns
+    /// the `VersionInfo` of the reply, how the request ended and how many
+    /// other messages came meanwhile. A reply's body is read whatever its
+    /// code: our Hub and NVR answer some requests with 300 and a full body.
+    async fn ask_version(&mut self) -> (Option<VersionInfo>, VersionAnswer, usize) {
+        let msg_num = self.next_msg_num();
+        let request = Bc {
+            meta: BcMeta {
+                msg_id: MSG_ID_VERSION,
+                channel_id: 0,
+                stream_type: 0,
+                msg_num,
+                response_code: 0,
+                class: 0x6414,
+            },
+            body: BcBody::Modern(ModernMsg { extension_xml: None, payload: None }),
+        };
+        let mut info: Option<VersionInfo> = None;
+        let mut answer = VersionAnswer::TimedOut;
+        let mut others = 0;
+        let exchange = async {
+            if let Err(e) = self.connection.lock().await.send_bc(&request, &self.encryption).await {
+                answer = VersionAnswer::NotSent(e);
+                return;
+            }
+            let mut image_chunks = HashMap::new();
+            for _ in 0..16 {
+                let reply = match self.connection.lock().await.recv_bc(&self.encryption).await {
+                    Ok(reply) => reply,
+                    Err(e) => {
+                        answer = VersionAnswer::RecvError(e);
+                        return;
+                    }
+                };
+                if let Some(update) = pushed_update(&reply, &mut image_chunks, &self.pending_images, &self.channel_uids) {
+                    let _ = self.channel_updates_tx.send(update);
+                    others += 1;
+                    continue;
+                }
+                if reply.meta.msg_id != MSG_ID_VERSION {
+                    others += 1;
+                    continue;
+                }
+                let body = match reply.body {
+                    BcBody::Modern(ModernMsg { payload: Some(payload), .. }) => match BcXml::from_bytes(&payload) {
+                        Ok(xml) => {
+                            info = xml.version_info;
+                            if info.is_some() {
+                                VersionBody::VersionInfo
+                            } else {
+                                VersionBody::NoVersionInfo
+                            }
+                        }
+                        Err(_) => VersionBody::Unparsed,
+                    },
+                    _ => VersionBody::Empty,
+                };
+                answer = VersionAnswer::Reply { code: reply.meta.response_code, body };
+                return;
+            }
+            answer = VersionAnswer::OnlyOthers;
+        };
+        let _ = tokio::time::timeout(IDENTITY_TIMEOUT, exchange).await;
+        (info, answer, others)
     }
 
     /// Diagnostic-only (`REOLING_PROBE_PUSH`): sends the empty requests the
@@ -2302,6 +2384,44 @@ mod control_tests {
     }
 
     #[test]
+    fn the_identity_debug_line_says_how_the_version_request_ended() {
+        let ms = std::time::Duration::from_millis;
+        let reply = |code, body| VersionAnswer::Reply { code, body };
+        assert_eq!(
+            reply(200, VersionBody::VersionInfo).describe(ms(143), 2),
+            "version reply code 200 after 143 ms (2 other messages), VersionInfo read"
+        );
+        assert_eq!(
+            reply(400, VersionBody::Empty).describe(ms(90), 0),
+            "version reply code 400 after 90 ms (0 other messages), no body"
+        );
+        assert_eq!(
+            reply(300, VersionBody::Unparsed).describe(ms(71), 1),
+            "version reply code 300 after 71 ms (1 other message), the body did not parse"
+        );
+        assert_eq!(
+            reply(200, VersionBody::NoVersionInfo).describe(ms(5), 0),
+            "version reply code 200 after 5 ms (0 other messages), no VersionInfo in the body"
+        );
+        assert_eq!(
+            VersionAnswer::TimedOut.describe(ms(2001), 3),
+            "no version reply within 2 s (3 other messages)"
+        );
+        assert_eq!(
+            VersionAnswer::OnlyOthers.describe(ms(480), 16),
+            "no version reply among 16 other messages (480 ms)"
+        );
+        assert_eq!(
+            VersionAnswer::RecvError(Error::ConnectionLost).describe(ms(12), 1),
+            "receive error after 12 ms (1 other message): connection lost"
+        );
+        assert_eq!(
+            VersionAnswer::NotSent(Error::ConnectionLost).describe(ms(0), 0),
+            "version request not sent: connection lost"
+        );
+    }
+
+    #[test]
     fn channel_uids_follow_the_latest_channel_list() {
         let uids = std::sync::Mutex::new(HashMap::new());
         let channel = |channel_id: u8, uid: Option<&str>| ChannelInfo {
@@ -2766,6 +2886,42 @@ mod keepalive_tests {
         assert_eq!((msg_id, second), (MSG_ID_VIDEO, 2));
         assert_eq!(client.live_msg_num, Some(second));
         fake.abort();
+    }
+
+    /// The version request's reply is read whatever its code, and how it
+    /// ended is told apart: a refusal with no body, a body under 300 that
+    /// gives the name and model, a body that does not parse; a push before
+    /// the reply is counted.
+    #[tokio::test]
+    async fn the_version_reply_is_read_whatever_its_code() {
+        let (mut client, mut device) = client_and_device().await;
+        let version = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<VersionInfo version=\"1.1\">\n\
+                       <name>Test hub</name>\n<type>TESTMODEL</type>\n</VersionInfo>\n</body>\n";
+        let fake = tokio::spawn(async move {
+            let replies: [(u16, Option<&str>); 3] = [(400, None), (300, Some(version)), (200, Some("<body"))];
+            for (index, (code, body)) in replies.into_iter().enumerate() {
+                let request = device.recv_bc(&PLAIN).await.unwrap();
+                assert_eq!(request.meta.msg_id, MSG_ID_VERSION);
+                if index == 1 {
+                    device.send_bc(&alarm_push(), &PLAIN).await.unwrap();
+                }
+                let reply = device_message(MSG_ID_VERSION, request.meta.msg_num, code, None, body.map(|b| b.into()));
+                device.send_bc(&reply, &PLAIN).await.unwrap();
+            }
+        });
+        let (info, answer, others) = client.ask_version().await;
+        assert!(info.is_none());
+        assert!(matches!(answer, VersionAnswer::Reply { code: 400, body: VersionBody::Empty }), "{answer:?}");
+        assert_eq!(others, 0);
+        let (info, answer, others) = client.ask_version().await;
+        let info = info.expect("the body under 300 is read");
+        assert_eq!((info.name.as_deref(), info.model.as_deref()), (Some("Test hub"), Some("TESTMODEL")));
+        assert!(matches!(answer, VersionAnswer::Reply { code: 300, body: VersionBody::VersionInfo }), "{answer:?}");
+        assert_eq!(others, 1);
+        let (info, answer, _) = client.ask_version().await;
+        assert!(info.is_none());
+        assert!(matches!(answer, VersionAnswer::Reply { code: 200, body: VersionBody::Unparsed }), "{answer:?}");
+        fake.await.unwrap();
     }
 
     /// A Preview answered with 400 and no body, the shape of every 400 in our
