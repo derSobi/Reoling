@@ -151,6 +151,16 @@ pub fn looks_multi_channel(name: &str, model: &str) -> bool {
 /// without: the name is a nicety, the video must not wait for it.
 const IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long a login step waits for its reply in all, other messages read
+/// past included (see `ReolinkClient::recv_login_reply`): the connection's
+/// own reply timeout.
+const LOGIN_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How many messages a login step reads in all, the reply counted: up to 63
+/// others can come ahead of it. The limit is generous: `LOGIN_REPLY_TIMEOUT` is
+/// the bound that matters.
+const LOGIN_READ_LIMIT: usize = 64;
+
 /// How `identity`'s version request ended, for the negotiation debug output.
 #[derive(Debug)]
 enum VersionAnswer {
@@ -991,7 +1001,7 @@ impl ReolinkClient {
                 body: BcBody::Legacy(LegacyMsg::LoginUpgrade),
             };
             self.connection.lock().await.send_bc(&legacy_login, &self.encryption).await?;
-            let reply = self.connection.lock().await.recv_bc(&self.encryption).await?;
+            let reply = self.recv_login_reply(msg_num).await?;
             let BcBody::Modern(ModernMsg { payload: Some(payload), .. }) = reply.body else {
                 return Err(Error::ProtocolError("expected an Encryption reply".to_string()));
             };
@@ -1032,7 +1042,7 @@ impl ReolinkClient {
             }),
         };
         self.connection.lock().await.send_bc(&modern_login, &self.encryption).await?;
-        let reply = self.connection.lock().await.recv_bc(&self.encryption).await?;
+        let reply = self.recv_login_reply(msg_num).await?;
         if reply.meta.response_code != 200 {
             return Err(Error::LoginFailed { code: reply.meta.response_code });
         }
@@ -1056,6 +1066,35 @@ impl ReolinkClient {
         Ok(DeviceInfoSummary {
             resolution_name: device_info.resolution.and_then(|r| r.name),
         })
+    }
+
+    /// Reads until the reply to a login step: `MSG_ID_LOGIN` under the
+    /// request's number, as every login reply in our captures is. A device
+    /// can push before it answers: our RLN36 on firmware v3.5 sent an alarm
+    /// push (33 under 0) ahead of its nonce reply in one run of 14, and the
+    /// login took it for the reply. Other messages are passed on like any
+    /// push and read past, for at most `LOGIN_READ_LIMIT` messages, the reply
+    /// counted, and `LOGIN_REPLY_TIMEOUT` for the whole step.
+    async fn recv_login_reply(&self, msg_num: u16) -> crate::Result<Bc> {
+        let mut image_chunks = HashMap::new();
+        let read = async {
+            for _ in 0..LOGIN_READ_LIMIT {
+                let reply = self.connection.lock().await.recv_bc(&self.encryption).await?;
+                if reply.meta.msg_id == MSG_ID_LOGIN && reply.meta.msg_num == msg_num {
+                    return Ok(reply);
+                }
+                if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
+                    let at = debug_prefix(self.debug_id, None);
+                    eprintln!("{at}DEBUG login: read past message {} under {}", reply.meta.msg_id, reply.meta.msg_num);
+                }
+                let update = pushed_update(&reply, &mut image_chunks, &self.pending_images, &self.channel_uids);
+                if let Some(update) = update {
+                    let _ = self.channel_updates_tx.send(update);
+                }
+            }
+            Err(Error::ProtocolError(format!("no login reply among {LOGIN_READ_LIMIT} messages")))
+        };
+        tokio::time::timeout(LOGIN_REPLY_TIMEOUT, read).await.map_err(|_| Error::ReplyTimeout)?
     }
 
     /// A command about one channel: the channel goes in the extension, the
@@ -2558,20 +2597,29 @@ mod keepalive_tests {
 
     /// The same, with the client encrypting as `encryption` says.
     async fn client_and_device_with(encryption: EncryptionProtocol) -> (ReolinkClient, BcConnection) {
+        client_and_device_with_nonce(encryption, None).await
+    }
+
+    /// The same, with the login nonce the P2P handshake gave the client, if
+    /// it gave one.
+    async fn client_and_device_with_nonce(
+        encryption: EncryptionProtocol,
+        nonce: Option<&str>,
+    ) -> (ReolinkClient, BcConnection) {
         let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let device_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let client_addr = client_socket.local_addr().unwrap();
         let device_addr = device_socket.local_addr().unwrap();
-        let peer = |addr, local_connection_id, remote_connection_id| PeerHandle {
+        let peer = |addr, local_connection_id, remote_connection_id, nonce: Option<&str>| PeerHandle {
             addr,
             local_connection_id,
             remote_connection_id,
-            nonce: None,
+            nonce: nonce.map(str::to_string),
             is_direct: false,
         };
-        let device = BcConnection::new(device_socket, peer(client_addr, 2, 1));
-        let client =
-            ReolinkClient::from_connection(BcConnection::new(client_socket, peer(device_addr, 1, 2)), encryption);
+        let device = BcConnection::new(device_socket, peer(client_addr, 2, 1, None));
+        let connection = BcConnection::new(client_socket, peer(device_addr, 1, 2, nonce));
+        let client = ReolinkClient::from_connection(connection, encryption);
         (client, device)
     }
 
@@ -3101,5 +3149,254 @@ mod keepalive_tests {
         }
         let asked = fake.await.unwrap();
         assert_eq!(asked, [(MSG_ID_VIDEO, 1), (MSG_ID_IMAGE_FILE, 2), (MSG_ID_IMAGE_FILE, 2)]);
+    }
+
+    /// The nonce reply as our RLN36 on firmware v3.5 sends it in every
+    /// capture: login under the request's number, 0xdd12 (a BCEncrypt body),
+    /// class 0x6614.
+    fn nonce_reply(msg_num: u16, nonce: &str) -> Bc {
+        let xml = BcXml {
+            encryption: Some(Encryption {
+                version: XML_VERSION.to_string(),
+                type_: "md5".to_string(),
+                nonce: nonce.to_string(),
+            }),
+            ..Default::default()
+        };
+        Bc {
+            meta: BcMeta {
+                msg_id: MSG_ID_LOGIN,
+                channel_id: 0,
+                stream_type: 0,
+                msg_num,
+                response_code: 0xdd12,
+                class: 0x6614,
+            },
+            body: BcBody::Modern(ModernMsg { extension_xml: None, payload: Some(xml.to_bytes()) }),
+        }
+    }
+
+    /// A message shaped as the login reply: 200 and a stream list of one
+    /// table, of `stream` at 640x360 and 10 fps.
+    fn stream_list_message(msg_id: u32, msg_num: u16, stream: &str) -> Bc {
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<DeviceInfo version=\"1.1\">\n</DeviceInfo>\n\
+             <StreamInfoList version=\"1.1\">\n<StreamInfo>\n<channelBits>1</channelBits>\n<encodeTable>\n\
+             <type>{stream}</type>\n<resolution>\n<width>640</width>\n<height>360</height>\n</resolution>\n\
+             <defaultFramerate>10</defaultFramerate>\n</encodeTable>\n</StreamInfo>\n</StreamInfoList>\n\
+             </body>\n"
+        );
+        device_message(msg_id, msg_num, 200, None, Some(xml.into_bytes()))
+    }
+
+    /// The login reply: 200 under the request's number, with a stream list of
+    /// one table.
+    fn login_reply(msg_num: u16) -> Bc {
+        stream_list_message(MSG_ID_LOGIN, msg_num, "subStream")
+    }
+
+    /// What `login_reply`'s stream list reads as.
+    const LOGIN_REPLY_STREAMS: &str = "channels 0x1: subStream 640x360 10 fps";
+
+    /// A channel list push (145 under 0) of one channel, with a placeholder
+    /// camera UID.
+    fn channel_list_push() -> Bc {
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<ChannelInfoList version=\"1.1\">\n\
+                   <ChannelInfo>\n<channelId>0</channelId>\n<devName>Test cam</devName>\n<state>connect</state>\n\
+                   <uid>TESTCAMUID000001</uid>\n</ChannelInfo>\n</ChannelInfoList>\n</body>\n";
+        device_message(MSG_ID_CHANNEL_INFO, 0, 200, None, Some(xml.as_bytes().to_vec()))
+    }
+
+    /// The header `login` always sends its two requests with: login, channel
+    /// 0, under 1 (its first request).
+    fn login_request_meta(response_code: u16, class: u16) -> BcMeta {
+        BcMeta { msg_id: MSG_ID_LOGIN, channel_id: 0, stream_type: 0, msg_num: 1, response_code, class }
+    }
+
+    /// The device end of a login with the nonce step (no nonce from the P2P
+    /// handshake): checks that the upgrade request is the one `login` always
+    /// sends, sends `before_nonce` ahead of the nonce reply, then goes on as
+    /// `fake_login_step`.
+    async fn fake_login_with_nonce_step(
+        mut device: BcConnection,
+        before_nonce: Vec<Bc>,
+        before_login: Vec<Bc>,
+        reply: fn(u16) -> Bc,
+    ) {
+        let upgrade = device.recv_bc(&PLAIN).await.unwrap();
+        assert_eq!(upgrade.meta, login_request_meta(0xdc12, 0x6514));
+        assert!(matches!(upgrade.body, BcBody::Legacy(LegacyMsg::LoginUpgrade)), "{:?}", upgrade.body);
+        // Before the login the device has no key: these go out as it would
+        // send them, which the client cannot read.
+        for message in &before_nonce {
+            device.send_bc(message, &EncryptionProtocol::BcEncrypt).await.unwrap();
+        }
+        device.send_bc(&nonce_reply(upgrade.meta.msg_num, "TESTNONCE"), &EncryptionProtocol::BcEncrypt).await.unwrap();
+        fake_login_step(device, before_login, reply).await;
+    }
+
+    /// The device end of the login step, with the nonce "TESTNONCE": checks
+    /// that the request is the one `login` always sends, hashed with that
+    /// nonce, and sends `before_reply` ahead of `reply` under the request's
+    /// number.
+    async fn fake_login_step(mut device: BcConnection, before_reply: Vec<Bc>, reply: fn(u16) -> Bc) {
+        let aes = EncryptionProtocol::Aes { key: aes_key_from_password("swordfish", "TESTNONCE") };
+        let login = device.recv_bc(&aes).await.unwrap();
+        assert_eq!(login.meta, login_request_meta(0, 0x6414));
+        let BcBody::Modern(ModernMsg { extension_xml: None, payload: Some(payload) }) = &login.body else {
+            panic!("{:?}", login.body);
+        };
+        let user = BcXml::from_bytes(payload).unwrap().login_user.unwrap();
+        assert_eq!(user.user_name, md5_hex_truncated("adminTESTNONCE"), "hashed with the nonce of the reply");
+        assert_eq!(user.password, md5_hex_truncated("swordfishTESTNONCE"));
+        for message in &before_reply {
+            device.send_bc(message, &aes).await.unwrap();
+        }
+        device.send_bc(&reply(login.meta.msg_num), &aes).await.unwrap();
+    }
+
+    /// An alarm push (33 under 0) ahead of the nonce reply, as our RLN36 on
+    /// firmware v3.5 sent one in a run, is read past: the login goes on
+    /// with the nonce of the reply.
+    #[tokio::test]
+    async fn a_push_before_the_nonce_reply_is_read_past() {
+        let (mut client, device) = client_and_device().await;
+        let fake = tokio::spawn(fake_login_with_nonce_step(device, vec![alarm_push()], Vec::new(), login_reply));
+        client.login("admin", "swordfish").await.unwrap();
+        assert_eq!(describe_streams(&client.encode_profiles()), LOGIN_REPLY_STREAMS);
+        fake.await.unwrap();
+    }
+
+    /// Ahead of the login reply, neither an alarm push nor a channel list is
+    /// taken for it (the reply's stream list is the one kept), and the
+    /// channel list is passed on, its camera UID kept for recorded video.
+    #[tokio::test]
+    async fn a_push_before_the_login_reply_is_read_past_and_passed_on() {
+        let (mut client, device) = client_and_device().await;
+        let mut updates = client.take_channel_updates().unwrap();
+        let pushes = vec![alarm_push(), channel_list_push()];
+        let fake = tokio::spawn(fake_login_with_nonce_step(device, Vec::new(), pushes, login_reply));
+        client.login("admin", "swordfish").await.unwrap();
+        assert_eq!(describe_streams(&client.encode_profiles()), LOGIN_REPLY_STREAMS);
+        match updates.try_recv() {
+            Ok(DeviceUpdate::Channels(channels)) => assert_eq!(channels.len(), 1),
+            other => panic!("expected the channel list, got {other:?}"),
+        }
+        assert_eq!(client.channel_uid(0).as_ref().map(CameraUid::as_str), Some("TESTCAMUID000001"));
+        fake.await.unwrap();
+    }
+
+    /// The same when the nonce came from the P2P handshake, as on our Hub and
+    /// our RLN36 on firmware v3.6: only the login step reads.
+    #[tokio::test]
+    async fn a_push_before_the_login_reply_is_read_past_with_the_nonce_from_the_handshake() {
+        let (mut client, device) = client_and_device_with_nonce(PLAIN, Some("TESTNONCE")).await;
+        let mut updates = client.take_channel_updates().unwrap();
+        let pushes = vec![alarm_push(), channel_list_push()];
+        let fake = tokio::spawn(fake_login_step(device, pushes, login_reply));
+        client.login("admin", "swordfish").await.unwrap();
+        assert_eq!(describe_streams(&client.encode_profiles()), LOGIN_REPLY_STREAMS);
+        match updates.try_recv() {
+            Ok(DeviceUpdate::Channels(channels)) => assert_eq!(channels.len(), 1),
+            other => panic!("expected the channel list, got {other:?}"),
+        }
+        assert_eq!(client.channel_uid(0).as_ref().map(CameraUid::as_str), Some("TESTCAMUID000001"));
+        fake.await.unwrap();
+    }
+
+    /// A message of another id under the request's number, ahead of either
+    /// reply, is not taken for it.
+    #[tokio::test]
+    async fn a_message_of_another_id_under_the_request_s_number_is_read_past() {
+        let (mut client, device) = client_and_device().await;
+        let mut other_id = nonce_reply(1, "OTHERNONCE");
+        other_id.meta.msg_id = MSG_ID_VERSION;
+        let before_nonce = vec![other_id];
+        let before_login = vec![stream_list_message(MSG_ID_VERSION, 1, "mainStream")];
+        let fake = tokio::spawn(fake_login_with_nonce_step(device, before_nonce, before_login, login_reply));
+        client.login("admin", "swordfish").await.unwrap();
+        assert_eq!(describe_streams(&client.encode_profiles()), LOGIN_REPLY_STREAMS);
+        fake.await.unwrap();
+    }
+
+    /// A login message under another number, ahead of either reply, is not
+    /// taken for it: here a nonce reply under 0 with another nonce, and a
+    /// login reply under 2 with another stream list.
+    #[tokio::test]
+    async fn a_login_message_under_another_number_is_read_past() {
+        let (mut client, device) = client_and_device().await;
+        let before_nonce = vec![nonce_reply(0, "OTHERNONCE")];
+        let before_login = vec![stream_list_message(MSG_ID_LOGIN, 2, "mainStream")];
+        let fake = tokio::spawn(fake_login_with_nonce_step(device, before_nonce, before_login, login_reply));
+        client.login("admin", "swordfish").await.unwrap();
+        assert_eq!(describe_streams(&client.encode_profiles()), LOGIN_REPLY_STREAMS);
+        fake.await.unwrap();
+    }
+
+    /// A push ahead of a refusal leaves the refusal's code to decide: 401
+    /// (wrong password), which makes the app forget the saved password.
+    #[tokio::test]
+    async fn a_push_before_a_refusal_still_gives_the_refusal_s_code() {
+        let (mut client, device) = client_and_device().await;
+        let refusal = |msg_num| device_message(MSG_ID_LOGIN, msg_num, 401, None, None);
+        let fake = tokio::spawn(fake_login_with_nonce_step(device, Vec::new(), vec![alarm_push()], refusal));
+        let error = client.login("admin", "swordfish").await.unwrap_err();
+        assert!(matches!(error, Error::LoginFailed { code: 401 }), "{error}");
+        fake.await.unwrap();
+    }
+
+    /// 63 messages ahead of a reply are read past: with the reply, the 64 a
+    /// login step reads at most.
+    #[tokio::test]
+    async fn sixty_three_pushes_ahead_of_the_reply_are_read_past() {
+        let (mut client, device) = client_and_device().await;
+        let pushes = (0..63).map(|_| alarm_push()).collect();
+        let fake = tokio::spawn(fake_login_with_nonce_step(device, pushes, Vec::new(), login_reply));
+        client.login("admin", "swordfish").await.unwrap();
+        assert_eq!(describe_streams(&client.encode_profiles()), LOGIN_REPLY_STREAMS);
+        fake.await.unwrap();
+    }
+
+    /// 64 messages ahead of the reply end the step before it.
+    #[tokio::test]
+    async fn a_login_step_reads_at_most_64_messages() {
+        let (mut client, mut device) = client_and_device().await;
+        let fake = tokio::spawn(async move {
+            let upgrade = device.recv_bc(&PLAIN).await.unwrap();
+            assert_eq!(upgrade.meta, login_request_meta(0xdc12, 0x6514));
+            for _ in 0..64 {
+                device.send_bc(&alarm_push(), &EncryptionProtocol::BcEncrypt).await.unwrap();
+            }
+            let reply = nonce_reply(upgrade.meta.msg_num, "TESTNONCE");
+            device.send_bc(&reply, &EncryptionProtocol::BcEncrypt).await.unwrap();
+            device
+        });
+        let error = client.login("admin", "swordfish").await.unwrap_err();
+        match &error {
+            Error::ProtocolError(text) => assert_eq!(text, "no login reply among 64 messages"),
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+        drop(fake.await.unwrap());
+    }
+
+    /// A device that only pushes, every 4 s so that no single read waits
+    /// long, ends a login step 15 s after its request.
+    #[tokio::test(start_paused = true)]
+    async fn a_login_step_gives_up_15_s_after_its_request() {
+        let (mut client, mut device) = client_and_device().await;
+        let fake = tokio::spawn(async move {
+            device.recv_bc(&PLAIN).await.unwrap();
+            for _ in 0..8 {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                device.send_bc(&alarm_push(), &EncryptionProtocol::BcEncrypt).await.unwrap();
+            }
+            device
+        });
+        let start = Instant::now();
+        let error = client.login("admin", "swordfish").await.unwrap_err();
+        let waited = start.elapsed();
+        assert!(matches!(error, Error::ReplyTimeout), "{error}");
+        assert!(waited >= Duration::from_secs(15) && waited < Duration::from_secs(16), "{waited:?}");
+        fake.abort();
     }
 }
