@@ -2,6 +2,101 @@
 
 All notable changes of Reoling, newest first.
 
+## 1.0.4 — 2026-11-05
+
+`reoling_1.0.4-1_amd64.deb` and `Reoling-1.0.4-x86_64.AppImage`,
+built as 1.0.3's were; the .deb also installs the new guides. Tests on
+a second NVR brought two fixes, for live video after a switch to the sub
+stream and for the login, and Run at Startup now works from the
+AppImage. The stream selector, the message and the debug output come
+from [issue #3](https://github.com/derSobi/Reoling/issues/3), where a
+Reolink Go (1st generation) refuses the live view request for the sub
+stream with code 400. The README still lists the Go as not working yet;
+with 1.0.4 another stream can be tried on it right in the stream
+selector, the message says which, and the debug output tells more.
+
+- After a switch from the main to the sub stream, live video no longer
+  stays black. An NVR reached over the relay went on sending the main
+  stream for a moment after the sub stream's reply (in our captures up
+  to 0.2 s, and up to 0.7 s between two cameras), under the main
+  stream's request number; live video took it for the new stream, picked
+  the decoder from an old H.265 frame for an H.264 stream, and the
+  picture stayed black. Live video now leaves out every video message
+  that does not come under its own request's number, so going from one
+  camera to another no longer shows a moment of the camera left behind
+  either. Pushes, pictures, settings and control replies are read as
+  before, and what the app sends is unchanged.
+- A device that pushes a message, such as an alarm event, while a login
+  waits for its reply no longer breaks that login. An NVR reached over
+  the relay did so in one run of 14: the login took the push for the
+  reply, failed, and the device's card said "Not connected". Each login
+  step now reads past other messages until its own reply, for at most
+  64 messages and 15 s; a channel list that comes ahead of the login
+  reply is kept. The requests are unchanged, and a wrong password still
+  clears the saved one.
+- Run at Startup, turned on in the AppImage, starts the AppImage file at
+  the next login. Before, the autostart entry named the program inside
+  the AppImage's mount (`/tmp/.mount_…`), which is gone once Reoling
+  exits, so it started nothing. The path in the entry is now quoted, so
+  a folder with a space in its name works too, for every package. At
+  start, Reoling points an autostart entry whose program is gone, such
+  as one an earlier AppImage wrote, at the running copy; only its
+  `Exec` changes, and Run at Startup is never turned on by it.
+- The stream selector stays usable when a live stream failed to start
+  or broke off, so another stream can be picked there, which starts it.
+  Before, the selector was greyed out until video played, so a stream
+  the camera refused could only be left by picking another one while
+  another camera played. It stays greyed out, as before, while a stream
+  starts ("Starting…"), while live video waits for a download on the
+  device, and with nothing watched (stopped, on the Playback page, or
+  with the device removed or lost). Only a failure of the channel being
+  watched opens it.
+- When a camera refuses a live stream, the message names the stream and
+  the one to try instead: "The camera refused the sub stream (code
+  400). Try the main stream in the stream selector." For the main
+  stream it names the sub stream, for the extern stream the main or the
+  sub stream. Before, it read "protocol error: camera rejected the video
+  stream request with code 400". Only the message changed: the request
+  stays as it was, and the app does not try another stream by itself.
+- README: Installation is short, where to download and each package in
+  a few lines, and links four new guides in docs/: installing the .deb
+  (INSTALL-DEB.md), running the AppImage (INSTALL-APPIMAGE.md), hardware
+  decoding (HARDWARE-DECODING.md) and building the packages
+  (BUILDING-PACKAGES.md). The .deb installs them in
+  `/usr/share/doc/reoling/docs`, next to FEATURES.md. They correct the
+  old text: the AppImage needs `/dev/fuse` and the `fusermount` program
+  (`fuse3` on Debian and Ubuntu), not `libfuse2`, as its runtime has
+  libfuse built in.
+- README: a new section, Tested devices, lists a Home Hub Pro and two
+  RLN36 NVRs and the cameras on them, the second NVR's being a Reolink
+  Duo 2 PoE, an RLC-1224A, five RLC-820A and a P330, with their hardware
+  and firmware and what is tested on which; on the second NVR, Playback
+  does not list the recordings yet. It also lists the models users
+  reported: the RLC-823S1 works, the Reolink Go (1st generation) does
+  not yet.
+- For those who report a problem: with `REOLING_DEBUG_NEGOTIATION` set,
+  stderr also gives, right after login, the P2P path that won (local,
+  NAT-mapped or relay, by name only, never an address; a device added by
+  IP prints none) and the streams the login reply offers (per group of
+  channels, each stream's type, size and default frame rate), and says
+  how the request for the device's name and model ended: the reply's
+  code, the time it took and what its body gave, or that no reply came.
+  A login step names each message it reads past by its id and number
+  (`DEBUG login: read past message 33 under 0`), and live video says
+  how much of an earlier stream it left out (`NEGOTIATION live: skipped
+  23 messages (129073 bytes) of an earlier stream`). These lines, and
+  those about the live stream and the device's name and model, start
+  with the connection's number and, after login, the time since login,
+  as `[conn 2 +812 ms]`, so that the lines of devices connecting side by
+  side can be told apart; the number names no device. Without the
+  variable nothing changes.
+- `REOLING_PROBE_PUSH`, a diagnostic that prints the login reply and the
+  replies after it, now also hides the contents of `serialNumber`,
+  `userName`, `validpassword`, `password`, `mac`, `token`, `secretCode`
+  and `bootSecret`. Before, it hid only the elements that can hold a
+  UID, so a login reply's `secretCode` and `bootSecret` were printed as
+  they came.
+
 ## 1.0.3 — 2026-11-01
 
 `reoling_1.0.3-1_amd64.deb` and `Reoling-1.0.3-x86_64.AppImage`,
