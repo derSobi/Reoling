@@ -1,3 +1,4 @@
+use crate::client::StreamProfile;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -13,6 +14,11 @@ pub enum Error {
 
     #[error("protocol error: {0}")]
     ProtocolError(String),
+
+    /// The device answered a live stream's request with another code than
+    /// 200. Its text is what the UI shows.
+    #[error("{}", stream_refused(.stream, .code))]
+    StreamRefused { stream: StreamProfile, code: u16 },
 
     #[error("timed out waiting for a reply")]
     ReplyTimeout,
@@ -31,6 +37,17 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Why live video did not start: the stream the device refused, its code,
+/// and the streams to pick in the stream selector instead.
+fn stream_refused(stream: &StreamProfile, code: &u16) -> String {
+    let (refused, others) = match stream {
+        StreamProfile::Main => ("main", "the sub stream"),
+        StreamProfile::Sub => ("sub", "the main stream"),
+        StreamProfile::Extern => ("extern", "the main or the sub stream"),
+    };
+    format!("The camera refused the {refused} stream (code {code}). Try {others} in the stream selector.")
+}
 
 /// Why a device refused a login, from the reply's response code. Only
 /// `WrongCredentials` (401) says the user name or password is wrong, and only
@@ -103,7 +120,8 @@ impl LoginRefusal {
 
 #[cfg(test)]
 mod tests {
-    use super::LoginRefusal;
+    use super::{Error, LoginRefusal};
+    use crate::client::StreamProfile;
 
     #[test]
     fn every_known_code_has_its_refusal() {
@@ -145,6 +163,23 @@ mod tests {
         assert_eq!(
             LoginRefusal::from_code(407).reason(),
             "The device is locked after too many failed logins; try again later"
+        );
+    }
+
+    #[test]
+    fn a_refused_stream_names_itself_and_the_streams_to_try() {
+        let text = |stream, code| Error::StreamRefused { stream, code }.to_string();
+        assert_eq!(
+            text(StreamProfile::Sub, 400),
+            "The camera refused the sub stream (code 400). Try the main stream in the stream selector."
+        );
+        assert_eq!(
+            text(StreamProfile::Main, 400),
+            "The camera refused the main stream (code 400). Try the sub stream in the stream selector."
+        );
+        assert_eq!(
+            text(StreamProfile::Extern, 0xffff),
+            "The camera refused the extern stream (code 65535). Try the main or the sub stream in the stream selector."
         );
     }
 }

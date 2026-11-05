@@ -1677,10 +1677,7 @@ impl ReolinkClient {
             );
         }
         if ack.meta.response_code != 200 {
-            return Err(Error::ProtocolError(format!(
-                "camera rejected the video stream request with code {}",
-                ack.meta.response_code
-            )));
+            return Err(Error::StreamRefused { stream: quality, code: ack.meta.response_code });
         }
 
         let (tx, rx) = channel(32);
@@ -2751,6 +2748,36 @@ mod keepalive_tests {
         assert_eq!((msg_id, second), (MSG_ID_VIDEO, 2));
         assert_eq!(client.live_msg_num, Some(second));
         fake.abort();
+    }
+
+    /// A Preview answered with 400 and no body, the shape of every 400 in our
+    /// captures, comes back as the stream the device refused, with its code,
+    /// for the sub and the main stream alike.
+    #[tokio::test]
+    async fn a_refused_preview_names_the_stream_and_the_code() {
+        let (mut client, mut device) = client_and_device().await;
+        let fake = tokio::spawn(async move {
+            let mut asked = Vec::new();
+            for _ in 0..2 {
+                let request = device.recv_bc(&PLAIN).await.unwrap();
+                let BcBody::Modern(ModernMsg { payload: Some(payload), .. }) = request.body else {
+                    panic!("a Preview without a body");
+                };
+                let preview = BcXml::from_bytes(&payload).unwrap().preview.expect("a Preview");
+                asked.push((request.meta.msg_id, preview.stream_type.unwrap_or_default()));
+                let refusal = device_message(MSG_ID_VIDEO, request.meta.msg_num, 400, None, None);
+                device.send_bc(&refusal, &PLAIN).await.unwrap();
+            }
+            asked
+        });
+        for stream in [StreamProfile::Sub, StreamProfile::Main] {
+            match client.start_video(0, stream).await.err() {
+                Some(Error::StreamRefused { stream: refused, code: 400 }) => assert_eq!(refused, stream),
+                other => panic!("expected the {stream:?} stream refused with 400, got {other:?}"),
+            }
+        }
+        let asked = fake.await.unwrap();
+        assert_eq!(asked, [(MSG_ID_VIDEO, "subStream".to_string()), (MSG_ID_VIDEO, "mainStream".to_string())]);
     }
 
     /// Live video's reader puts images together for as long as the stream
