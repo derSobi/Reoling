@@ -24,7 +24,7 @@ More on <https://reoling.eu>.
 
 ## Status
 
-Version **1.0.3**, with installable packages since 1.0.0 (see
+Version **1.0.4**, with installable packages since 1.0.0 (see
 [Installation](#installation)). Login, live video, PTZ, the camera and
 device settings pages, and playback with sound, events and downloads
 work end to end on a real Home Hub, NVR and their cameras, over UDP/P2P
@@ -76,14 +76,16 @@ Each of these in full: [docs/FEATURES.md](docs/FEATURES.md).
 
 **Version history**
 
-- 1.0.3 — the .deb and the AppImage, built as 1.0.2's were. Fullscreen
-  controls lie under the picture, as wide as it, so on an ultrawide
-  monitor they no longer sit beside it. On X11 the windows' `WM_CLASS`
-  is `de.dersobi.reoling`, as the desktop entries say, so a dock can
-  show Reoling's icon. A connection that stays up for days skips the
-  request numbers the device sends its own messages under. The .deb
-  also installs docs/FEATURES.md, and both packages carry the GTK 4 sink
-  stripped; Cargo.toml names Rust 1.88 as the minimum.
+- 1.0.4 — the .deb and the AppImage, built as 1.0.3's were; the .deb
+  also installs the new guides. Live video no longer stays black after a
+  switch from the main to the sub stream, and a push that comes before a
+  login reply no longer breaks the login. Run at Startup from the
+  AppImage starts the AppImage file. After a live stream failed, the
+  stream selector stays usable and a refused stream's message names the
+  one to try ([issue #3](https://github.com/derSobi/Reoling/issues/3)).
+  More `REOLING_DEBUG_NEGOTIATION` output, and `REOLING_PROBE_PUSH` hides
+  more. The README's Installation is short, with a guide per package in
+  docs/, and a new section lists the tested devices.
 
 The full history, with the date of every version, is in
 [CHANGELOG.md](CHANGELOG.md).

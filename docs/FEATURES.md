@@ -18,7 +18,10 @@ The full list behind the [README's Status](../README.md#status).
   the whole width in Stretch Mode or when the picture is within 2% of the
   screen's width), and beside it the pointer is over the video; a latency
   setting (Low / Balanced / Smooth) trades reaction time for smoothness
-  over a poor connection.
+  over a poor connection. Another stream can be picked in the stream
+  selector while the picture plays, and also after a start failed or the
+  stream broke off (not while a stream starts or waits for a download); a
+  refused stream's message names the stream and the one to try.
 - Digital video zoom in live view and playback: scroll up over the picture
   to zoom in at the pointer, and down to zoom out, up to 16×. Left-click and
   drag to pan while zoomed in; middle-click restores the whole picture.
@@ -148,10 +151,11 @@ The full list behind the [README's Status](../README.md#status).
   `~/Videos/Reoling`, where Playback's downloads go too).
 - Settings (the "Client Settings" window):
   System Settings (General, Live View & Playback, Alarm), Download Settings,
-  Local Record and About. Working: Run at Startup (an XDG autostart entry),
-  Theme, System Status (versions, the hardware decoders and the decoders in
-  use), Auto Live View, Stretch Mode, decoding (Auto with the integrated or
-  the dedicated GPU first / Hardware — with the decoder to use if there are
+  Local Record and About. Working: Run at Startup (an XDG autostart entry;
+  run from the AppImage, it starts the AppImage file), Theme, System
+  Status (versions, the hardware decoders and the decoders in use), Auto
+  Live View, Stretch Mode, decoding (Auto with the integrated or the
+  dedicated GPU first / Hardware — with the decoder to use if there are
   several — / Software; see [Hardware decoding](HARDWARE-DECODING.md)),
   latency, and the folders for screenshots and recordings. The window's
   rows Reoling cannot act on yet (client update, add devices automatically,
