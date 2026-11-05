@@ -78,7 +78,8 @@ depends = "$auto, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreame
 # desktop keyring (org.freedesktop.secrets).
 recommends = "va-driver-all | mesa-va-drivers | intel-media-va-driver, gnome-keyring | kwalletmanager"
 # The documents keep their places in the repository under /usr/share/doc/reoling,
-# so that the links between README.md, CHANGELOG.md and docs/FEATURES.md work in
+# so that the links between README.md, CHANGELOG.md, docs/FEATURES.md and the
+# guides in docs/ (installing, hardware decoding, building the packages) work in
 # the installed copy; for that CHANGELOG.md also keeps its name, where lintian
 # would like changelog.gz.
 assets = [
@@ -96,6 +97,10 @@ assets = [
     ["data/icons/hicolor/512x512/apps/de.dersobi.reoling.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
     ["README.md", "usr/share/doc/reoling/", "644"],
     ["docs/FEATURES.md", "usr/share/doc/reoling/docs/", "644"],
+    ["docs/INSTALL-DEB.md", "usr/share/doc/reoling/docs/", "644"],
+    ["docs/INSTALL-APPIMAGE.md", "usr/share/doc/reoling/docs/", "644"],
+    ["docs/HARDWARE-DECODING.md", "usr/share/doc/reoling/docs/", "644"],
+    ["docs/BUILDING-PACKAGES.md", "usr/share/doc/reoling/docs/", "644"],
     ["CHANGELOG.md", "usr/share/doc/reoling/", "644"],
     ["LICENSE", "usr/share/doc/reoling/", "644"],
 ]

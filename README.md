@@ -159,7 +159,9 @@ src/
 └── main.rs      The `reoling` binary.
 examples/        Small diagnostic tools (UID probe, media trace analysis).
 data/            Icons and the desktop entry.
-docs/            FEATURES.md (every feature) and the README's screenshots.
+docs/            FEATURES.md (every feature), the installation, hardware
+                 decoding and package-building guides, and the README's
+                 screenshots.
 scripts/         Packaging: the GTK 4 sink build, the AppImage tools and
                  build, and a rehearsal of the release in a container.
 ```
@@ -168,114 +170,25 @@ Reoling is a Linux-only desktop application.
 
 ## Installation
 
-Every release on GitHub — <https://github.com/derSobi/Reoling/releases> —
-carries two packages for x86_64 Linux, both built on Ubuntu 24.04 LTS by
-the release workflow (`.github/workflows/release.yml`) so that they run on
-24.04 and everything newer:
+Download a package from the
+[latest release](https://github.com/derSobi/Reoling/releases/latest). Both
+are for x86_64 Linux, built on Ubuntu 24.04 LTS so that they run on 24.04
+and everything newer.
 
-- **`reoling_1.0.3-1_amd64.deb`** for Ubuntu 24.04 LTS or newer and
-  Debian 13 or newer (and derivatives with at least those library
-  versions): `sudo apt install ./reoling_1.0.3-1_amd64.deb`. apt
-  installs the GTK 4 and GStreamer runtime with it — the base, good and
-  bad plugin sets (parsers, muxers, the nvcodec and va hardware decoders),
-  the libav software decoders and a PulseAudio, PipeWire or ALSA sink —
-  and recommends a VA-API driver (`va-driver-all`, or the one for your
-  GPU) for hardware decoding and a keyring (GNOME Keyring or KWallet) for
-  the device passwords. Ubuntu 24.04 has no `gstreamer1.0-gtk4` package, so
-  the .deb carries GStreamer's GTK 4 paintable sink itself, in
-  `/usr/lib/reoling/gstreamer-1.0`, a directory `reoling` adds to its
-  plugin registry when it starts. Reoling then appears in the
-  applications menu; `reoling --version` prints the installed version.
-- **`Reoling-1.0.3-x86_64.AppImage`** for any other distribution with
-  glibc 2.39 and GLib 2.80 or newer (Ubuntu 24.04, Fedora 40, Debian 13
-  and later): `chmod +x Reoling-1.0.3-x86_64.AppImage` and run it.
-  The AppImage mounts itself with FUSE 2 (`libfuse2` or `libfuse2t64`);
-  without it, `--appimage-extract-and-run` unpacks it to a
-  temporary directory for that run, and `--appimage-extract` unpacks it
-  for good. Inside are GTK 4, GStreamer with the parsers, muxers, decoders
-  (libav in software; the nvcodec and va plugins for hardware) and sound
-  sinks the app uses, its GTK 4 sink, librsvg and the icons it draws. It
-  uses the system's GTK 4 and GStreamer instead where they are at least as
-  new as its own (GTK 4.14, GStreamer 1.24), so it looks like the
-  desktop's other applications with the desktop's own theme, and its
-  bundled copies otherwise; a line on stderr says which
-  (`reoling: GTK and GStreamer core: host` or `bundled`), and
-  `REOLING_GTK_STACK=bundled` or `host` forces the choice. From the system
-  it always takes glibc, GLib (whose GIO modules read the desktop's
-  settings), Mesa (OpenGL/EGL) or the NVIDIA driver's GL, the core X11
-  client libraries (`libX11`, `libX11-xcb`, `libxcb`) and
-  `libwayland-client` (GTK links `libX11` and `libwayland-client`, and
-  Reoling `libwayland-client` too, so a session needs them on X11 and on
-  Wayland alike), fontconfig and the fonts, PulseAudio or PipeWire
-  (`pipewire-pulse`) or ALSA for sound, `libva` (the FFmpeg
-  libraries behind the software decoders need it too, with `libva-drm` and
-  `libva-x11`; any of them the system lacks comes from the AppImage), the
-  hardware decoding driver — NVIDIA's `libcuda`/`libnvcuvid` for NVDEC, or
-  a VA-API driver for the system's `libva` — and a Secret Service keyring
-  (GNOME Keyring, KWallet) for the device passwords. It follows the
-  desktop's GTK theme (and with it the accent colour); on the bundled GTK,
-  a theme written for a newer GTK may print a few "Theme parser error"
-  lines and lose some of its looks. It keeps its own GStreamer registry
-  under `~/.cache/reoling`. The first
-  time it runs it also gives its own file the Reoling icon in GNOME Files,
-  which otherwise shows the bare "executable" icon for an AppImage: it
-  copies the Reoling icon into your icon theme (under
-  `~/.local/share/icons/hicolor`, for the sizes the system theme lacks)
-  and sets it as the file's custom icon — the GIO attribute
-  `metadata::custom-icon`, which Files shows at every zoom level and gvfs
-  keeps per user and per path; by hand that is
-  `gio set <file> metadata::custom-icon file://<icon>`. It also writes the
-  file's thumbnail-cache entries under `~/.cache/thumbnails` for the file
-  managers and dialogs that read the cache but no custom icon. Both are
-  checked at every start, so a replaced file (a new download) or a moved
-  one gets its icon back the next time it runs. Other file managers
-  (Dolphin among them) may still show the generic icon. Where the .deb is
-  not installed, it also writes the per-user desktop entry
-  `~/.local/share/applications/de.dersobi.reoling.desktop`, which starts
-  the AppImage file: Reoling then appears in the applications menu and the
-  dock shows its icon. The entry names the copy started last (a source
-  build writes the same entry for itself), and the menu hides it once that
-  file is gone. A per-user entry hides the .deb's of the same name, so
-  once the .deb is installed, the next start of either package (the menu
-  still starts the AppImage until then) removes the entry Reoling wrote,
-  and the .deb's takes over. If the AppImage file is deleted before that,
-  Reoling is missing from the menu until `reoling` is started once from a
-  terminal. That is all it touches, and only for the AppImage file it was
-  started from: it installs no thumbnailer and no file type association,
-  so nothing of Reoling's runs on other files.
+- **.deb**, for Ubuntu 24.04 LTS or newer, Debian 13 or newer and their
+  derivatives. apt installs it with everything it needs:
+  `sudo apt install ./reoling_*_amd64.deb` (with several in the folder,
+  type the full name). Guide: [docs/INSTALL-DEB.md](docs/INSTALL-DEB.md).
+- **AppImage**, for any other distribution with glibc 2.39 and GLib 2.80
+  or newer. Make it executable, then start it by its full name
+  (`<version>` as in the file's name): `chmod +x Reoling-*-x86_64.AppImage`,
+  then `./Reoling-<version>-x86_64.AppImage`.
+  Guide: [docs/INSTALL-APPIMAGE.md](docs/INSTALL-APPIMAGE.md).
 
-Both packages decode video in hardware where they can: NVDEC
-(`nvh264dec`/`nvh265dec`) on an NVIDIA GPU, VA-API (`vah264dec`/
-`vah265dec`) on an Intel or AMD one. With Decoding set to Auto (integrated
-GPU first), the default, Reoling orders the hardware decoders itself:
-those on the integrated GPU first, then those on a GPU whose kind it
-cannot tell, then those on a dedicated card, all of them ahead of the
-libav software decoders, which take over where no driver is present. Auto
-(dedicated GPU first) tries the card first. A GPU counts as dedicated when
-switcheroo-control tags it so, or when it is an Intel or NVIDIA GPU behind
-a PCI bridge; an Intel GPU at 00:02.0 on the root bus is the integrated
-one, and any other GPU is of unknown kind. Settings → Live View &
-Playback → Decoding switches to Hardware (with a choice of device when
-there are several) or Software; System Status lists the hardware decoders
-found (with the kind of GPU, where known), the decoding mode in use and
-the decoders the latest live and recorded streams started with. Hardware
-on a machine without a usable hardware decoder decodes in software
-instead of leaving the picture black, and the Decoding row says so.
-
-The workflow installs the .deb and starts both packages (`--version`, then
-20 s on a virtual display) on Ubuntu 24.04, the AppImage there on either
-GTK, and the AppImage again in Ubuntu 26.04 and 24.04 containers
-(`scripts/smoke-appimage-in-docker.sh`) before it uploads them. To build
-them yourself — the sink build needs Rust 1.92 or newer, and
-`scripts/validate-in-docker.sh --host <output directory>` rehearses the
-whole release in an `ubuntu:24.04` container and runs the container tests:
-
-```bash
-scripts/build-gst-gtk4-plugin.sh target/gst-gtk4   # the GTK 4 sink, where the distribution has none
-cargo install cargo-deb && cargo deb                # target/debian/reoling_1.0.3-1_amd64.deb
-scripts/fetch-appimage-tools.sh ~/appimage-tools    # linuxdeploy, its plugins, appimagetool (pinned)
-APPIMAGE_TOOLS=~/appimage-tools scripts/build-appimage.sh target/release/reoling dist
-```
+Both decode video in hardware where a driver allows it, and in software
+otherwise: [docs/HARDWARE-DECODING.md](docs/HARDWARE-DECODING.md). To build
+the packages yourself, and for how the release tests them:
+[docs/BUILDING-PACKAGES.md](docs/BUILDING-PACKAGES.md).
 
 ## Building from source
 
@@ -314,6 +227,9 @@ release workflow and Docker validation run it under Xvfb:
 ```bash
 cargo test --bin reoling ui::zoom_picture::tests::widget_renders_and_resets -- --ignored --exact
 ```
+
+To build the .deb and the AppImage, see
+[docs/BUILDING-PACKAGES.md](docs/BUILDING-PACKAGES.md).
 
 ## License
 
