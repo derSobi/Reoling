@@ -90,29 +90,41 @@ The full history, with the date of every version, is in
 
 ## Tested devices
 
-Reoling is built and tested on the project's own Home Hub Pro and RLN36 NVR
-and the cameras on them. Both are added by UID and reached over UDP/P2P: the
-Hub on its local network and through the relay, the NVR through the relay
-only.
+Reoling is built and tested on a Home Hub Pro and two RLN36 NVRs and the
+cameras on them. All three are added by UID and reached over UDP/P2P: the
+Hub on its local network and through the relay, the two NVRs through the
+relay only.
 
 | Device | What | Model | Hardware | Firmware |
 |---|---|---|---|---|
 | Home Hub Pro | the Hub itself | Reolink Home Hub Pro | BASE_WENNT3NA5 | v3.3.0.605 |
 | Home Hub Pro | 2 cameras | E1 Outdoor PoE | IPC_560SD88MP | v3.1.0.5223 |
 | Home Hub Pro | 1 camera | RLC-1224A | IPC_NT18NA612MP | v3.2.0.6011 |
-| RLN36 NVR | the NVR itself | RLN36 | N5MB01 | v3.6.5.597 |
-| RLN36 NVR | 9 cameras | RLC-1224A | IPC_523D8128M12MP | v3.1.0.2174 (one on v3.1.0.1294) |
-| RLN36 NVR | 3 cameras | RLC-820A | IPC_56064M8MP | v3.1.0.2368 |
-| RLN36 NVR | 1 camera | E1 Outdoor PoE | IPC_560SD88MP | v3.1.0.2448 |
-| RLN36 NVR | 1 camera | P334 | IPC_NT2NA48MP | v3.1.0.4666 |
+| RLN36 NVR (1) | the NVR itself | RLN36 | N5MB01 | v3.6.5.597 |
+| RLN36 NVR (1) | 9 cameras | RLC-1224A | IPC_523D8128M12MP | v3.1.0.2174 |
+| RLN36 NVR (1) | 3 cameras | RLC-820A | IPC_56064M8MP | v3.1.0.2368 |
+| RLN36 NVR (1) | 1 camera | E1 Outdoor PoE | IPC_560SD88MP | v3.1.0.2448 |
+| RLN36 NVR (1) | 1 camera | P334 | IPC_NT2NA48MP | v3.1.0.4666 |
+| RLN36 NVR (2) | the NVR itself | RLN36 | N5MB01 | v3.5.0.329 |
+| RLN36 NVR (2) | 1 camera | Reolink Duo 2 PoE | IPC_529B17B8MP | v3.0.0.1889 |
+| RLN36 NVR (2) | 1 camera | RLC-1224A | IPC_523D8128M12MP | v3.1.0.2174 |
+| RLN36 NVR (2) | 5 cameras | RLC-820A | IPC_56064M8MP | v3.1.0.1782 |
+| RLN36 NVR (2) | 1 camera | P330 | IPC_NT2NA48MP | v3.1.0.4054 |
 
-Live view is tested on all three of the Hub's cameras and on the NVR's
-RLC-1224A. Playback, downloads and the settings pages are tested on cameras
-of both: the Hub's E1 Outdoor PoE and RLC-1224A, the NVR's RLC-1224A and
-P334, and the encoding settings also on the NVR's E1 Outdoor PoE. PTZ is
-tested on the Hub's E1 Outdoor PoE cameras. The NVR's RLC-820A cameras have
-no individual tests recorded. None of these cameras runs on a battery, so we
-have not tested battery or 4G cameras ourselves.
+Live view is tested on all three of the Hub's cameras, on the first NVR's
+RLC-1224A, on the second NVR's Reolink Duo 2 PoE and P330 (main and sub
+stream, and the P330's extern stream) and on the main and sub stream of
+one of its RLC-820A, with a switch from the main stream back to the sub
+stream. Playback, downloads and the settings pages are tested on cameras
+of the Hub and the first NVR: the Hub's E1 Outdoor PoE and RLC-1224A, the
+first NVR's RLC-1224A and P334, and the encoding settings also on the
+first NVR's E1 Outdoor PoE. On the second NVR, the camera settings window
+was opened on all eight cameras without changing anything (the Info page
+on all of them, the Display page on the P330); Playback does not list its
+recordings yet, although the NVR answers the searches. PTZ is tested on
+the Hub's E1 Outdoor PoE cameras. The first NVR's RLC-820A cameras have
+no individual tests recorded. None of these cameras runs on a battery, so
+we have not tested battery or 4G cameras ourselves.
 
 **Reported by users**
 
