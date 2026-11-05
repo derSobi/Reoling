@@ -2,10 +2,12 @@
 //! key file next to the device list and applied at start and on change.
 
 use crate::ui::gpu::{self, GpuKind};
+use crate::ui::icon;
 use glib::translate::{FromGlib, IntoGlib};
 use gstreamer::prelude::*;
 use gtk4::glib::{self, KeyFile, KeyFileFlags};
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -354,23 +356,81 @@ pub fn autostart_enabled() -> bool {
     autostart_path().is_file()
 }
 
-/// Adds or removes the XDG autostart entry.
+/// Adds or removes the XDG autostart entry. It starts this build (see
+/// `icon::own_program`): run from an AppImage, the `.AppImage` file, as the
+/// executable inside is gone with the image's mount once the app exits.
 pub fn set_autostart(on: bool) {
     let path = autostart_path();
     if !on {
         let _ = std::fs::remove_file(&path);
         return;
     }
-    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "reoling".to_string());
-    let entry = format!(
-        "[Desktop Entry]\nType=Application\nName=Reoling\nComment=Client for Reolink cameras\nExec={exe}\nIcon=de.dersobi.reoling\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
-    );
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Err(e) = std::fs::write(&path, entry) {
+    let program = icon::own_program().unwrap_or_else(|| PathBuf::from("reoling"));
+    let Some(entry) = autostart_entry(&program) else {
+        eprintln!("could not enable autostart: {} cannot be written into a desktop entry", program.display());
+        return;
+    };
+    if let Err(e) = icon::write_atomically(&path, entry.as_bytes(), 0o755, 0o644) {
         eprintln!("could not enable autostart: {e}");
     }
+}
+
+/// The autostart entry that starts `program`, its path quoted for `Exec`
+/// (see `icon::exec_quoted`). `None` for a path no entry can name.
+fn autostart_entry(program: &Path) -> Option<String> {
+    let exec = icon::exec_quoted(program)?;
+    Some(format!(
+        "[Desktop Entry]\nType=Application\nName=Reoling\nComment=Client for Reolink cameras\nExec={exec}\nIcon=de.dersobi.reoling\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+    ))
+}
+
+/// Points the autostart entry at this build (see `icon::own_program`) when
+/// the program it starts is gone. Reoling up to 1.0.3, run from an AppImage,
+/// wrote the executable inside the image's mount, which is gone once the app
+/// exits; an AppImage file may also have been moved or deleted since. An
+/// entry whose program is there stays as it is, and a missing one stays
+/// missing: this never turns autostart on. Call at start.
+pub fn refresh_autostart() {
+    let Some(program) = icon::own_program() else { return };
+    let path = autostart_path();
+    if let Err(e) = refresh_autostart_entry(&path, &program) {
+        eprintln!("could not update the autostart entry {}: {e}", path.display());
+    }
+}
+
+/// The work of [`refresh_autostart`] on the entry at `path`: when its `Exec`
+/// starts an absolute path with no file there, `Exec` becomes `program`
+/// (quoted, with no arguments: Reoling never wrote any) and the rest of the
+/// entry stays as it is, keys a desktop added such as
+/// `X-GNOME-Autostart-enabled=false` too. An entry that is missing or does
+/// not parse, one that names its program by a bare name, and a `program`
+/// that is no file or cannot be written into an entry leave it alone.
+/// Returns whether it wrote.
+fn refresh_autostart_entry(path: &Path, program: &Path) -> io::Result<bool> {
+    let entry = KeyFile::new();
+    if entry.load_from_file(path, KeyFileFlags::KEEP_COMMENTS | KeyFileFlags::KEEP_TRANSLATIONS).is_err() {
+        return Ok(false);
+    }
+    // As the desktop reads it: the key file's escaping, then the quoting. An
+    // unquoted path with a space, as Reoling wrote one before, gives a first
+    // word that is no file either.
+    let Some(started) = entry
+        .string("Desktop Entry", "Exec")
+        .ok()
+        .and_then(|exec| glib::shell_parse_argv(exec.as_str()).ok())
+        .and_then(|argv| argv.into_iter().next())
+        .map(PathBuf::from)
+    else {
+        return Ok(false);
+    };
+    if !started.is_absolute() || started.is_file() || !program.is_file() {
+        return Ok(false);
+    }
+    let Some(exec) = icon::exec_quoted(program) else { return Ok(false) };
+    // `set_value`, not `set_string`: the quoted path is escaped for the key
+    // file already.
+    entry.set_value("Desktop Entry", "Exec", &exec);
+    icon::write_atomically(path, entry.to_data().as_bytes(), 0o755, 0o644).map(|()| true)
 }
 
 /// The hardware decoders on this machine, one entry per device.
@@ -577,8 +637,150 @@ pub fn decoder_in_use(replay: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gtk4::gio;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     const AUTO: [Decoding; 2] = [Decoding::AutoIntegrated, Decoding::AutoDedicated];
+
+    /// A fresh, empty directory for one test.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("reoling-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// An executable file at `path`, its directories created.
+    fn program_file(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"\x7fELF").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn keyfile(entry: &str) -> KeyFile {
+        let keyfile = KeyFile::new();
+        keyfile.load_from_data(entry, KeyFileFlags::NONE).unwrap();
+        keyfile
+    }
+
+    /// The command line an entry runs, as the desktop reads `Exec`: the key
+    /// file's escaping undone, then split as the shell would.
+    fn started(entry: &str) -> Vec<OsString> {
+        glib::shell_parse_argv(keyfile(entry).string("Desktop Entry", "Exec").unwrap().as_str()).unwrap()
+    }
+
+    #[test]
+    fn autostart_entry_starts_the_program_quoted() {
+        for program in [
+            "/usr/bin/reoling",
+            "/home/user/My Apps/Reoling-1.0.4-x86_64.AppImage",
+            "/home/user/Apps \"new\" $HOME `x` back\\slash/reoling",
+        ] {
+            let entry = autostart_entry(Path::new(program)).unwrap();
+            assert_eq!(started(&entry), [OsString::from(program)], "{entry}");
+            assert!(keyfile(&entry).boolean("Desktop Entry", "X-GNOME-Autostart-enabled").unwrap());
+        }
+        let entry = autostart_entry(Path::new("/usr/bin/reoling")).unwrap();
+        assert!(entry.contains("\nExec=\"/usr/bin/reoling\"\n"), "{entry}");
+        // Paths no entry can name.
+        assert_eq!(autostart_entry(Path::new("/home/user/100% done/reoling")), None);
+        assert_eq!(autostart_entry(Path::new("/home/user/a\nb/reoling")), None);
+    }
+
+    #[test]
+    fn autostart_from_an_appimage_starts_the_appimage_file() {
+        let dir = scratch("autostart-appimage");
+        // The file in a folder with a space, its image where the runtime
+        // mounted it, and the .deb's (or a source build's) executable.
+        let appimage = dir.join("My Apps/Reoling-1.0.4-x86_64.AppImage");
+        let (mount, installed) = (dir.join(".mount_Reolin"), dir.join("bin/reoling"));
+        let exe = mount.join("usr/bin/reoling");
+        for file in [&appimage, &exe, &installed] {
+            program_file(file);
+        }
+        let program = icon::program_of(exe.clone(), Some(&appimage), Some(&mount));
+        assert_eq!(program, appimage);
+        let entry = autostart_entry(&program).unwrap();
+        assert_eq!(started(&entry), [appimage.clone().into_os_string()]);
+        // GLib, which starts the autostart entries of a GNOME session, takes
+        // the entry; not once the file it names is gone, as the mount is.
+        assert!(gio::DesktopAppInfo::from_keyfile(&keyfile(&entry)).is_some());
+        let mounted = autostart_entry(&exe).unwrap();
+        fs::remove_dir_all(&mount).unwrap();
+        assert!(gio::DesktopAppInfo::from_keyfile(&keyfile(&mounted)).is_none());
+
+        // Not from an AppImage, or with the variables an AppImage passed on
+        // to a shell it started: the running executable, as before.
+        for (appimage, appdir) in [(None, None), (Some(appimage.as_path()), Some(mount.as_path()))] {
+            let program = icon::program_of(installed.clone(), appimage, appdir);
+            assert_eq!(program, installed);
+            assert_eq!(started(&autostart_entry(&program).unwrap()), [installed.clone().into_os_string()]);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_autostart_entry_is_pointed_at_this_build() {
+        let dir = scratch("autostart-refresh");
+        let path = dir.join("autostart").join(AUTOSTART_FILE);
+        // A folder name with all that needs escaping, to tell the key file's
+        // escaping from the quoting's.
+        let program = dir.join("My \"Apps\" $x back\\slash/Reoling-1.0.4-x86_64.AppImage");
+        program_file(&program);
+        let refresh = || refresh_autostart_entry(&path, &program).unwrap();
+        // None there: autostart stays off.
+        assert!(!refresh());
+        assert!(!path.exists());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // The entry as Reoling wrote it before, turned off since by the
+        // desktop's own tool.
+        let entry = |exec: &str| {
+            format!(
+                "[Desktop Entry]\nType=Application\nName=Reoling\nComment=Client for Reolink cameras\nExec={exec}\nIcon=de.dersobi.reoling\nTerminal=false\nX-GNOME-Autostart-enabled=false\n"
+            )
+        };
+        let quoted = |path: &Path| icon::exec_quoted(path).unwrap();
+        let refreshed = entry(&quoted(&program));
+        for gone in [
+            // The executable in an AppImage's mount, unquoted.
+            dir.join(".mount_ReolinAbCdEf/usr/bin/reoling").display().to_string(),
+            // An unquoted path with a space: its first word is no file.
+            dir.join("Old Apps/reoling").display().to_string(),
+            // An AppImage file moved or deleted since.
+            quoted(&dir.join("Downloads/Reoling-1.0.3-x86_64.AppImage")),
+        ] {
+            fs::write(&path, entry(&gone)).unwrap();
+            assert!(refresh(), "{gone}");
+            let text = fs::read_to_string(&path).unwrap();
+            assert_eq!(started(&text), [program.clone().into_os_string()]);
+            assert_eq!(text, refreshed);
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+            // No temporary file left behind.
+            assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+            // A second start writes nothing.
+            assert!(!refresh());
+        }
+
+        // An entry whose program is there stays, another build's too; so do
+        // a bare name, an Exec the shell cannot split, and a file that is no
+        // entry at all.
+        let other = dir.join("bin/reoling");
+        program_file(&other);
+        for text in [entry(&quoted(&other)), entry("reoling"), entry("\"/opt/unbalanced"), "Reoling\n".to_string()] {
+            fs::write(&path, &text).unwrap();
+            assert!(!refresh(), "{text}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        }
+        // Nothing to point it at: it stays too.
+        let stale = entry(&dir.join(".mount_ReolinAbCdEf/usr/bin/reoling").display().to_string());
+        fs::write(&path, &stale).unwrap();
+        assert!(!refresh_autostart_entry(&path, &dir.join("missing")).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), stale);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn auto_and_software_are_applied_as_set() {

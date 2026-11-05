@@ -44,6 +44,7 @@ fn main() {
         ui::icon::install();
         ui::icon::install_desktop_entry();
         ui::icon::install_appimage_integration();
+        ui::settings::refresh_autostart();
     });
 
     app.connect_activate(move |app| {
