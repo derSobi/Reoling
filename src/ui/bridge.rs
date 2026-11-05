@@ -43,9 +43,12 @@ pub enum DeviceEvent {
     ChannelName { channel_id: u8, name: String },
     /// The requested stream's first frame reached GStreamer.
     Playing,
-    /// The requested stream could not be started or broke off. The device
-    /// itself is still connected.
-    PlayFailed(String),
+    /// The stream of `channel` could not be started or broke off. The
+    /// device itself is still connected.
+    PlayFailed { channel: u8, reason: String },
+    /// The requested stream waits for the device's download: no failure,
+    /// it starts once the download is over.
+    PlayDeferred(String),
     /// The encoder values the device allows (from its login reply).
     EncodeProfiles(Vec<reoling::encoding::EncodeProfile>),
     /// A channel's encoder settings (`None`: the device refused to say).
@@ -142,7 +145,7 @@ async fn deferral_notice(
 ) {
     match command {
         Command::Play { .. } => {
-            let _ = tx.send(DeviceEvent::PlayFailed("Live video starts after the download".to_string())).await;
+            let _ = tx.send(DeviceEvent::PlayDeferred("Live video starts after the download".to_string())).await;
         }
         Command::Playback(PlaybackCommand::Close { .. }) | Command::Stop => {}
         Command::Playback(playback) => {
@@ -637,7 +640,8 @@ pub fn spawn_device(
                             match client.start_video(channel, profile).await {
                                 Ok(f) => frames = Some(f),
                                 Err(e) => {
-                                    let _ = tx.send(DeviceEvent::PlayFailed(e.to_string())).await;
+                                    let event = DeviceEvent::PlayFailed { channel, reason: e.to_string() };
+                                    let _ = tx.send(event).await;
                                 }
                             }
                         }
@@ -864,7 +868,7 @@ pub fn spawn_device(
                         }
                         Some(Err(e)) => {
                             frames = None;
-                            let _ = tx.send(DeviceEvent::PlayFailed(e.to_string())).await;
+                            let _ = tx.send(DeviceEvent::PlayFailed { channel, reason: e.to_string() }).await;
                         }
                         None => frames = None,
                     },

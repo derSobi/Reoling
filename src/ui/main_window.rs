@@ -91,6 +91,14 @@ fn keyring_step(logged_in: bool, typed: Option<Remember>) -> KeyringStep {
     }
 }
 
+/// Whether the stream selector can be used: while the watched stream plays,
+/// and after its start failed or it broke off, so that another stream can be
+/// picked (the selector starts it). Not while a start is under way, nor with
+/// nothing watched.
+fn stream_selectable(watching: bool, streaming: bool, refused: bool) -> bool {
+    watching && (streaming || refused)
+}
+
 /// A device's live connection. `id` tells a replaced connection's late events
 /// apart from the current one's.
 struct Link {
@@ -140,6 +148,12 @@ pub struct MainWindow {
     next: Button,
     /// Whether the picture on screen is really flowing.
     streaming: Cell<bool>,
+    /// The watched channel's last start failed or its stream broke off (the
+    /// camera refused it, say): the stream selector stays usable, so that
+    /// another stream can be tried. `play` and the first frame clear it; a
+    /// late failure of the channel watched before and a stream that waits
+    /// for a download do not set it.
+    refused: Cell<bool>,
     /// The stream the user prefers, and the ones the watched device offers
     /// (what the dropdown lists, in the same order).
     profile: Cell<StreamProfile>,
@@ -868,6 +882,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             previous,
             next,
             streaming: Cell::new(false),
+            refused: Cell::new(false),
             // Start on the lightest stream; heavier ones are opt-in.
             profile: Cell::new(StreamProfile::Sub),
             stream_options: RefCell::new(vec![StreamProfile::Main, StreamProfile::Sub]),
@@ -1729,7 +1744,7 @@ impl MainWindow {
         self.spotlight
             .set_tooltip_text(Some(if spotlight { "Spotlight" } else { "This camera has no spotlight" }));
         self.record.set_sensitive(self.streaming.get());
-        self.stream.set_sensitive(self.streaming.get());
+        self.stream.set_sensitive(stream_selectable(playing.is_some(), self.streaming.get(), self.refused.get()));
         self.previous.set_sensitive(multi);
         self.next.set_sensitive(multi);
     }
@@ -2087,12 +2102,23 @@ impl MainWindow {
                 if self.playing_key().as_deref() == Some(key) {
                     self.message.set_visible(false);
                     self.streaming.set(true);
+                    self.refused.set(false);
                     self.update_controls();
                     self.query_zoom();
                     self.query_monitor_point();
                 }
             }
-            DeviceEvent::PlayFailed(reason) => {
+            DeviceEvent::PlayFailed { channel, reason } => {
+                if self.playing_key().as_deref() == Some(key) {
+                    self.streaming.set(false);
+                    if self.device(key).is_some_and(|d| d.channel == channel) {
+                        self.refused.set(true);
+                    }
+                    self.show_message(&reason);
+                    self.update_controls();
+                }
+            }
+            DeviceEvent::PlayDeferred(reason) => {
                 if self.playing_key().as_deref() == Some(key) {
                     self.streaming.set(false);
                     self.show_message(&reason);
@@ -2383,6 +2409,7 @@ impl MainWindow {
         *self.playing.borrow_mut() = Some(key.to_string());
         *self.last_played.borrow_mut() = Some(key.to_string());
         self.streaming.set(false);
+        self.refused.set(false);
         self.refresh_streams();
         self.persist();
         self.sidebar.select(key);
@@ -2503,7 +2530,7 @@ impl MainWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::{bar_span, keyring_step, place_bar_under_picture, KeyringStep, Remember};
+    use super::{bar_span, keyring_step, place_bar_under_picture, stream_selectable, KeyringStep, Remember};
     use crate::ui::zoom_picture::ZoomPicture;
     use gtk4::prelude::*;
     use gtk4::{gdk, Box as GtkBox, Label, Orientation, Overlay, Revealer, RevealerTransitionType, Window};
@@ -2782,5 +2809,19 @@ mod tests {
         assert_eq!(keyring_step(true, Some(Remember::Forget)), KeyringStep::Forget);
         assert_eq!(keyring_step(false, Some(Remember::Store)), KeyringStep::Keep);
         assert_eq!(keyring_step(false, Some(Remember::Forget)), KeyringStep::Keep);
+    }
+
+    #[test]
+    fn the_stream_selector_opens_after_a_failed_start_but_not_while_starting() {
+        // Starting: no frame and no failure yet.
+        assert!(!stream_selectable(true, false, false));
+        // Playing, as before.
+        assert!(stream_selectable(true, true, false));
+        // Refused or broken off: another stream can be picked.
+        assert!(stream_selectable(true, false, true));
+        // Nothing watched (stopped, on the Playback page, removed or lost): closed, whatever came before.
+        for (streaming, refused) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert!(!stream_selectable(false, streaming, refused), "streaming {streaming}, refused {refused}");
+        }
     }
 }
