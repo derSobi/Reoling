@@ -1583,16 +1583,19 @@ impl ReolinkClient {
         // Picked while the last stream's number is still kept out.
         let msg_num = self.next_msg_num();
         self.live_msg_num = Some(msg_num);
-        // handle/stream_type per quality. `Main`'s values (handle 0,
-        // BcMeta.stream_type 0, XML streamType "mainStream") come straight
-        // from our own real capture and are not in question.
-        //
-        // `Sub`'s values (handle 256, BcMeta.stream_type 1, XML streamType
-        // "subStream") are NOT independently confirmed against our own
-        // Wireshark capture — that capture only covers Main-stream Preview
-        // usage. They come from the 2026-09-16 audit (section 21), not
-        // from a capture. Treat as unverified until confirmed against real
-        // hardware requesting a Sub stream.
+        // handle/stream_type per quality. What the captures we decoded show
+        // (the official app's against our Home Hub and NVR, and Reoling's
+        // own): the official app asks for the sub stream with XML handle
+        // 256 + channel, streamType "subStream" and a
+        // <policy>newestIFrame</policy> that Reoling does not send. It
+        // leaves msg_num at 0 and counts its requests in the header bytes
+        // Reoling uses for the channel and the stream type, so it says
+        // nothing about BcMeta.stream_type. Reoling's own `Sub` request
+        // below (handle 256 on every channel, BcMeta.stream_type 1,
+        // "subStream", no policy) is answered 200 by the Hub on channels 0
+        // to 2 and by the NVR on channel 0. Every Preview in them is for the
+        // sub stream: `Main`'s and `Extern`'s values are not confirmed by
+        // these captures.
         let (handle, stream_type_str, bc_meta_stream_type) = match quality {
             StreamProfile::Main => (0, "mainStream", 0),
             StreamProfile::Sub => (256, "subStream", 1),
