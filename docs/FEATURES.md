@@ -152,12 +152,12 @@ The full list behind the [README's Status](../README.md#status).
   Theme, System Status (versions, the hardware decoders and the decoders in
   use), Auto Live View, Stretch Mode, decoding (Auto with the integrated or
   the dedicated GPU first / Hardware — with the decoder to use if there are
-  several — / Software), latency, and the folders for screenshots and
-  recordings. The window's rows Reoling cannot act on yet (client
-  update, add devices automatically, lockscreen password, date format,
-  language, detection overlays, scrollview time, alarm beep, temporary and
-  download folders, local record) are shown greyed out. Colours are the
-  active theme's.
+  several — / Software; see [Hardware decoding](HARDWARE-DECODING.md)),
+  latency, and the folders for screenshots and recordings. The window's
+  rows Reoling cannot act on yet (client update, add devices automatically,
+  lockscreen password, date format, language, detection overlays,
+  scrollview time, alarm beep, temporary and download folders, local
+  record) are shown greyed out. Colours are the active theme's.
 
 ## Not done yet
 
