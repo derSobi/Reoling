@@ -461,13 +461,17 @@ pub async fn connect_relay(
 /// `relay_addr` mirrors `connect_relay`'s own parameter: callers should
 /// pass `register.relay.unwrap_or(lookup.relay)` so a register reply with
 /// no relay offer still has one to race against.
+///
+/// Returns the peer and which path won, by its name only ("local",
+/// "NAT-mapped" or "relay"; never an address), for the negotiation debug
+/// output.
 pub async fn connect_race(
     socket: &UdpSocket,
     register_addr: SocketAddr,
     relay_addr: SocketAddr,
     register: &RegisterResult,
     client_id: i32,
-) -> crate::Result<PeerHandle> {
+) -> crate::Result<(PeerHandle, &'static str)> {
     let candidates: Vec<(&'static str, SocketAddr)> = [
         register.dev.map(|a| ("local", a)),
         register.map.map(|a| ("map", a)),
@@ -528,16 +532,12 @@ pub async fn connect_race(
     })
     .await
     .map_err(|_| Error::P2pNegotiationTimeout)??;
-    if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
-        // Which path won, by its name only: never an address.
-        let path = match winning_conn.as_str() {
-            "local" => "local",
-            "map" => "NAT-mapped",
-            "relay" => "relay",
-            _ => "other",
-        };
-        eprintln!("NEGOTIATION p2p path: {path}");
-    }
+    let path = match winning_conn.as_str() {
+        "local" => "local",
+        "map" => "NAT-mapped",
+        "relay" => "relay",
+        _ => "other",
+    };
 
     let confirm = BcUdp::Discovery(UdpDiscovery {
         tid: rand::random::<u32>().max(1),
@@ -553,7 +553,7 @@ pub async fn connect_race(
         .send_to(&write_bcudp(&confirm), register_addr)
         .await?;
 
-    Ok(peer)
+    Ok((peer, path))
 }
 
 /// The P2P servers asked about a UID, all in parallel. Exactly the set the
@@ -651,6 +651,12 @@ async fn resolve_and_register(
 /// ~8.8Mbit/s encoder rate on both direct and relay paths while ours,
 /// always forced onto relay, managed only ~3.5Mbit/s there.
 pub async fn connect_by_uid(socket: &UdpSocket, uid: &str) -> crate::Result<PeerHandle> {
+    connect_by_uid_with_path(socket, uid).await.map(|(peer, _)| peer)
+}
+
+/// `connect_by_uid`, also returning which path won ("local", "NAT-mapped"
+/// or "relay", by name only), for the negotiation debug output.
+pub async fn connect_by_uid_with_path(socket: &UdpSocket, uid: &str) -> crate::Result<(PeerHandle, &'static str)> {
     let (lookup, register_result, client_id) = resolve_and_register(socket, uid).await?;
     let relay_addr = register_result.relay.unwrap_or(lookup.relay);
     connect_race(socket, lookup.reg, relay_addr, &register_result, client_id).await
@@ -1147,9 +1153,10 @@ mod tests {
             map: None,
             relay: Some(relay_addr),
         };
-        let peer = connect_race(&client, register_addr, relay_addr, &register_result, 1)
+        let (peer, path) = connect_race(&client, register_addr, relay_addr, &register_result, 1)
             .await
             .unwrap();
+        assert_eq!(path, "relay");
         assert_eq!(peer.addr, relay_addr);
         assert_eq!(peer.remote_connection_id, 88);
         assert_eq!(peer.nonce, Some("654321".to_string()));

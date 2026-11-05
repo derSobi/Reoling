@@ -4,7 +4,7 @@ use crate::protocol::bcmedia::model::{parse_one, BcMediaMessage};
 use crate::protocol::crypto::{aes_key_from_password, EncryptionProtocol};
 use crate::media_guard::{MediaGuard, Verdict};
 use crate::transport::connection::BcConnection;
-use crate::transport::discovery::{connect_by_uid, PeerHandle};
+use crate::transport::discovery::{connect_by_uid_with_path, PeerHandle};
 use crate::Error;
 use md5::{Digest, Md5};
 use std::collections::HashMap;
@@ -308,8 +308,15 @@ pub struct ReolinkClient {
     /// `next_msg_num` does not give it out until the next stream starts.
     live_msg_num: Option<u16>,
     /// When the device accepted the login, for the time the negotiation
-    /// debug lines start with (see `since_login`).
+    /// debug lines start with (see `debug_prefix`).
     logged_in_at: Option<std::time::Instant>,
+    /// This connection's number in the negotiation debug lines (see
+    /// `debug_prefix`).
+    debug_id: u32,
+    /// Which P2P path won the connect race ("local", "NAT-mapped" or
+    /// "relay"), for the negotiation debug output; `None` for a connection
+    /// made another way.
+    p2p_path: Option<&'static str>,
 }
 
 /// What an in-flight request was asking for: a `MSG_ID_IMAGE_FILE` request
@@ -699,10 +706,19 @@ fn redact_identifiers(text: &str) -> String {
     out
 }
 
-/// What the negotiation and identity debug lines start with: the time since
-/// the device accepted the login ("[+812 ms] "), or nothing before that.
-fn since_login(logged_in_at: Option<std::time::Instant>) -> String {
-    logged_in_at.map(|at| format!("[+{} ms] ", at.elapsed().as_millis())).unwrap_or_default()
+/// Numbers this process's connections for the negotiation debug lines (see
+/// `debug_prefix`): every device connects at start, side by side, and the
+/// number tells their lines apart without naming the device.
+static NEXT_DEBUG_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// What the negotiation and identity debug lines start with: the
+/// connection's number and the time since the device accepted the login
+/// ("[conn 2 +812 ms] "), or the number alone before that.
+fn debug_prefix(debug_id: u32, logged_in_at: Option<std::time::Instant>) -> String {
+    match logged_in_at {
+        Some(at) => format!("[conn {debug_id} +{} ms] ", at.elapsed().as_millis()),
+        None => format!("[conn {debug_id}] "),
+    }
 }
 
 /// The login reply's stream list for the negotiation debug output: per
@@ -749,11 +765,12 @@ impl ReolinkClient {
     /// available" strategy. Still strictly UDP/P2P — no TCP.
     pub async fn connect_by_uid(uid: &str) -> crate::Result<Self> {
         let socket = Arc::new(crate::transport::bind_udp_socket_with_large_rcvbuf().await?);
-        let peer: PeerHandle = connect_by_uid(&socket, uid).await?;
+        let (peer, path): (PeerHandle, _) = connect_by_uid_with_path(&socket, uid).await?;
         let connection = BcConnection::new(socket, peer);
         let keepalive = connection.spawn_direct_keepalive();
         let mut client = Self::from_connection(connection, EncryptionProtocol::Unencrypted);
         client.direct_keepalive_task = keepalive;
+        client.p2p_path = Some(path);
         Ok(client)
     }
 
@@ -854,6 +871,8 @@ impl ReolinkClient {
             subscribe_msg_num: None,
             live_msg_num: None,
             logged_in_at: None,
+            debug_id: NEXT_DEBUG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            p2p_path: None,
         }
     }
 
@@ -1027,7 +1046,10 @@ impl ReolinkClient {
         }
         self.encode_profiles = crate::encoding::EncodeProfile::parse_list(&String::from_utf8_lossy(&payload));
         if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
-            let at = since_login(self.logged_in_at);
+            let at = debug_prefix(self.debug_id, self.logged_in_at);
+            if let Some(path) = self.p2p_path {
+                eprintln!("{at}NEGOTIATION p2p path: {path}");
+            }
             eprintln!("{at}DEBUG login streams: {}", describe_streams(&self.encode_profiles));
         }
         let device_info = BcXml::from_bytes(&payload)?.device_info.unwrap_or_default();
@@ -1418,7 +1440,7 @@ impl ReolinkClient {
         let (info, answer, others) = self.ask_version().await;
         let (name, model) = info.map(|i| (i.name, i.model)).unwrap_or_default();
         if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
-            let at = since_login(self.logged_in_at);
+            let at = debug_prefix(self.debug_id, self.logged_in_at);
             eprintln!("{at}DEBUG identity version: {}", answer.describe(asked.elapsed(), others));
             eprintln!("{at}DEBUG identity reply: name={name:?} model={model:?}");
         }
@@ -1751,7 +1773,7 @@ impl ReolinkClient {
             if let BcBody::Modern(ModernMsg { payload: Some(p), .. }) = &request.body {
                 eprintln!(
                     "{}NEGOTIATION preview request: channel_id={} stream_type={} class={:#x} xml={}",
-                    since_login(self.logged_in_at),
+                    debug_prefix(self.debug_id, self.logged_in_at),
                     request.meta.channel_id,
                     request.meta.stream_type,
                     request.meta.class,
@@ -1790,7 +1812,7 @@ impl ReolinkClient {
         if debug_negotiation {
             eprintln!(
                 "{}NEGOTIATION preview reply: response_code={} class={:#x} body={:?}",
-                since_login(self.logged_in_at),
+                debug_prefix(self.debug_id, self.logged_in_at),
                 ack.meta.response_code,
                 ack.meta.class,
                 ack.body
@@ -1807,7 +1829,7 @@ impl ReolinkClient {
         let audio = self.audio_tx.clone();
         let pending_images = Arc::clone(&self.pending_images);
         let channel_uids = Arc::clone(&self.channel_uids);
-        let logged_in_at = self.logged_in_at;
+        let (debug_id, logged_in_at) = (self.debug_id, self.logged_in_at);
         self.video_task = Some(tokio::spawn(async move {
             let mut buffer: Vec<u8> = Vec::new();
             let mut guard = MediaGuard::default();
@@ -1855,7 +1877,7 @@ impl ReolinkClient {
                             buffer.drain(..used);
                             if let BcMediaMessage::Info { width, height } = &msg {
                                 if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
-                                    let at = since_login(logged_in_at);
+                                    let at = debug_prefix(debug_id, logged_in_at);
                                     eprintln!("{at}NEGOTIATION stream info unit: {width}x{height}");
                                 }
                             }
@@ -1875,7 +1897,7 @@ impl ReolinkClient {
                             // unit instead of ending the stream.
                             let skip = crate::protocol::bcmedia::model::resync_offset(&buffer);
                             if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
-                                let at = since_login(logged_in_at);
+                                let at = debug_prefix(debug_id, logged_in_at);
                                 eprintln!("{at}NEGOTIATION media resync: {e}; skipped {skip} bytes");
                             }
                             if skip == 0 {
@@ -2442,6 +2464,15 @@ mod control_tests {
             VersionAnswer::NotSent(Error::ConnectionLost).describe(ms(0), 0),
             "version request not sent: connection lost"
         );
+    }
+
+    #[test]
+    fn the_debug_prefix_gives_the_connection_and_the_time_since_login() {
+        assert_eq!(debug_prefix(3, None), "[conn 3] ");
+        let at = std::time::Instant::now().checked_sub(std::time::Duration::from_millis(812)).unwrap();
+        let shown = debug_prefix(3, Some(at));
+        let ms = shown.strip_prefix("[conn 3 +").and_then(|rest| rest.strip_suffix(" ms] "));
+        assert!(ms.and_then(|ms| ms.parse::<u128>().ok()).is_some_and(|ms| ms >= 812), "{shown}");
     }
 
     #[test]
