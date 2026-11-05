@@ -705,6 +705,25 @@ fn since_login(logged_in_at: Option<std::time::Instant>) -> String {
     logged_in_at.map(|at| format!("[+{} ms] ", at.elapsed().as_millis())).unwrap_or_default()
 }
 
+/// The login reply's stream list for the negotiation debug output: per
+/// `StreamInfo`, the channels it is for (a bit mask) and each of its tables'
+/// stream type, size and frame rate; nothing else of the reply.
+fn describe_streams(profiles: &[crate::encoding::EncodeProfile]) -> String {
+    if profiles.is_empty() {
+        return "no stream list".to_string();
+    }
+    let info = |profile: &crate::encoding::EncodeProfile| {
+        let tables: Vec<String> = profile
+            .tables
+            .iter()
+            .map(|t| format!("{} {}x{} {} fps", t.stream_type, t.width, t.height, t.default_frame_rate))
+            .collect();
+        let tables = if tables.is_empty() { "no tables".to_string() } else { tables.join(", ") };
+        format!("channels {:#x}: {tables}", profile.channel_bits)
+    };
+    profiles.iter().map(info).collect::<Vec<_>>().join("; ")
+}
+
 /// The camera truncates the hex MD5 digest of `input` to 31 characters
 /// (uppercase) before comparing it — a quirk inherited from a fixed-size C
 /// buffer in the original firmware. Both username and password must be
@@ -1007,6 +1026,10 @@ impl ReolinkClient {
             eprintln!("PROBE login reply: {text}");
         }
         self.encode_profiles = crate::encoding::EncodeProfile::parse_list(&String::from_utf8_lossy(&payload));
+        if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
+            let at = since_login(self.logged_in_at);
+            eprintln!("{at}DEBUG login streams: {}", describe_streams(&self.encode_profiles));
+        }
         let device_info = BcXml::from_bytes(&payload)?.device_info.unwrap_or_default();
         Ok(DeviceInfoSummary {
             resolution_name: device_info.resolution.and_then(|r| r.name),
@@ -2419,6 +2442,45 @@ mod control_tests {
             VersionAnswer::NotSent(Error::ConnectionLost).describe(ms(0), 0),
             "version request not sent: connection lost"
         );
+    }
+
+    #[test]
+    fn the_login_streams_line_gives_type_size_and_frame_rate_per_table() {
+        use crate::encoding::{EncodeProfile, EncodeTable};
+        let table = |stream_type: &str, width, height, default_frame_rate| EncodeTable {
+            stream_type: stream_type.to_string(),
+            width,
+            height,
+            default_frame_rate,
+            default_bitrate: 1024,
+            frame_rates: vec![25, 20, 15],
+            bitrates: vec![1024, 2048],
+            ..Default::default()
+        };
+        let profiles = [
+            EncodeProfile {
+                channel_bits: 1,
+                tables: vec![table("mainStream", 1920, 1080, 15), table("subStream", 640, 360, 10)],
+            },
+            EncodeProfile { channel_bits: 6, tables: vec![table("externStream", 1280, 720, 25)] },
+        ];
+        assert_eq!(
+            describe_streams(&profiles),
+            "channels 0x1: mainStream 1920x1080 15 fps, subStream 640x360 10 fps; \
+             channels 0x6: externStream 1280x720 25 fps"
+        );
+        assert_eq!(describe_streams(&[]), "no stream list");
+        let bare = EncodeProfile { channel_bits: 1, tables: Vec::new() };
+        assert_eq!(describe_streams(&[bare]), "channels 0x1: no tables");
+        // From a login reply's text, as `login` reads it.
+        let reply = "<body><DeviceInfo><serialNumber>TESTSERIAL</serialNumber></DeviceInfo><StreamInfoList>\
+                     <StreamInfo><channelBits>1</channelBits><encodeTable><type>subStream</type><resolution>\
+                     <width>640</width><height>360</height></resolution><defaultFramerate>15</defaultFramerate>\
+                     </encodeTable></StreamInfo></StreamInfoList></body>";
+        let shown = describe_streams(&EncodeProfile::parse_list(reply));
+        assert_eq!(shown, "channels 0x1: subStream 640x360 15 fps");
+        let without = "<body><DeviceInfo></DeviceInfo></body>";
+        assert_eq!(describe_streams(&EncodeProfile::parse_list(without)), "no stream list");
     }
 
     #[test]
