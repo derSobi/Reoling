@@ -731,6 +731,35 @@ fn debug_prefix(debug_id: u32, logged_in_at: Option<std::time::Instant>) -> Stri
     }
 }
 
+/// What live video's reader left out of an earlier stream before its own
+/// stream's first message, for the negotiation debug line: the messages,
+/// and their bytes as their headers count them (Extension and payload).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SkippedTail {
+    messages: u32,
+    bytes: usize,
+}
+
+impl SkippedTail {
+    fn add(&mut self, bc: &Bc) {
+        let len = match &bc.body {
+            BcBody::Modern(ModernMsg { extension_xml, payload }) => {
+                extension_xml.as_ref().map_or(0, Vec::len) + payload.as_ref().map_or(0, Vec::len)
+            }
+            BcBody::Legacy(_) => 0,
+        };
+        self.messages = self.messages.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(len);
+    }
+
+    /// The line, or `None` when nothing was left out.
+    fn describe(&self) -> Option<String> {
+        let s = if self.messages == 1 { "" } else { "s" };
+        (self.messages > 0)
+            .then(|| format!("live: skipped {} message{s} ({} bytes) of an earlier stream", self.messages, self.bytes))
+    }
+}
+
 /// The login reply's stream list for the negotiation debug output: per
 /// `StreamInfo`, the channels it is for (a bit mask) and each of its tables'
 /// stream type, size and frame rate; nothing else of the reply.
@@ -1873,6 +1902,8 @@ impl ReolinkClient {
             let mut buffer: Vec<u8> = Vec::new();
             let mut guard = MediaGuard::default();
             let mut image_chunks = HashMap::new();
+            // Counted for the debug line until this stream's first message.
+            let mut skipped = debug_negotiation.then(SkippedTail::default);
             loop {
                 let bc = {
                     let mut conn = connection.lock().await;
@@ -1893,6 +1924,22 @@ impl ReolinkClient {
                 }
                 if let Some(trace) = &trace {
                     trace.record(&bc);
+                }
+                if bc.meta.msg_num != msg_num {
+                    // An earlier stream's tail. The device sends each stream
+                    // under its own Preview's number, and what the last one
+                    // still had in flight comes after this one's reply (in
+                    // our captures, up to 0.7 s of it): another codec, or
+                    // another camera. Taken for this stream's, its first
+                    // frame would pick the decoder. Pushes and replies were
+                    // passed on above.
+                    if let Some(skipped) = &mut skipped {
+                        skipped.add(&bc);
+                    }
+                    continue;
+                }
+                if let Some(line) = skipped.take().and_then(|skipped| skipped.describe()) {
+                    eprintln!("{}NEGOTIATION {line}", debug_prefix(debug_id, logged_in_at));
                 }
                 let BcBody::Modern(ModernMsg { extension_xml, payload: Some(payload) }) = bc.body
                 else {
@@ -1930,10 +1977,10 @@ impl ReolinkClient {
                         }
                         Ok(None) => break,
                         Err(e) => {
-                            // Not the start of a unit — typically the tail of
-                            // the stream we just switched away from, still in
-                            // flight when the new one began. Skip to the next
-                            // unit instead of ending the stream.
+                            // Not the start of a unit. Skip to the next unit
+                            // instead of ending the stream. (The tail of the
+                            // stream we just switched away from, once the
+                            // usual cause, is left out above by its number.)
                             let skip = crate::protocol::bcmedia::model::resync_offset(&buffer);
                             if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
                                 let at = debug_prefix(debug_id, logged_in_at);
@@ -2515,6 +2562,35 @@ mod control_tests {
     }
 
     #[test]
+    fn the_live_debug_line_counts_what_was_left_out_of_an_earlier_stream() {
+        let mut skipped = SkippedTail::default();
+        assert_eq!(skipped.describe(), None);
+        let message = |extension_xml: Option<Vec<u8>>, payload: Vec<u8>| Bc {
+            meta: BcMeta {
+                msg_id: MSG_ID_VIDEO,
+                channel_id: 2,
+                stream_type: 0,
+                msg_num: 16,
+                response_code: 200,
+                class: 0x0000,
+            },
+            body: BcBody::Modern(ModernMsg { extension_xml, payload: Some(payload) }),
+        };
+        let binary = Extension { version: XML_VERSION.to_string(), binary_data: Some(1), ..Default::default() };
+        let first = message(Some(binary.to_bytes()), vec![0; 600]);
+        skipped.add(&first);
+        // The bytes as the message's header counts them.
+        let wire = crate::protocol::bc::codec::write_bc(&first, &EncryptionProtocol::Unencrypted);
+        let (header, _) = crate::protocol::bc::header_codec::read_header(&wire).unwrap().unwrap();
+        assert_eq!(skipped.bytes, header.body_len as usize);
+        let one = format!("live: skipped 1 message ({} bytes) of an earlier stream", header.body_len);
+        assert_eq!(skipped.describe(), Some(one));
+        skipped.add(&message(None, vec![0; 63]));
+        let two = format!("live: skipped 2 messages ({} bytes) of an earlier stream", header.body_len + 63);
+        assert_eq!(skipped.describe(), Some(two));
+    }
+
+    #[test]
     fn the_login_streams_line_gives_type_size_and_frame_rate_per_table() {
         use crate::encoding::{EncodeProfile, EncodeTable};
         let table = |stream_type: &str, width, height, default_frame_rate| EncodeTable {
@@ -2586,6 +2662,7 @@ mod keepalive_tests {
     use std::time::Duration;
     use tokio::net::UdpSocket;
     use tokio::time::Instant;
+    use tokio_stream::StreamExt;
 
     const PLAIN: EncryptionProtocol = EncryptionProtocol::Unencrypted;
 
@@ -3398,5 +3475,306 @@ mod keepalive_tests {
         assert!(matches!(error, Error::ReplyTimeout), "{error}");
         assert!(waited >= Duration::from_secs(15) && waited < Duration::from_secs(16), "{waited:?}");
         fake.abort();
+    }
+
+    /// One BcMedia video unit without an extra header: a key frame of `codec`
+    /// (`H264` or `H265`), or with `key` false a delta frame.
+    fn video_unit(key: bool, codec: &[u8; 4], microseconds: u32, data: &[u8]) -> Vec<u8> {
+        let magic: u32 = if key { 0x6364_3030 } else { 0x6364_3130 };
+        let mut unit = magic.to_le_bytes().to_vec();
+        unit.extend_from_slice(codec);
+        unit.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        unit.extend_from_slice(&0u32.to_le_bytes());
+        unit.extend_from_slice(&microseconds.to_le_bytes());
+        unit.extend_from_slice(&0u32.to_le_bytes());
+        unit.extend_from_slice(data);
+        unit.resize(unit.len() + (8 - data.len() % 8) % 8, 0);
+        unit
+    }
+
+    /// One BcMedia AAC unit.
+    fn audio_unit(adts: &[u8]) -> Vec<u8> {
+        let mut unit = 0x6277_3530u32.to_le_bytes().to_vec();
+        unit.extend_from_slice(&(adts.len() as u16).to_le_bytes());
+        unit.extend_from_slice(&(adts.len() as u16).to_le_bytes());
+        unit.extend_from_slice(adts);
+        unit.resize(unit.len() + (8 - adts.len() % 8) % 8, 0);
+        unit
+    }
+
+    /// A live stream's message that starts a unit, under its Preview's
+    /// number, channel and stream type (`preview` is the request's header),
+    /// with an Extension that marks it binary and names the channel. It has
+    /// no self-check, so the media guard takes it.
+    fn media(preview: &BcMeta, payload: Vec<u8>) -> Bc {
+        let binary = Extension {
+            version: XML_VERSION.to_string(),
+            binary_data: Some(1),
+            channel_id: Some(preview.channel_id),
+            ..Default::default()
+        };
+        let mut bc = device_message(MSG_ID_VIDEO, preview.msg_num, 200, Some(binary.to_bytes()), Some(payload));
+        (bc.meta.channel_id, bc.meta.stream_type) = (preview.channel_id, preview.stream_type);
+        bc
+    }
+
+    /// The same for a later message of a unit, which carries no Extension.
+    fn media_continued(preview: &BcMeta, payload: Vec<u8>) -> Bc {
+        let mut bc = device_message(MSG_ID_VIDEO, preview.msg_num, 200, None, Some(payload));
+        (bc.meta.channel_id, bc.meta.stream_type) = (preview.channel_id, preview.stream_type);
+        bc
+    }
+
+    /// The device end of a switch from one live stream to another. The first
+    /// Preview is answered and followed by `first` under its number; the stop
+    /// is answered; other requests are only kept. The second Preview is
+    /// answered and followed by what `tail` makes of the headers of every
+    /// request so far: the messages that come after that reply. Gives back
+    /// those headers.
+    async fn switching_device(
+        mut device: BcConnection,
+        first: Vec<u8>,
+        tail: impl FnOnce(&[BcMeta]) -> Vec<Bc>,
+    ) -> Vec<BcMeta> {
+        let mut asked: Vec<BcMeta> = Vec::new();
+        while let Ok(request) = device.recv_bc(&PLAIN).await {
+            let meta = request.meta;
+            asked.push(meta.clone());
+            if meta.msg_id != MSG_ID_VIDEO && meta.msg_id != MSG_ID_VIDEO_STOP {
+                continue;
+            }
+            let mut reply = device_message(meta.msg_id, meta.msg_num, 200, None, None);
+            (reply.meta.channel_id, reply.meta.stream_type) = (meta.channel_id, meta.stream_type);
+            if meta.msg_id == MSG_ID_VIDEO && asked.iter().filter(|m| m.msg_id == MSG_ID_VIDEO).count() > 1 {
+                for bc in std::iter::once(reply).chain(tail(&asked)) {
+                    device.send_bc(&bc, &PLAIN).await.unwrap();
+                }
+                return asked;
+            }
+            device.send_bc(&reply, &PLAIN).await.unwrap();
+            if meta.msg_id == MSG_ID_VIDEO {
+                device.send_bc(&media(&meta, first.clone()), &PLAIN).await.unwrap();
+            }
+        }
+        asked
+    }
+
+    /// The next frame of a live stream, within 5 s.
+    async fn next_frame(frames: &mut ReceiverStream<crate::Result<VideoFrame>>) -> VideoFrame {
+        let next = tokio::time::timeout(Duration::from_secs(5), frames.next()).await.expect("a frame within 5 s");
+        next.expect("the stream goes on").expect("a frame, not an error")
+    }
+
+    /// Each request's id, number, channel and stream type.
+    fn headers(asked: &[BcMeta]) -> Vec<(u32, u16, u8, u8)> {
+        asked.iter().map(|m| (m.msg_id, m.msg_num, m.channel_id, m.stream_type)).collect()
+    }
+
+    /// Main to sub, as an NVR over the relay does it: after the sub stream's
+    /// reply the main stream (H.265) still sends, under its own Preview's
+    /// number, a whole delta frame and the start of a key frame. The sub
+    /// stream (H.264) starts with its own key frame, which is what the decoder
+    /// is picked by; nothing of the tail comes out, and the diagnostic trace
+    /// still has it.
+    #[tokio::test]
+    async fn after_a_switch_the_first_frame_is_the_new_stream_s_not_the_old_stream_s_tail() {
+        let (mut client, device) = client_and_device().await;
+        let fake = tokio::spawn(switching_device(device, video_unit(true, b"H265", 1, &[0, 0, 0, 1, 0x40]), |asked| {
+            let (main, sub) = (&asked[0], &asked[2]);
+            let next_key = video_unit(true, b"H265", 3, &[0x26; 64]);
+            vec![
+                media(main, video_unit(false, b"H265", 2, &[0, 0, 0, 1, 0x02, 0x01])),
+                media(main, next_key[..40].to_vec()),
+                media(sub, video_unit(true, b"H264", 1000, &[0, 0, 0, 1, 0x67, 0x64])),
+            ]
+        }));
+        let mut main = client.start_video(0, StreamProfile::Main).await.unwrap();
+        assert_eq!(next_frame(&mut main).await.video_type, VideoType::H265);
+        client.stop_video(0).await.unwrap();
+        let trace = Arc::new(crate::media_trace::MediaTrace::default());
+        let mut sub = client.start_video_with_trace(0, StreamProfile::Sub, Some(Arc::clone(&trace))).await.unwrap();
+        let first = next_frame(&mut sub).await;
+        assert_eq!(
+            (first.video_type, first.is_keyframe, first.microseconds, first.data.as_slice()),
+            (VideoType::H264, true, 1000, &[0, 0, 0, 1, 0x67, 0x64][..])
+        );
+        // The trace has the tail as well as the new stream's message.
+        assert_eq!(trace.write_to(Vec::new()).unwrap(), (3, false));
+        let asked = fake.await.unwrap();
+        assert_eq!(headers(&asked), [(MSG_ID_VIDEO, 1, 0, 0), (MSG_ID_VIDEO_STOP, 2, 0, 0), (MSG_ID_VIDEO, 3, 0, 1)]);
+    }
+
+    /// From one camera's sub stream to another camera's, both H.264, as an
+    /// NVR over the relay does it: what the first camera still sends after
+    /// the reply, under its own Preview's number, is not shown as the second
+    /// camera's picture.
+    #[tokio::test]
+    async fn after_a_switch_another_camera_s_tail_in_the_same_codec_is_not_shown() {
+        let (mut client, device) = client_and_device().await;
+        let fake = tokio::spawn(switching_device(device, video_unit(true, b"H264", 1, &[0, 0, 0, 1, 0x65, 1]), |asked| {
+            let (one, other) = (&asked[0], &asked[2]);
+            vec![
+                media(one, video_unit(false, b"H264", 2, &[0, 0, 0, 1, 0x41, 1])),
+                media(one, video_unit(true, b"H264", 3, &[0, 0, 0, 1, 0x65, 1])),
+                media(other, video_unit(true, b"H264", 500, &[0, 0, 0, 1, 0x65, 2])),
+            ]
+        }));
+        let mut one = client.start_video(1, StreamProfile::Sub).await.unwrap();
+        assert_eq!(next_frame(&mut one).await.microseconds, 1);
+        client.stop_video(1).await.unwrap();
+        let mut other = client.start_video(0, StreamProfile::Sub).await.unwrap();
+        let first = next_frame(&mut other).await;
+        assert_eq!(
+            (first.video_type, first.is_keyframe, first.microseconds, first.data.as_slice()),
+            (VideoType::H264, true, 500, &[0, 0, 0, 1, 0x65, 2][..])
+        );
+        let asked = fake.await.unwrap();
+        assert_eq!(headers(&asked), [(MSG_ID_VIDEO, 1, 1, 1), (MSG_ID_VIDEO_STOP, 2, 1, 1), (MSG_ID_VIDEO, 3, 0, 1)]);
+    }
+
+    /// The old stream's message between two messages of the new stream's
+    /// first key frame: the key frame comes out whole, and the frame after it
+    /// too.
+    #[tokio::test]
+    async fn an_old_stream_s_message_between_two_parts_of_a_frame_is_left_out() {
+        let (mut client, device) = client_and_device().await;
+        let data: Vec<u8> = (0..100).collect();
+        let main_key = video_unit(true, b"H265", 1, &[0, 0, 0, 1, 0x40]);
+        let key = video_unit(true, b"H264", 1000, &data);
+        let fake = tokio::spawn(switching_device(device, main_key, move |asked| {
+            let (main, sub) = (&asked[0], &asked[2]);
+            vec![
+                media(sub, key[..50].to_vec()),
+                media(main, video_unit(false, b"H265", 2, &[0, 0, 0, 1, 0x02, 0x01])),
+                media_continued(sub, key[50..].to_vec()),
+                media(sub, video_unit(false, b"H264", 1040, &[0, 0, 0, 1, 0x41])),
+            ]
+        }));
+        let mut main = client.start_video(0, StreamProfile::Main).await.unwrap();
+        next_frame(&mut main).await;
+        client.stop_video(0).await.unwrap();
+        let mut sub = client.start_video(0, StreamProfile::Sub).await.unwrap();
+        let first = next_frame(&mut sub).await;
+        assert_eq!((first.video_type, first.is_keyframe, first.microseconds), (VideoType::H264, true, 1000));
+        assert_eq!(first.data, data);
+        let second = next_frame(&mut sub).await;
+        assert_eq!(
+            (second.is_keyframe, second.microseconds, second.data.as_slice()),
+            (false, 1040, &[0, 0, 0, 1, 0x41][..])
+        );
+        fake.await.unwrap();
+    }
+
+    /// The next update, within 5 s.
+    async fn next_update(updates: &mut tokio::sync::mpsc::UnboundedReceiver<DeviceUpdate>) -> DeviceUpdate {
+        let next = tokio::time::timeout(Duration::from_secs(5), updates.recv()).await;
+        next.expect("an update within 5 s").expect("the updates go on")
+    }
+
+    /// What else comes in the middle of the old stream's tail is still passed
+    /// on: a pushed channel list, and the picture and the settings page asked
+    /// for between the stop and the new Preview (an alarm push is dropped, as
+    /// it always was). The new stream's sound is played, the old stream's is
+    /// not.
+    #[tokio::test]
+    async fn pushes_pictures_settings_and_sound_still_come_through_an_old_stream_s_tail() {
+        let (mut client, device) = client_and_device().await;
+        let mut updates = client.take_channel_updates().unwrap();
+        let mut audio = client.take_audio().unwrap();
+        let fake = tokio::spawn(switching_device(device, video_unit(true, b"H265", 1, &[0, 0, 0, 1, 0x40]), |asked| {
+            let (main, image, page, sub) = (&asked[0], asked[2].msg_num, asked[3].msg_num, &asked[4]);
+            let channels = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<ChannelInfoList version=\"1.1\">\n\
+                            <ChannelInfo>\n<channelId>2</channelId>\n<state>connect</state>\n\
+                            <streamSupport>mainStream,subStream</streamSupport>\n</ChannelInfo>\n\
+                            </ChannelInfoList>\n</body>\n";
+            let opening = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n</body>\n";
+            let reboot = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<AutoReboot version=\"1.1\">\n\
+                          <enable>1</enable>\n<weekDay>Sunday</weekDay>\n<hour>11</hour>\n<minute>0</minute>\n\
+                          <second>0</second>\n</AutoReboot>\n</body>\n";
+            let binary = Extension { version: XML_VERSION.to_string(), binary_data: Some(1), ..Default::default() };
+            let chunk = |code: u16, bytes: Option<Vec<u8>>| {
+                device_message(MSG_ID_IMAGE_FILE, image, code, Some(binary.to_bytes()), bytes)
+            };
+            vec![
+                media(main, video_unit(false, b"H265", 2, &[0, 0, 0, 1, 0x02, 0x01])),
+                alarm_push(),
+                device_message(MSG_ID_CHANNEL_INFO, 0, 200, None, Some(channels.as_bytes().to_vec())),
+                media(main, audio_unit(&[0xff, 0xf1, 1])),
+                device_message(MSG_ID_IMAGE_FILE, image, 200, None, Some(opening.as_bytes().to_vec())),
+                chunk(200, Some(vec![0xff, 0xd8, 1, 2, 0xff, 0xd9])),
+                media(main, video_unit(false, b"H265", 3, &[0, 0, 0, 1, 0x02, 0x02])),
+                chunk(201, None),
+                device_message(settings::MSG_ID_AUTO_REBOOT, page, 200, None, Some(reboot.as_bytes().to_vec())),
+                media(main, audio_unit(&[0xff, 0xf1, 3])),
+                media(sub, audio_unit(&[0xff, 0xf1, 2])),
+                media(sub, video_unit(true, b"H264", 1000, &[0, 0, 0, 1, 0x67])),
+            ]
+        }));
+        let mut main = client.start_video(0, StreamProfile::Main).await.unwrap();
+        next_frame(&mut main).await;
+        client.stop_video(0).await.unwrap();
+        // Asked while no stream runs; answered in the middle of the old stream's tail.
+        client.query_preset_image(0, 4).await;
+        let maintenance = SettingsTarget::Device { page: DevicePage::Maintenance };
+        client.query_settings(maintenance, &SettingsGates::default(), 7).await;
+        let mut sub = client.start_video(0, StreamProfile::Sub).await.unwrap();
+        match next_update(&mut updates).await {
+            DeviceUpdate::Channels(channels) => {
+                assert_eq!(channels.iter().map(|c| (c.channel_id, c.online)).collect::<Vec<_>>(), [(2, true)]);
+            }
+            other => panic!("expected the pushed channel list, got {other:?}"),
+        }
+        match next_update(&mut updates).await {
+            DeviceUpdate::PresetImage { channel_id: 0, preset_id: 4, jpeg } => {
+                assert_eq!(jpeg, [0xff, 0xd8, 1, 2, 0xff, 0xd9]);
+            }
+            other => panic!("expected preset 4's image, got {other:?}"),
+        }
+        match next_update(&mut updates).await {
+            DeviceUpdate::Settings { page: SettingsPage::DeviceMaintenance(page), read: 7 } => {
+                assert_eq!(page.auto_reboot.ok().and_then(|r| r.week_day).as_deref(), Some("Sunday"));
+            }
+            other => panic!("expected the Maintenance page, got {other:?}"),
+        }
+        let first = next_frame(&mut sub).await;
+        assert_eq!((first.video_type, first.is_keyframe, first.microseconds), (VideoType::H264, true, 1000));
+        // Passed on before the first frame: the new stream's sound alone.
+        assert_eq!(audio.try_recv().ok(), Some(vec![0xff, 0xf1, 2]));
+        assert!(audio.try_recv().is_err(), "more sound than the new stream's");
+        let asked = fake.await.unwrap();
+        let ids: Vec<_> = asked.iter().map(|m| (m.msg_id, m.msg_num)).collect();
+        let (image, page) = ((MSG_ID_IMAGE_FILE, 3), (settings::MSG_ID_AUTO_REBOOT, 4));
+        assert_eq!(ids, [(MSG_ID_VIDEO, 1), (MSG_ID_VIDEO_STOP, 2), image, page, (MSG_ID_VIDEO, 5)]);
+    }
+
+    /// Main to extern on a channel other than 0, once the request count has
+    /// come round: the old stream under 65534, the stop under 65535 and the
+    /// new stream under 1. Both streams have the same channel and the same
+    /// header stream type, so only the number tells them apart.
+    #[tokio::test]
+    async fn after_a_switch_past_65535_the_new_stream_s_number_is_still_told_apart() {
+        let (mut client, device) = client_and_device().await;
+        client.next_msg_num = 65534;
+        let fake = tokio::spawn(switching_device(device, video_unit(true, b"H265", 1, &[0, 0, 0, 1, 0x40]), |asked| {
+            let (main, other) = (&asked[0], &asked[2]);
+            vec![
+                media(main, video_unit(false, b"H265", 2, &[0, 0, 0, 1, 0x02, 0x01])),
+                media(other, video_unit(true, b"H264", 1000, &[0, 0, 0, 1, 0x67])),
+            ]
+        }));
+        let mut main = client.start_video(2, StreamProfile::Main).await.unwrap();
+        next_frame(&mut main).await;
+        client.stop_video(2).await.unwrap();
+        let mut other = client.start_video(2, StreamProfile::Extern).await.unwrap();
+        let first = next_frame(&mut other).await;
+        assert_eq!(
+            (first.video_type, first.is_keyframe, first.microseconds, first.data.as_slice()),
+            (VideoType::H264, true, 1000, &[0, 0, 0, 1, 0x67][..])
+        );
+        let asked = fake.await.unwrap();
+        assert_eq!(
+            headers(&asked),
+            [(MSG_ID_VIDEO, 65534, 2, 0), (MSG_ID_VIDEO_STOP, 65535, 2, 0), (MSG_ID_VIDEO, 1, 2, 0)]
+        );
     }
 }
