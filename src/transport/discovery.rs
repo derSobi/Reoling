@@ -528,6 +528,16 @@ pub async fn connect_race(
     })
     .await
     .map_err(|_| Error::P2pNegotiationTimeout)??;
+    if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
+        // Which path won, by its name only: never an address.
+        let path = match winning_conn.as_str() {
+            "local" => "local",
+            "map" => "NAT-mapped",
+            "relay" => "relay",
+            _ => "other",
+        };
+        eprintln!("NEGOTIATION p2p path: {path}");
+    }
 
     let confirm = BcUdp::Discovery(UdpDiscovery {
         tid: rand::random::<u32>().max(1),

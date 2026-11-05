@@ -259,6 +259,9 @@ pub struct ReolinkClient {
     /// data carry: some may still come in after `stop_video`, so
     /// `next_msg_num` does not give it out until the next stream starts.
     live_msg_num: Option<u16>,
+    /// When the device accepted the login, for the time the negotiation
+    /// debug lines start with (see `since_login`).
+    logged_in_at: Option<std::time::Instant>,
 }
 
 /// What an in-flight request was asking for: a `MSG_ID_IMAGE_FILE` request
@@ -648,6 +651,12 @@ fn redact_identifiers(text: &str) -> String {
     out
 }
 
+/// What the negotiation and identity debug lines start with: the time since
+/// the device accepted the login ("[+812 ms] "), or nothing before that.
+fn since_login(logged_in_at: Option<std::time::Instant>) -> String {
+    logged_in_at.map(|at| format!("[+{} ms] ", at.elapsed().as_millis())).unwrap_or_default()
+}
+
 /// The camera truncates the hex MD5 digest of `input` to 31 characters
 /// (uppercase) before comparing it — a quirk inherited from a fixed-size C
 /// buffer in the original firmware. Both username and password must be
@@ -777,6 +786,7 @@ impl ReolinkClient {
             keepalive_sent: None,
             subscribe_msg_num: None,
             live_msg_num: None,
+            logged_in_at: None,
         }
     }
 
@@ -940,6 +950,7 @@ impl ReolinkClient {
         if reply.meta.response_code != 200 {
             return Err(Error::LoginFailed { code: reply.meta.response_code });
         }
+        self.logged_in_at = Some(std::time::Instant::now());
         let BcBody::Modern(ModernMsg { payload: Some(payload), .. }) = reply.body else {
             return Err(Error::ProtocolError("expected a DeviceInfo reply".to_string()));
         };
@@ -1371,7 +1382,7 @@ impl ReolinkClient {
         let _ = tokio::time::timeout(IDENTITY_TIMEOUT, exchange).await;
         let (name, model) = info.map(|i| (i.name, i.model)).unwrap_or_default();
         if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
-            eprintln!("DEBUG identity reply: name={name:?} model={model:?}");
+            eprintln!("{}DEBUG identity reply: name={name:?} model={model:?}", since_login(self.logged_in_at));
         }
         // Diagnostic-only: a scripted recorded-video session on one channel
         // (see `probe_replay`), or an event search (see `probe_events`).
@@ -1634,7 +1645,8 @@ impl ReolinkClient {
         if debug_negotiation {
             if let BcBody::Modern(ModernMsg { payload: Some(p), .. }) = &request.body {
                 eprintln!(
-                    "NEGOTIATION preview request: channel_id={} stream_type={} class={:#x} xml={}",
+                    "{}NEGOTIATION preview request: channel_id={} stream_type={} class={:#x} xml={}",
+                    since_login(self.logged_in_at),
                     request.meta.channel_id,
                     request.meta.stream_type,
                     request.meta.class,
@@ -1672,8 +1684,11 @@ impl ReolinkClient {
         };
         if debug_negotiation {
             eprintln!(
-                "NEGOTIATION preview reply: response_code={} class={:#x} body={:?}",
-                ack.meta.response_code, ack.meta.class, ack.body
+                "{}NEGOTIATION preview reply: response_code={} class={:#x} body={:?}",
+                since_login(self.logged_in_at),
+                ack.meta.response_code,
+                ack.meta.class,
+                ack.body
             );
         }
         if ack.meta.response_code != 200 {
@@ -1687,6 +1702,7 @@ impl ReolinkClient {
         let audio = self.audio_tx.clone();
         let pending_images = Arc::clone(&self.pending_images);
         let channel_uids = Arc::clone(&self.channel_uids);
+        let logged_in_at = self.logged_in_at;
         self.video_task = Some(tokio::spawn(async move {
             let mut buffer: Vec<u8> = Vec::new();
             let mut guard = MediaGuard::default();
@@ -1734,7 +1750,8 @@ impl ReolinkClient {
                             buffer.drain(..used);
                             if let BcMediaMessage::Info { width, height } = &msg {
                                 if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
-                                    eprintln!("NEGOTIATION stream info unit: {width}x{height}");
+                                    let at = since_login(logged_in_at);
+                                    eprintln!("{at}NEGOTIATION stream info unit: {width}x{height}");
                                 }
                             }
                             if let BcMediaMessage::Audio(frame) = msg {
@@ -1753,7 +1770,8 @@ impl ReolinkClient {
                             // unit instead of ending the stream.
                             let skip = crate::protocol::bcmedia::model::resync_offset(&buffer);
                             if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
-                                eprintln!("NEGOTIATION media resync: {e}; skipped {skip} bytes");
+                                let at = since_login(logged_in_at);
+                                eprintln!("{at}NEGOTIATION media resync: {e}; skipped {skip} bytes");
                             }
                             if skip == 0 {
                                 break;
