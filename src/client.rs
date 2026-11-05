@@ -629,10 +629,13 @@ fn remember_channel_uids(channel_uids: &std::sync::Mutex<HashMap<u8, CameraUid>>
 /// `text` with the contents of every element that can hold a camera or
 /// device UID replaced, for diagnostic output: `<uid>`, `<fakeUid>`, a
 /// recording's `<Id>` and `<fileId>` (a Home Hub's ends with the camera
-/// UID).
+/// UID). The same for serial numbers, MAC addresses, user names, passwords
+/// and tokens, and for the `<secretCode>` and `<bootSecret>` of a login
+/// reply.
 fn redact_identifiers(text: &str) -> String {
     let mut out = text.to_string();
-    for tag in ["uid", "fakeUid", "UID", "Id", "fileId"] {
+    let secrets = ["serialNumber", "userName", "validpassword", "password", "mac", "token", "secretCode", "bootSecret"];
+    for tag in ["uid", "fakeUid", "UID", "Id", "fileId"].into_iter().chain(secrets) {
         let open = format!("<{tag}>");
         let close = format!("</{tag}>");
         let mut from = 0;
@@ -2262,6 +2265,22 @@ mod control_tests {
         assert_eq!(shown.matches("<hidden>").count(), 5);
         // An unterminated element is left alone rather than looping.
         assert_eq!(redact_identifiers("<uid>abc"), "<uid>abc");
+    }
+
+    #[test]
+    fn diagnostic_text_hides_serial_numbers_addresses_and_secrets() {
+        let text = "<DeviceInfo><serialNumber>TESTSERIAL</serialNumber><mac>TESTMAC</mac>\
+                    <secretCode>TESTSECRETCODE</secretCode><bootSecret>TESTBOOTSECRET</bootSecret>\
+                    <type>TESTMODEL</type></DeviceInfo><User><userName>TESTUSER</userName>\
+                    <password>TESTPASSWORD</password><validpassword>TESTVALID</validpassword></User>\
+                    <token>TESTTOKEN</token>";
+        let shown = redact_identifiers(text);
+        for placeholder in ["SERIAL", "MAC", "SECRETCODE", "BOOTSECRET", "USER", "PASSWORD", "VALID", "TOKEN"] {
+            assert!(!shown.contains(&format!("TEST{placeholder}")), "{placeholder}: {shown}");
+        }
+        assert_eq!(shown.matches("<hidden>").count(), 8);
+        // Not an identifier: the model stays.
+        assert!(shown.contains("<type>TESTMODEL</type>"));
     }
 
     #[test]
