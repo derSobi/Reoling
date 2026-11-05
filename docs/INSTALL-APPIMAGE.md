@@ -100,6 +100,12 @@ It always takes these from the system:
   and the dock shows its icon. The entry names the copy started last (a
   source build writes the same entry for itself), and the menu hides it
   once that file is gone.
+- **The autostart entry**, only while Run at Startup is on (Client
+  Settings, System Settings, tab General Settings):
+  `~/.config/autostart/de.dersobi.reoling.desktop`, which starts the
+  AppImage file. At every start, Reoling points an entry whose program is
+  gone (an earlier AppImage's, or a file moved or deleted since) at the
+  copy that runs; only its `Exec` changes, and no entry is created.
 
 The icon and the thumbnails are checked at every start, so a replaced file
 (a new download) or a moved one gets its icon back the next time it runs.
@@ -125,6 +131,10 @@ If the AppImage file is deleted before that, Reoling is missing from the
 menu until `reoling` is started once from a terminal, with Reoling not
 running.
 
+With Run at Startup on, the autostart entry keeps starting the AppImage
+while its file is there; to have it start the .deb's `reoling`, turn Run
+at Startup off and on again in the .deb.
+
 ## Updating
 
 1. Download the new `Reoling-<version>-x86_64.AppImage` from the
@@ -139,7 +149,9 @@ running.
    ```
 
    The menu entry (where the .deb is not installed) now starts this copy,
-   and the new file gets its icon.
+   and the new file gets its icon. If Run at Startup is on, turn it off
+   and on again in this copy (Client Settings, System Settings, tab
+   General Settings): the autostart entry still starts the old file.
 4. Delete the old file.
 
 The devices, the settings and the passwords stay.

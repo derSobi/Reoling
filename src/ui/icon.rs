@@ -165,7 +165,7 @@ fn write_user_desktop_entry(user_data: &Path, entry: &str) -> io::Result<bool> {
 /// that is not UTF-8, holds a control character, or a `%`: GLib looks the
 /// program up before it expands the field codes and runs it after, so
 /// neither `%` nor `%%` names the file both times.
-fn exec_quoted(path: &Path) -> Option<String> {
+pub(crate) fn exec_quoted(path: &Path) -> Option<String> {
     let path = path.to_str().filter(|path| !path.chars().any(|c| c.is_control() || c == '%'))?;
     let mut quoted = String::with_capacity(path.len() + 2);
     quoted.push('"');
@@ -271,6 +271,30 @@ fn runs_from_own_appdir(exe: &Path, appimage: &Path, appdir: &Path) -> bool {
     exe.starts_with(&appdir)
         && same_file(&exe, &appdir.join("usr/bin/reoling"))
         && fs::metadata(appimage).is_ok_and(|meta| meta.is_file())
+}
+
+/// The file that starts this build again, for an entry the desktop runs
+/// later (the autostart entry, see `settings::set_autostart`): the AppImage
+/// file when the AppImage runtime started this very process, as the
+/// executable inside it is gone with the image's mount once the app exits;
+/// else the running executable. `None` when that cannot be found.
+pub(crate) fn own_program() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let (appimage, appdir) = (std::env::var_os("APPIMAGE"), std::env::var_os("APPDIR"));
+    Some(program_of(exe, appimage.as_deref().map(Path::new), appdir.as_deref().map(Path::new)))
+}
+
+/// [`own_program`] for the running executable `exe`, given `APPIMAGE` and
+/// `APPDIR`: `appimage` when the runtime that mounted it at `appdir` started
+/// `exe` (see [`runs_from_own_appdir`]), else `exe`. The runtime resolves
+/// every link for `APPIMAGE`, so that is the file itself; the variables an
+/// AppImage passed on to a shell it started name a file that is not this
+/// build.
+pub(crate) fn program_of(exe: PathBuf, appimage: Option<&Path>, appdir: Option<&Path>) -> PathBuf {
+    match (appimage, appdir) {
+        (Some(appimage), Some(appdir)) if runs_from_own_appdir(&exe, appimage, appdir) => appimage.to_path_buf(),
+        _ => exe,
+    }
 }
 
 /// The work of [`install_appimage_integration`], for the AppImage mounted
@@ -577,7 +601,7 @@ fn thumbnail_key(uri: &str) -> String {
 /// Creates `path`'s directories (those missing, with `dir_mode`) and the
 /// file (`file_mode`, whatever the umask) through a temporary name in the
 /// same directory, so a reader never sees a half-written file.
-fn write_atomically(path: &Path, bytes: &[u8], dir_mode: u32, file_mode: u32) -> io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8], dir_mode: u32, file_mode: u32) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| io::Error::other("no parent directory"))?;
     fs::DirBuilder::new().recursive(true).mode(dir_mode).create(dir)?;
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
@@ -1010,6 +1034,31 @@ mod tests {
         assert!(!runs_from_own_appdir(&exe, &dir, &own));
         assert!(!runs_from_own_appdir(&exe, &dir.join("missing"), &own));
         assert!(!runs_from_own_appdir(&exe, &appimage, &dir.join("missing")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn own_program_is_the_appimage_file_that_started_the_app() {
+        let dir = scratch("own-program");
+        let appimage = dir.join("My Apps/Reoling-1.0.4-x86_64.AppImage");
+        let (own, foreign, installed) = (dir.join(".mount_Reolin"), dir.join(".mount_Other"), dir.join("bin/reoling"));
+        let exe = own.join("usr/bin/reoling");
+        for file in [appimage.clone(), exe.clone(), foreign.join("usr/bin/reoling"), installed.clone()] {
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, b"\x7fELF").unwrap();
+        }
+        // Started by the AppImage runtime: the file, not the executable in
+        // the image's mount.
+        assert_eq!(program_of(exe.clone(), Some(&appimage), Some(&own)), appimage);
+        // Not from an AppImage: the running executable.
+        assert_eq!(program_of(installed.clone(), None, None), installed);
+        // Started from a shell some AppImage started, with its APPIMAGE and
+        // APPDIR: not that file.
+        assert_eq!(program_of(installed.clone(), Some(&appimage), Some(&own)), installed);
+        assert_eq!(program_of(exe.clone(), Some(&appimage), Some(&foreign)), exe);
+        // One of the two alone is no runtime's.
+        assert_eq!(program_of(exe.clone(), Some(&appimage), None), exe);
+        assert_eq!(program_of(exe.clone(), None, Some(&own)), exe);
         let _ = fs::remove_dir_all(&dir);
     }
 
