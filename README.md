@@ -20,8 +20,6 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
   <img src="docs/screenshots/download-settings.png" alt="Client Settings, Download Settings" width="49%">
 </p>
 
-More on <https://reoling.eu>.
-
 ## Status
 
 Version **1.0.4**, with installable packages since 1.0.0 (see
