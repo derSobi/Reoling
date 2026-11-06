@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Downloads the tools scripts/build-appimage.sh runs, at pinned versions,
-# and checks every file against its recorded SHA-256 before it is made
-# executable. Files already present with the right hash are kept.
+# Downloads the tools scripts/build-appimage.sh and
+# scripts/build-appimage-app-only.sh run, at pinned versions, and checks every
+# file against its recorded SHA-256 before it is made executable. Files
+# already present with the right hash are kept. Then the AppImage runtime
+# both AppImages start with, runtime-x86_64, which has no fixed version to
+# pin (see below).
 #
 #   scripts/fetch-appimage-tools.sh <directory>
 #
@@ -43,4 +46,20 @@ while read -r name sha url; do
     fi
     chmod +x "$target"
 done <<< "$tools"
+
+# The AppImage runtime both AppImages start with. appimagetool downloads
+# type2-runtime's "continuous" build by itself when given none; that build
+# moves (last on 2026-10-19), and the one release with a fixed name,
+# 20251108, is older than the runtime 1.0.4 carries, so no checksum can be
+# pinned here. It is fetched at every call, its SHA-256 printed, and both
+# build scripts hand this one file to appimagetool (scripts/appimage-common.sh,
+# appimage_pack).
+curl -fsSL --retry 3 -o "$dir/runtime-x86_64.part" \
+    https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64
+case $(file -b "$dir/runtime-x86_64.part") in
+    "ELF 64-bit"*) ;;
+    *) echo "runtime-x86_64: not an ELF file" >&2; rm -f "$dir/runtime-x86_64.part"; exit 1 ;;
+esac
+mv "$dir/runtime-x86_64.part" "$dir/runtime-x86_64"
+echo "runtime-x86_64: $(sha256sum "$dir/runtime-x86_64" | cut -d' ' -f1) (type2-runtime continuous)"
 echo "AppImage tools ready in $dir"

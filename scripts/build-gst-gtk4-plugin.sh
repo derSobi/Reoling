@@ -2,11 +2,13 @@
 # Builds GStreamer's GTK 4 paintable sink (gtk4paintablesink, the
 # gst-plugin-gtk4 crate from gst-plugins-rs) for distributions whose
 # GStreamer packages do not ship it: Ubuntu 24.04 has no gstreamer1.0-gtk4.
-# The Debian package and the AppImage carry the resulting libgstgtk4.so.
+# The Debian package and both AppImages carry the resulting libgstgtk4.so.
 #
 #   scripts/build-gst-gtk4-plugin.sh <output directory>
 #
-# writes <output directory>/libgstgtk4.so, stripped. Needs the GTK 4 and
+# writes <output directory>/libgstgtk4.so, stripped, and beside it the
+# plugin's licence, LICENSE-MPL-2.0, and SOURCE, which says where its source
+# is (the app-only AppImage carries both). Needs the GTK 4 and
 # GStreamer development packages (libgtk-4-dev, libgstreamer1.0-dev,
 # libgstreamer-plugins-base1.0-dev), Rust 1.92 or newer and binutils
 # (strip).
@@ -63,6 +65,14 @@ cargo build --release --manifest-path "$work/$crate/Cargo.toml" --target-dir "$w
 
 so="$work/target/release/libgstgtk4.so"
 cp "$so" "$out/libgstgtk4.so"
+# The sink's licence, MPL-2.0, from the crate, and where its source is: the
+# app-only AppImage carries both beside the sink
+# (scripts/build-appimage-app-only.sh).
+cp "$work/$crate/LICENSE-MPL-2.0" "$out/LICENSE-MPL-2.0"
+printf '%s\n' "gst-plugin-gtk4 $version, GStreamer's GTK 4 paintable sink from gst-plugins-rs, features $features" \
+    "Source: https://crates.io/crates/gst-plugin-gtk4/$version (SHA-256 of the .crate: $sha256)" \
+    "Project: https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs" \
+    "Licence: MPL-2.0, in LICENSE-MPL-2.0" > "$out/SOURCE"
 # Stripped the way cargo deb strips the binary it builds (lintian rejects an
 # unstripped shared object in a package); the dynamic symbols GStreamer loads
 # the plugin by stay, and the check below loads the stripped file.
