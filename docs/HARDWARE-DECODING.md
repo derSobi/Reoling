@@ -50,7 +50,7 @@ The install command for each is in
   OpenH264.
 
 Where a codec has neither a hardware nor a software decoder, Reoling says
-so at start and over the picture, with what to install (see
+so at start and over the picture, with what brings one (see
 [When something is missing](INSTALL-APPIMAGE.md#when-something-is-missing)).
 
 ## How Auto picks a decoder
@@ -111,12 +111,16 @@ row System Status, View) lists:
 - the hardware decoders found, with the kind of GPU where known;
 - the decoding mode in use, and a codec Software decodes as Auto;
 - the decoders the latest live and recorded streams started with;
+- where the GStreamer plugins come from (`Plugins: bundled with the
+  AppImage` in the embed AppImage, `Plugins: the system's, under the
+  AppImage` in the system one, `Plugins: the system's` in the .deb);
 - the GTK 4 sink that draws the picture (`Display: gtk4paintablesink
   <version> (<file>)`), and what this system lacks (`Missing: nothing`,
-  or a line per feature with what installs it).
+  or a line per feature with what brings it).
 
 `--check-requirements` prints whether there are software and hardware
-decoders for H.264 and H.265, without a window (see
+decoders for H.264 and H.265, with the same `Plugins:` and `Display:`
+lines and what is missing, without a window (see
 [From a terminal](INSTALL-APPIMAGE.md#from-a-terminal)).
 
 ## Troubleshooting
@@ -129,8 +133,12 @@ decoders for H.264 and H.265, without a window (see
   has no `libva`, and so no VA-API decoding.
 - **"No H.265 decoder on this system." (or H.264) over the picture.**
   Neither a hardware nor a software decoder for that codec is installed:
-  install what the message names, then start Reoling again. On Fedora and
-  openSUSE, see [The system AppImage](#the-system-appimage).
+  install what the message names, or take the steps it gives, then start
+  Reoling again. It names no package whose plugin is there already. On
+  Fedora and openSUSE, see [The system AppImage](#the-system-appimage).
+  Where the embed AppImage asks for a report instead, on a minimal Debian
+  13 install, first see the AppImage guide's
+  [Troubleshooting](INSTALL-APPIMAGE.md#troubleshooting).
 - **The video stays black.** Check in System Status which decoder the
   stream started with. Where a software decoder for the stream's codec is
   installed, set Decoding to Software and start the stream again, to rule

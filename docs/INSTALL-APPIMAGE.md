@@ -16,9 +16,11 @@ without being installed. It mounts itself with FUSE, which needs
 | `Reoling-<version>-embed-x86_64.AppImage` | about 100 MB | inside the file |
 | `Reoling-<version>-system-x86_64.AppImage` | about 6 MB | the distribution's |
 
-- **The embed file** runs on any such distribution as it comes. Take it
-  when unsure. Up to 1.0.4 it was the only AppImage, named
-  `Reoling-<version>-x86_64.AppImage`.
+- **The embed file** runs on the desktop install of any such
+  distribution as it comes; a minimal Debian 13 install, a container for
+  example, may lack two libraries it takes from the system (see
+  [Troubleshooting](#troubleshooting)). Take it when unsure. Up to 1.0.4
+  it was the only AppImage, named `Reoling-<version>-x86_64.AppImage`.
 - **The system file** carries the app alone, with its GTK 4 sink. It needs
   GTK 4.14 and GStreamer 1.24 or newer from the distribution, with the
   base, good and bad plugins and a decoder for H.264 and one for H.265,
@@ -138,7 +140,8 @@ Fedora's own FFmpeg (`ffmpeg-free`) decodes neither H.264 nor H.265:
   default) and replaces noopenh264, a stand-in that decodes nothing,
   which a Fedora desktop has. Reoling tries the OpenH264 decoder once at
   start and counts it only if it starts, so on the stand-in it reports
-  no H.264 decoder.
+  no H.264 decoder, and names the library `openh264` alone: the plugin
+  is there already.
 - **H.265:** it needs the full FFmpeg from RPM Fusion: enable it
   (https://rpmfusion.org/Configuration), then:
 
@@ -147,7 +150,9 @@ Fedora's own FFmpeg (`ffmpeg-free`) decodes neither H.264 nor H.265:
   ```
 
   The swap does not bring `gstreamer1-plugin-libav`, the GStreamer
-  plugin that uses FFmpeg; the command above installs it. With RPM
+  plugin that uses FFmpeg; the command above installs it. Reoling names
+  it only where that plugin is missing; with the plugin there, as on a
+  Fedora desktop, its message gives the swap and no package. With RPM
   Fusion's FFmpeg, H.264 needs no OpenH264 either.
 - If the decoder still does not show up, remove the plugin registry
   Reoling names in its message and start Reoling again. The system
@@ -240,18 +245,29 @@ from: the picture, H.264 video, H.265 video, sound, talk, recording and
 downloads. Where one is missing:
 
 - **A window, "Missing parts",** lists them, a line per feature, with
-  the command that installs them on this distribution and any steps;
-  from the system file it ends with `Or use
+  the command that installs them on this distribution, where one is
+  needed, and any steps; from the system file it ends with `Or use
   Reoling-<version>-embed-x86_64.AppImage, which brings these parts
   along.` Tick **Don't show this again** before OK, and it stays away
   until the missing parts change.
 - **One line on stderr:** `reoling: missing on this system: ...`, with
-  the command after `install:`.
+  the command, where one is needed, after `install:`.
 - **System Status** (Client Settings, System Settings, tab General
-  Settings, row System Status, View) lists `Missing for <feature>: ...`
-  and the same advice, or `Missing: nothing`. Its line
-  `Display: gtk4paintablesink <version> (<file>)` names the GTK 4 sink in
-  use.
+  Settings, row System Status, View) has, after its decoder lines, where
+  the GStreamer plugins come from, the GTK 4 sink in use and what is
+  missing. With every part there, from the system file:
+
+  ```
+  Plugins: the system's, under the AppImage
+  Display: gtk4paintablesink <version> (<file>)
+  Missing: nothing
+  ```
+
+  `Plugins:` reads `bundled with the AppImage` in the embed file and
+  `the system's` in the .deb. With something missing, the same two lines
+  come first (`Display: gtk4paintablesink missing` where the sink is
+  what is missing), then `Missing for <feature>: ...`, a line per
+  feature, and the same advice.
 - **Over the picture,** a stream that cannot be shown says why, and what
   installs it:
   - an element missing, for example "Cannot show this stream: h265parse
@@ -267,9 +283,22 @@ downloads. Where one is missing:
 Install what it names and start Reoling again: GStreamer reads its
 plugins at start.
 
+It names no decoder package whose GStreamer plugin is there already,
+as installing it would change nothing: FFmpeg's plugin (libav) has
+decoders only for the codecs the system's FFmpeg decodes, and Fedora's
+OpenH264 plugin is there on the noopenh264 stand-in too. On Fedora,
+H.265 then gets the swap to RPM Fusion's FFmpeg, and H.264 the library
+`openh264` (see
+[What the system file needs](#what-the-system-file-needs)); on
+openSUSE, the decoders get Packman. Where FFmpeg's plugin is there but
+lacks a decoder Reoling needs, and no such step brings one, it names no
+package, only the plugin registry to remove: `If the decoder still does
+not show up, remove ... and start Reoling again.`
+
 The embed file brings every part. One missing there is a fault of the
 package: the texts then name no command and ask you to report it at
-https://github.com/derSobi/Reoling/issues.
+https://github.com/derSobi/Reoling/issues. On a minimal Debian 13
+install, see [Troubleshooting](#troubleshooting) first.
 
 ### From a terminal
 
@@ -327,6 +356,10 @@ Both files always take these from the system:
 - `libva`. In the embed file, the FFmpeg libraries behind the software
   decoders need it too, with `libva-drm` and `libva-x11`; any of them the
   system lacks comes from the AppImage;
+- `libgpg-error` and `libcom_err` (on Debian, `libgpg-error0` and
+  `libcom-err2`): in the embed file, FFmpeg's plugin needs both and
+  PulseAudio's `libgpg-error`. A desktop has both; a minimal install may
+  not (see [Troubleshooting](#troubleshooting));
 - the hardware decoding driver: NVIDIA's `libcuda`/`libnvcuvid` for
   NVDEC, or a VA-API driver for the system's `libva` (see
   [Hardware decoding](HARDWARE-DECODING.md));
@@ -502,6 +535,30 @@ What Reoling keeps in your home folder stays, for the AppImages and the
   after installing. See the Fedora and openSUSE notes in
   [What the system file needs](#what-the-system-file-needs), the plugin
   registry among them.
+- **The embed file on a minimal Debian 13 install (a container, for
+  example): `reoling: missing on this system: an H.264 decoder (H.264
+  video), an H.265 decoder (H.265 video); This AppImage should bring
+  these parts along: please report this at ...`** on stderr, or the
+  window "Missing parts" with the same two decoders and a request for a
+  report. The first start may also print
+  GStreamer warnings that `libgstlibav.so` failed to load:
+  `libgpg-error.so.0: cannot open shared object file` (or
+  `libcom_err.so.2`). The embed file takes these two libraries from the
+  system; a desktop install has both, a minimal one may not. Install
+  them and start Reoling again:
+
+  ```bash
+  sudo apt install libgpg-error0 libcom-err2
+  ```
+
+  If the message is still there, quit Reoling, remove its plugin
+  registries, and start it again. A registry keeps a plugin that failed
+  to load as failed while the plugin's path stays the same, as it does
+  with `--appimage-extract-and-run`:
+
+  ```bash
+  rm -f ~/.cache/reoling/gstreamer-registry-*.bin
+  ```
 - **A few "Theme parser error" lines on stderr, and the theme looks a
   little off.** On the embed file's bundled GTK, a theme written for a
   newer GTK may print them and lose some of its looks. The stderr line

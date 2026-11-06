@@ -111,6 +111,8 @@ scripts/validate-in-docker.sh --host ~/reoling-validate dist/Reoling-<version>-*
 Each package is started for 20 s on a virtual display with a session
 bus and an empty configuration, so no device is contacted: it must still
 be running when the time is up, and nothing it loads may fail to load.
+A critical warning from GTK, GLib or GStreamer (`Gdk-CRITICAL **: ...`)
+fails the run as well.
 
 Each package's requirements report is checked as well, by
 `scripts/assert-requirements.sh <program> <status> <gaps> <sink> [<text>...]`.
