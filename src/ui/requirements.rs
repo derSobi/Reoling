@@ -261,6 +261,9 @@ struct Facts {
     gstreamer: (u32, u32, u32),
     /// The element names of `NEEDS` the registry has.
     elements: Vec<&'static str>,
+    /// Which of `LIBAV` and `OPENH264` the registry has loaded (see
+    /// `plugin_loaded`): their packages are named only without them.
+    loaded_plugins: Vec<&'static str>,
     h264: Installed,
     h265: Installed,
     audio_output: bool,
@@ -269,6 +272,21 @@ struct Facts {
     sink: Option<(String, String)>,
     /// The plugin registry GStreamer writes (see `registry_of`).
     registry: Option<String>,
+}
+
+/// GStreamer's FFmpeg plugin (gst-libav) and OpenH264's, by the names the
+/// registry has them under.
+const LIBAV: &str = "libav";
+const OPENH264: &str = "openh264";
+
+/// Whether a plugin the registry has under its own name, with these flags, is
+/// loaded. A plugin file that fails to load is in the registry under its file
+/// name instead (gst-libav's as libgstlibav.so), blacklisted and without
+/// elements, so looking `LIBAV` or `OPENH264` up does not find it and it
+/// counts as absent; the flag is a guard should a registry ever have one
+/// under its own name.
+fn plugin_loaded(flags: gstreamer::PluginFlags) -> bool {
+    !flags.contains(gstreamer::PluginFlags::BLACKLISTED)
 }
 
 /// The plugin registry GStreamer writes, `~` for the home folder `home`: the
@@ -295,6 +313,11 @@ impl Facts {
         let (major, minor, micro, _) = gstreamer::version();
         let elements =
             element_names().into_iter().filter(|name| gstreamer::ElementFactory::find(name).is_some()).collect();
+        let gst_registry = gstreamer::Registry::get();
+        let loaded_plugins = [LIBAV, OPENH264]
+            .into_iter()
+            .filter(|name| gst_registry.find_plugin(name).is_some_and(|plugin| plugin_loaded(plugin.plugin_flags())))
+            .collect();
         let sink = gstreamer::ElementFactory::find("gtk4paintablesink").and_then(|factory| factory.plugin());
         let sink = sink.map(|plugin| {
             let file = plugin.filename().map(|file| file.display().to_string()).unwrap_or_default();
@@ -309,6 +332,7 @@ impl Facts {
             gtk: (gtk4::major_version(), gtk4::minor_version(), gtk4::micro_version()),
             gstreamer: (major, minor, micro),
             elements,
+            loaded_plugins,
             h264: settings::installed_decoders(VideoType::H264),
             h265: settings::installed_decoders(VideoType::H265),
             audio_output: has_device_element("Sink"),
@@ -487,6 +511,13 @@ fn module_label(module: Module) -> &'static str {
 /// What brings `need` on this system. The decoders: a package with a
 /// software decoder, never a hardware one (that needs a driver as well; System
 /// Status lists the hardware decoders there are).
+///
+/// A decoder package (gst-libav's, OpenH264's) whose plugin is loaded already
+/// is not named, as installing it changes nothing: gst-libav registers
+/// decoders only for the codecs the system's FFmpeg has (Fedora's ffmpeg-free
+/// decodes no H.265), and Fedora's OpenH264 plugin is loaded on the noopenh264
+/// stand-in too, which only the library replaces. A missing element's own
+/// plugin is missing or failed to load, so its package is always named.
 fn remedies(need: Need, facts: &Facts, family: Family, plugins: Plugins) -> Vec<Remedy> {
     if plugins == Plugins::Bundled {
         return vec![Remedy::Report];
@@ -497,20 +528,29 @@ fn remedies(need: Need, facts: &Facts, family: Family, plugins: Plugins) -> Vec<
         // too old to load it.
         return vec![if facts.too_old() { Remedy::TooOld } else { Remedy::Report }];
     }
+    let loaded = |plugin: &str| facts.loaded_plugins.contains(&plugin);
+    // The package that brings `plugin`, unless it is loaded.
+    let package = |plugin: &str, packages: &'static [&'static str]| {
+        (!loaded(plugin)).then_some(Remedy::Packages(packages))
+    };
     match (family, need) {
-        (Family::Fedora, Need::Decoder(VideoType::H264)) => {
-            vec![Remedy::Packages(&["gstreamer1-plugin-openh264", "openh264"]), Remedy::Steps(FEDORA_OPENH264)]
-        }
-        (Family::Fedora, Need::Decoder(VideoType::H265)) => vec![
-            Remedy::Packages(&["gstreamer1-plugin-libav"]),
-            Remedy::Steps(FEDORA_RPM_FUSION),
-            Remedy::ClearRegistry,
-        ],
+        (Family::Fedora, Need::Decoder(VideoType::H264)) => package(OPENH264, &["gstreamer1-plugin-openh264"])
+            .into_iter()
+            .chain([Remedy::Packages(&["openh264"]), Remedy::Steps(FEDORA_OPENH264)])
+            .collect(),
+        (Family::Fedora, Need::Decoder(VideoType::H265)) => package(LIBAV, &["gstreamer1-plugin-libav"])
+            .into_iter()
+            .chain([Remedy::Steps(FEDORA_RPM_FUSION), Remedy::ClearRegistry])
+            .collect(),
         (Family::Suse, Need::Decoder(_)) => vec![Remedy::Steps(PACKMAN)],
         (Family::Debian, Need::Element("gtk4paintablesink")) => {
             vec![Remedy::Steps(DEBIAN_SINK), Remedy::Steps(DEBIAN_SINK_OLDER)]
         }
         (Family::Suse, Need::Element("gtk4paintablesink")) => vec![Remedy::Module(module_label(module))],
+        // gst-libav is loaded but has no such decoder: no package brings it
+        // here, and a registry written before the system's FFmpeg changed
+        // can hide one.
+        _ if module == Module::Libav && loaded(LIBAV) => vec![Remedy::ClearRegistry],
         _ => match package_of(module, family) {
             Some(packages) => vec![Remedy::Packages(packages)],
             None => vec![Remedy::Module(module_label(module))],
@@ -674,7 +714,7 @@ impl Report {
                 }
             });
         }
-        if self.plugins == Plugins::SystemFromAppImage && advice.installs() {
+        if self.plugins == Plugins::SystemFromAppImage && (advice.installs() || advice.clear_registry) {
             lines.push(format!("Or use {EMBED_APPIMAGE}, which brings {it} along."));
         }
         lines
@@ -709,14 +749,7 @@ impl Report {
             format!("Reoling {}", env!("CARGO_PKG_VERSION")),
             format!("GTK {}.{}.{}", gtk.0, gtk.1, gtk.2),
             format!("GStreamer {}.{}.{}", gst.0, gst.1, gst.2),
-            format!(
-                "Plugins: {}",
-                match self.plugins {
-                    Plugins::Bundled => "bundled with the AppImage",
-                    Plugins::SystemFromAppImage => "the system's, under the AppImage",
-                    Plugins::System => "the system's",
-                }
-            ),
+            self.plugins_line(),
             self.display_line(),
             format!("H.264 decoders: {}", decoders(self.facts.h264)),
             format!("H.265 decoders: {}", decoders(self.facts.h265)),
@@ -731,6 +764,16 @@ impl Report {
         let mut text = lines.join("\n");
         text.push('\n');
         text
+    }
+
+    /// Where the GStreamer plugins come from (see `Plugins`).
+    fn plugins_line(&self) -> String {
+        let source = match self.plugins {
+            Plugins::Bundled => "bundled with the AppImage",
+            Plugins::SystemFromAppImage => "the system's, under the AppImage",
+            Plugins::System => "the system's",
+        };
+        format!("Plugins: {source}")
     }
 
     fn display_line(&self) -> String {
@@ -765,10 +808,11 @@ impl Report {
         Some(line)
     }
 
-    /// System Status: the display element in use, then "Missing: nothing" or
-    /// one line per gap and what brings them.
+    /// System Status: where the plugins come from and the display element in
+    /// use, as `check_text` says them, then "Missing: nothing" or one line per
+    /// gap and what brings them. The decoders are System Status' own lines.
     pub fn status_lines(&self) -> Vec<String> {
-        let mut lines = vec![self.display_line()];
+        let mut lines = vec![self.plugins_line(), self.display_line()];
         if self.gaps.is_empty() {
             lines.push("Missing: nothing".to_string());
             return lines;
@@ -880,6 +924,7 @@ mod tests {
             gtk: (4, 18, 6),
             gstreamer: (1, 26, 2),
             elements: element_names(),
+            loaded_plugins: vec![LIBAV, OPENH264],
             h264: Installed { software: true, hardware: true },
             h265: Installed { software: true, hardware: true },
             audio_output: true,
@@ -889,8 +934,10 @@ mod tests {
         }
     }
 
+    /// `facts` without these elements and plugins.
     fn without(mut facts: Facts, names: &[&str]) -> Facts {
         facts.elements.retain(|name| !names.contains(name));
+        facts.loaded_plugins.retain(|name| !names.contains(name));
         facts
     }
 
@@ -899,9 +946,11 @@ mod tests {
     const HARDWARE: Installed = Installed { software: false, hardware: true };
 
     /// Ubuntu 24.04's desktop: no -bad, no -libav (no parsers, no software
-    /// decoders, no avdec_aac; no hardware decoder without -bad either).
+    /// decoders, no avdec_aac, neither plugin; no hardware decoder without
+    /// -bad either).
     fn ubuntu_24_04() -> Facts {
-        let mut facts = without(complete(), &["h264parse", "h265parse", "avdec_aac", "faad", "gtk4paintablesink"]);
+        let names = ["h264parse", "h265parse", "avdec_aac", "faad", "gtk4paintablesink", LIBAV, OPENH264];
+        let mut facts = without(complete(), &names);
         facts.h264 = NOTHING;
         facts.h265 = NOTHING;
         facts.gtk = (4, 14, 2);
@@ -969,25 +1018,31 @@ mod tests {
 
     #[test]
     fn a_complete_system_reports_nothing() {
-        for plugins in [Plugins::Bundled, Plugins::SystemFromAppImage, Plugins::System] {
+        for (plugins, source) in [
+            (Plugins::Bundled, "Plugins: bundled with the AppImage"),
+            (Plugins::SystemFromAppImage, "Plugins: the system's, under the AppImage"),
+            (Plugins::System, "Plugins: the system's"),
+        ] {
             let report = Report::new(complete(), Family::Debian, plugins);
             assert!(report.gaps.is_empty());
             assert_eq!(report.exit_code(), 0);
             assert_eq!(report.text(), "");
             assert_eq!(report.summary_line(), None);
             assert_eq!(report.dismiss_key(), None);
-            assert_eq!(
-                report.status_lines(),
-                [
-                    "Display: gtk4paintablesink 0.13.5 (/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstgtk4.so)",
-                    "Missing: nothing"
-                ]
-            );
+            // System Status: the Plugins and Display lines `check_text` has,
+            // then "Missing"; no decoder lines (System Status has its own).
+            let display = "Display: gtk4paintablesink 0.13.5 (/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstgtk4.so)";
+            assert_eq!(report.status_lines(), [source, display, "Missing: nothing"]);
             let check = report.check_text();
             assert!(check.ends_with("\nMissing: nothing\n"), "{check}");
-            assert!(check.contains("\nDisplay: gtk4paintablesink 0.13.5 ("), "{check}");
+            assert!(check.contains(&format!("\n{source}\n{display}\nH.264 decoders: ")), "{check}");
             assert!(check.contains("\nH.265 decoders: software and hardware\n"), "{check}");
         }
+        // With gaps, the same two lines first.
+        let report = Report::new(ubuntu_24_04(), Family::Debian, Plugins::SystemFromAppImage);
+        let lines = report.status_lines();
+        assert_eq!(lines[..2], ["Plugins: the system's, under the AppImage", "Display: gtk4paintablesink missing"]);
+        assert_eq!(lines[2], "Missing for video: gtk4paintablesink");
     }
 
     #[test]
@@ -1055,39 +1110,60 @@ mod tests {
         assert_eq!(EMBED_APPIMAGE, format!("Reoling-{}-embed-x86_64.AppImage", env!("CARGO_PKG_VERSION")));
     }
 
+    /// What brings H.265 on Fedora once the FFmpeg plugin is there: the swap
+    /// to RPM Fusion's FFmpeg, then the registry line.
+    const FEDORA_H265: &str = "H.265 needs the full FFmpeg from RPM Fusion: enable it \
+                               (https://rpmfusion.org/Configuration), then: sudo dnf swap ffmpeg-free ffmpeg \
+                               --allowerasing\nThen start Reoling again.\nIf the decoder still does not show up, \
+                               remove ~/.cache/gstreamer-1.0/registry.*.bin and start Reoling again.";
+
     #[test]
     fn fedora_without_rpm_fusion_misses_only_h265() {
-        // Fedora 43/44 Workstation: OpenH264 for H.264, ffmpeg-free's AAC, a
-        // VA-API GPU without H.265, the distribution's sink.
+        // Fedora 43/44 Workstation: OpenH264 for H.264, the FFmpeg plugin on
+        // ffmpeg-free (its AAC, no H.265), a VA-API GPU without H.265, the
+        // distribution's sink. The plugin is loaded: dnf would answer
+        // "already installed", the swap is what brings H.265.
         let mut facts = complete();
         facts.h264 = Installed { software: true, hardware: true };
         facts.h265 = NOTHING;
         let report = Report::new(facts, Family::Fedora, Plugins::System);
         assert_eq!(gaps(&report), [(Feature::H265, vec![Need::Decoder(VideoType::H265)])]);
         assert_eq!(report.exit_code(), 1);
-        let text = report.text();
-        // The GStreamer plugin is not pulled in by the FFmpeg swap: both.
-        assert!(text.contains("\nsudo dnf install gstreamer1-plugin-libav\n"), "{text}");
-        let swap = "(https://rpmfusion.org/Configuration), then: sudo dnf swap ffmpeg-free ffmpeg --allowerasing\n";
-        assert!(text.contains(swap), "{text}");
-        assert!(text.contains("remove ~/.cache/gstreamer-1.0/registry.*.bin and start Reoling again."), "{text}");
-        // Under the app-only AppImage: its own registry.
-        let mut facts = complete();
+        assert_eq!(
+            report.text(),
+            format!("Some parts Reoling needs are not on this system:\n- H.265 video: an H.265 decoder\n{FEDORA_H265}")
+        );
+        assert_eq!(report.no_decoder_text(VideoType::H265), format!("No H.265 decoder on this system.\n{FEDORA_H265}"));
+        let summary = report.summary_line().expect("missing parts");
+        assert!(!summary.contains("dnf install"), "{summary}");
+        assert!(summary.contains("; H.265 needs the full FFmpeg from RPM Fusion: enable it"), "{summary}");
+        // Without the plugin (not installed, or failed to load: see
+        // `plugin_loaded`), and so without its AAC: named, before the swap.
+        let mut facts = without(complete(), &[LIBAV, "avdec_aac", "faad"]);
         facts.h265 = NOTHING;
+        let report = Report::new(facts.clone(), Family::Fedora, Plugins::System);
+        assert_eq!(
+            report.text(),
+            format!(
+                "Some parts Reoling needs are not on this system:\n- H.265 video: an H.265 decoder\n- Sound: an AAC \
+                 decoder\nInstall them with:\nsudo dnf install gstreamer1-plugin-libav\n{FEDORA_H265}"
+            )
+        );
+        let install = "No H.265 decoder on this system.\nInstall one with: sudo dnf install gstreamer1-plugin-libav";
+        assert_eq!(report.no_decoder_text(VideoType::H265), format!("{install}\n{FEDORA_H265}"));
+        // Under the app-only AppImage: its own registry.
         facts.registry = Some("~/.cache/reoling/gstreamer-registry-system-1.28.2.bin".to_string());
         let report = Report::new(facts, Family::Fedora, Plugins::SystemFromAppImage);
         let text = report.no_decoder_text(VideoType::H265);
-        let install = "No H.265 decoder on this system.\nInstall one with: sudo dnf install gstreamer1-plugin-libav\n";
-        assert!(text.starts_with(install), "{text}");
+        assert!(text.starts_with(&format!("{install}\n")), "{text}");
         assert!(text.contains("remove ~/.cache/reoling/gstreamer-registry-system-1.28.2.bin and start"), "{text}");
         assert!(text.ends_with(&format!("Or use {EMBED_APPIMAGE}, which brings one along.")), "{text}");
     }
 
     #[test]
     fn fedora_h264_names_the_codec_library() {
-        // The stock live image: openh264dec on the noopenh264 stand-in, which
-        // does not count (see `settings::installed_decoders`), no VA-API.
-        let mut facts = complete();
+        // A system without either plugin, no VA-API: both packages.
+        let mut facts = without(complete(), &[OPENH264, LIBAV]);
         facts.h264 = NOTHING;
         facts.h265 = NOTHING;
         let report = Report::new(facts, Family::Fedora, Plugins::System);
@@ -1105,8 +1181,27 @@ mod tests {
             ),
             "{text}"
         );
-        // Only a hardware decoder, which failed: the software one is named.
+        // The stock live image: both plugins, openh264dec on the noopenh264
+        // stand-in, which does not count (see `settings::installed_decoders`):
+        // the library is named, no plugin package.
         let mut facts = complete();
+        facts.h264 = NOTHING;
+        facts.h265 = NOTHING;
+        let report = Report::new(facts, Family::Fedora, Plugins::System);
+        let openh264 = "openh264 comes from Fedora's fedora-cisco-openh264 repository (enabled by default) and \
+                        replaces noopenh264, a stand-in that decodes nothing.";
+        assert_eq!(
+            report.text(),
+            format!(
+                "Some parts Reoling needs are not on this system:\n- H.264 video: an H.264 decoder\n- H.265 video: an \
+                 H.265 decoder\nInstall them with:\nsudo dnf install openh264\n{openh264}\n{FEDORA_H265}"
+            )
+        );
+        let install = "No H.264 decoder on this system.\nInstall one with: sudo dnf install openh264";
+        let text = report.no_decoder_text(VideoType::H264);
+        assert_eq!(text, format!("{install}\n{openh264}\nThen start Reoling again."));
+        // Only a hardware decoder, which failed: the software one is named.
+        let mut facts = without(complete(), &[OPENH264]);
         facts.h264 = HARDWARE;
         let report = Report::new(facts, Family::Fedora, Plugins::System);
         let text = report.no_decoder_text(VideoType::H264);
@@ -1116,19 +1211,84 @@ mod tests {
 
     #[test]
     fn opensuse_points_at_packman() {
+        // The FFmpeg plugin on openSUSE's own FFmpeg: its AAC, no H.264 or
+        // H.265.
         let mut facts = complete();
         facts.h264 = NOTHING;
         facts.h265 = NOTHING;
-        let report = Report::new(facts, Family::Suse, Plugins::System);
-        let text = report.text();
-        assert_eq!(text.matches("opi codecs").count(), 1, "{text}");
-        assert!(!text.contains("sudo zypper install gstreamer"), "{text}");
-        assert!(text.ends_with("opi codecs\nThen start Reoling again."), "{text}");
+        let report = Report::new(facts.clone(), Family::Suse, Plugins::System);
+        let gaps = "Some parts Reoling needs are not on this system:\n- H.264 video: an H.264 decoder\n- H.265 video: \
+                    an H.265 decoder";
+        let packman = "H.264 and H.265 decoders come from Packman: sudo zypper install opi && opi codecs";
+        assert_eq!(report.text(), format!("{gaps}\n{packman}\nThen start Reoling again."));
+        // Without the plugin, and so without an AAC decoder: it is named.
+        let report = Report::new(without(facts.clone(), &[LIBAV, "avdec_aac", "faad"]), Family::Suse, Plugins::System);
+        assert_eq!(
+            report.text(),
+            format!(
+                "{gaps}\n- Sound: an AAC decoder\nInstall them with:\nsudo zypper install gstreamer-plugins-libav\n\
+                 {packman}\nThen start Reoling again."
+            )
+        );
+        // With the plugin but no AAC decoder in it: no package.
+        let report = Report::new(without(facts, &["avdec_aac", "faad"]), Family::Suse, Plugins::System);
+        assert_eq!(
+            report.text(),
+            format!(
+                "{gaps}\n- Sound: an AAC decoder\n{packman}\nThen start Reoling again.\nIf the decoder still does not \
+                 show up, remove ~/.cache/gstreamer-1.0/registry.*.bin and start Reoling again."
+            )
+        );
+    }
+
+    #[test]
+    fn a_package_whose_plugin_is_loaded_is_not_named() {
+        // The guard in `plugin_loaded`: a plugin flagged blacklisted is not
+        // loaded. (One that failed to load is not found by its name at all.)
+        assert!(plugin_loaded(gstreamer::PluginFlags::empty()));
+        assert!(plugin_loaded(gstreamer::PluginFlags::CACHED));
+        assert!(!plugin_loaded(gstreamer::PluginFlags::BLACKLISTED));
+        assert!(!plugin_loaded(gstreamer::PluginFlags::CACHED | gstreamer::PluginFlags::BLACKLISTED));
+        // The FFmpeg plugin loaded, its H.265 decoder not there: only the
+        // registry line, on every family whose hint is a package (openSUSE's
+        // is Packman, above; Fedora's the swap).
+        let registry = "If the decoder still does not show up, remove ~/.cache/gstreamer-1.0/registry.*.bin and start \
+                        Reoling again.";
+        let mut facts = complete();
+        facts.h265 = NOTHING;
+        for (family, install) in [
+            (Family::Debian, "Install one with: sudo apt install gstreamer1.0-libav\nThen start Reoling again."),
+            (Family::Arch, "Install one with: sudo pacman -S --needed gst-libav\nThen start Reoling again."),
+            (
+                Family::Other,
+                "Install with the system's package manager: GStreamer's FFmpeg plugin (gst-libav).\nThen start \
+                 Reoling again.",
+            ),
+        ] {
+            let report = Report::new(facts.clone(), family, Plugins::System);
+            let text = report.no_decoder_text(VideoType::H265);
+            assert_eq!(text, format!("No H.265 decoder on this system.\n{registry}"), "{family:?}");
+            assert_eq!(
+                report.text(),
+                format!("Some parts Reoling needs are not on this system:\n- H.265 video: an H.265 decoder\n{registry}")
+            );
+            // Under the app-only AppImage, the embed one has its own FFmpeg.
+            let report = Report::new(facts.clone(), family, Plugins::SystemFromAppImage);
+            let embed = format!("{registry}\nOr use {EMBED_APPIMAGE}, which brings one along.");
+            assert!(report.no_decoder_text(VideoType::H265).ends_with(&embed), "{family:?}");
+            // Without it (not installed, or failed to load): its package.
+            let report = Report::new(without(facts.clone(), &[LIBAV]), family, Plugins::System);
+            let text = report.no_decoder_text(VideoType::H265);
+            assert_eq!(text, format!("No H.265 decoder on this system.\n{install}"), "{family:?}");
+        }
+        // A missing element's package is named, whatever is loaded.
+        let report = Report::new(without(complete(), &["h265parse"]), Family::Debian, Plugins::System);
+        assert!(report.text().ends_with("\nsudo apt install gstreamer1.0-plugins-bad\nThen start Reoling again."));
     }
 
     #[test]
     fn arch_needs_gst_libav() {
-        let mut facts = without(complete(), &["avdec_aac", "faad"]);
+        let mut facts = without(complete(), &["avdec_aac", "faad", LIBAV]);
         facts.h264 = NOTHING;
         facts.h265 = HARDWARE;
         let report = Report::new(facts, Family::Arch, Plugins::System);

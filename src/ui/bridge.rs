@@ -594,7 +594,7 @@ pub fn spawn_device(
     audio_out: std::sync::Arc<crate::ui::audio::AudioOutput>,
 ) -> DeviceLink {
     let (tx, rx) = async_channel::unbounded();
-    let (commands, mut command_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+    let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
     let playback_gen = Arc::new(AtomicU64::new(0));
     let driver_gen = Arc::clone(&playback_gen);
 
@@ -631,9 +631,9 @@ pub fn spawn_device(
                     return;
                 }
             }
-            let mut channel_updates =
+            let channel_updates =
                 client.take_channel_updates().expect("taken once per client");
-            let mut audio = client.take_audio().expect("taken once per client");
+            let audio = client.take_audio().expect("taken once per client");
             let identity = client.identity().await;
             if std::env::var("REOLING_PROBE_PUSH").is_ok() {
                 client.probe_pushes(&username).await;
@@ -651,354 +651,397 @@ pub fn spawn_device(
             let _ = tx.send(DeviceEvent::Connected(identity)).await;
             let _ = tx.send(DeviceEvent::EncodeProfiles(client.encode_profiles())).await;
 
-            let mut frames: Option<tokio_stream::wrappers::ReceiverStream<reoling::Result<VideoFrame>>> =
-                None;
-            let mut sink: Option<VideoSink> = None;
-            let mut announced = false;
-            let mut channel = 0u8;
-            let mut asked_names: std::collections::HashSet<u8> = std::collections::HashSet::new();
-            let mut driver = PlaybackDriver::new(driver_gen, replay_sink_request_tx);
-            let mut playback_tick = tokio::time::interval(PLAYBACK_TICK);
-            playback_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // A running download, and the commands that wait for it: live
-            // video and playback need the connection's reader, which the
-            // download has (as a search would). They run, in order, once
-            // it is over.
-            let mut download: Option<DownloadJob> = None;
-            let mut deferred: VecDeque<Command> = VecDeque::new();
-
-            loop {
-                let replay_active = driver.is_active();
-                let downloading = download.is_some();
-                let has_deferred = !downloading && !deferred.is_empty();
-                tokio::select! {
-                    incoming = async {
-                        if has_deferred { Incoming::Deferred } else { Incoming::Received(command_rx.recv().await) }
-                    } => match incoming.command(&mut deferred) {
-                        Some(
-                            command @ (Command::Play { .. }
-                            | Command::Stop
-                            | Command::Playback(_)
-                            | Command::QuerySettings { .. }
-                            | Command::WriteSettings { .. }),
-                        ) if downloading =>
-                        {
-                            if let Some(job) = download.as_mut() {
-                                deferral_notice(&command, job, &driver, &deferred, &tx).await;
-                            }
-                            deferred.push_back(command);
-                        }
-                        Some(Command::Download(request)) => {
-                            if download.is_some() {
-                                let outcome =
-                                    DownloadOutcome::Failed("A download is already running on this device".to_string());
-                                let event = DownloadEvent::Finished { session: request.session, outcome };
-                                let _ = tx.send(DeviceEvent::Download(event)).await;
-                            } else {
-                                // Live video and a download never share
-                                // the connection's reader.
-                                if frames.take().is_some() {
-                                    let _ = client.stop_video(channel).await;
-                                    sink = None;
-                                    announced = false;
-                                }
-                                download = DownloadJob::start(request, &mut driver, &mut client, &tx).await;
-                            }
-                        }
-                        Some(Command::DownloadCancel) => {
-                            if let Some(job) = download.as_ref() {
-                                job.cancel();
-                            }
-                        }
-                        Some(Command::Play { channel: wanted, profile }) => {
-                            // Live and playback never share the connection.
-                            // Nothing happens here while no playback runs.
-                            driver.end(&mut client).await;
-                            if frames.take().is_some() {
-                                let _ = client.stop_video(channel).await;
-                            }
-                            channel = wanted;
-                            sink = None;
-                            announced = false;
-                            match client.start_video(channel, profile).await {
-                                Ok(f) => frames = Some(f),
-                                Err(e) => {
-                                    let event = DeviceEvent::PlayFailed { channel, reason: e.to_string() };
-                                    let _ = tx.send(event).await;
-                                }
-                            }
-                        }
-                        Some(Command::QueryEncoding { channel }) => client.query_encoding(channel).await,
-                        Some(Command::QueryEncodeProfiles { channel }) => client.query_encode_profiles(channel).await,
-                        Some(Command::QueryChannelVersion { channel }) => client.query_channel_version(channel).await,
-                        Some(Command::QuerySettings { target, gates, read }) => {
-                            client.query_settings(target, &gates, read).await
-                        }
-                        Some(Command::WriteSettings { target, kind, group, writes }) => {
-                            client.write_settings(target, kind, group, writes).await
-                        }
-                        Some(Command::SetEncoding { channel, body }) => {
-                            if let Err(e) = client.set_encoding(channel, body).await {
-                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
-                            }
-                        }
-                        Some(Command::Siren { channel }) => {
-                            if let Err(e) = client.play_siren(channel).await {
-                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
-                            }
-                        }
-                        Some(Command::Spotlight { channel, on }) => {
-                            if let Err(e) = client.set_spotlight(channel, on).await {
-                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
-                            }
-                        }
-                        Some(Command::Ptz { channel, command, speed }) => {
-                            if let Err(e) = client.ptz(channel, command, speed).await {
-                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
-                            }
-                        }
-                        Some(Command::QueryZoomFocus { channel }) => {
-                            client.query_zoom_focus(channel).await;
-                        }
-                        Some(Command::Zoom { channel, position }) => {
-                            if let Err(e) = client.set_zoom(channel, position).await {
-                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
-                            }
-                        }
-                        Some(Command::QueryPresets { channel }) => {
-                            client.query_presets(channel).await;
-                        }
-                        Some(Command::SetPreset { channel, id, name }) => {
-                            if let Err(e) = client.set_preset(channel, id, &name).await {
-                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
-                            }
-                        }
-                        Some(Command::GotoPreset { channel, id }) => {
-                            if let Err(e) = client.goto_preset(channel, id).await {
-                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
-                            }
-                        }
-                        Some(Command::DeletePreset { channel, id }) => {
-                            if let Err(e) = client.delete_preset(channel, id).await {
-                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
-                            }
-                        }
-                        Some(Command::Calibrate { channel }) => {
-                            if let Err(e) = client.calibrate_ptz(channel).await {
-                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
-                            }
-                        }
-                        Some(Command::QueryMonitorPoint { channel }) => {
-                            client.query_monitor_point(channel).await;
-                        }
-                        Some(Command::QueryMonitorPointImage { channel }) => {
-                            client.query_monitor_point_image(channel).await;
-                        }
-                        Some(Command::CapturePresetImage { channel, preset_id }) => {
-                            client.request_snapshot(channel, preset_id).await;
-                        }
-                        Some(Command::UploadPresetImage { channel, preset_id, jpeg }) => {
-                            client.upload_preset_image(channel, preset_id, jpeg).await;
-                        }
-                        Some(Command::SavePresetWithImage { channel, id, name }) => {
-                            if let Err(e) = client.save_preset_with_image(channel, id, &name).await {
-                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
-                            }
-                        }
-                        Some(Command::ModifyPreset { channel, id, name, with_image }) => {
-                            if let Err(e) = client.modify_preset(channel, id, &name, with_image).await {
-                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
-                            }
-                        }
-                        Some(Command::QueryPresetImage { channel, preset_id }) => {
-                            client.query_preset_image(channel, preset_id).await;
-                        }
-                        Some(Command::SetMonitorPointConfig { channel, enabled, timeout_seconds }) => {
-                            if let Err(e) = client.set_monitor_point_config(channel, enabled, timeout_seconds).await {
-                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
-                            }
-                        }
-                        Some(Command::SetMonitorPointHere { channel, enabled, timeout_seconds }) => {
-                            if let Err(e) =
-                                client.set_current_position_as_monitor_point(channel, enabled, timeout_seconds).await
-                            {
-                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
-                            }
-                        }
-                        Some(Command::GoToMonitorPoint { channel, timeout_seconds }) => {
-                            if let Err(e) = client.go_to_monitor_point(channel, timeout_seconds).await {
-                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
-                            }
-                        }
-                        Some(Command::Focus { channel, position }) => {
-                            if let Err(e) = client.set_focus(channel, position).await {
-                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
-                            }
-                        }
-                        Some(Command::TalkStart { channel }) => {
-                            if let Err(e) = client.talk_start(channel).await {
-                                let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
-                            }
-                        }
-                        Some(Command::TalkBlock { channel, block }) => {
-                            let _ = client.talk_block(channel, &block).await;
-                        }
-                        Some(Command::TalkStop { channel }) => {
-                            let _ = client.talk_stop(channel).await;
-                        }
-                        Some(Command::Playback(command)) => {
-                            // Live and playback never share the connection's
-                            // reader.
-                            if frames.take().is_some() {
-                                let _ = client.stop_video(channel).await;
-                                sink = None;
-                                announced = false;
-                            }
-                            driver.command(command, &mut client, &tx).await;
-                        }
-                        Some(Command::Stop) => {
-                            if frames.take().is_some() {
-                                let _ = client.stop_video(channel).await;
-                            }
-                        }
-                        Some(Command::Shutdown) | None => break,
-                    },
-                    // Live sound only: a playback's audio travels with its
-                    // video (`driver.units()`) into the replay sink.
-                    Some(frame) = audio.recv() => audio_out.push(&frame),
-                    Some(update) = channel_updates.recv() => {
-                        let event = match update {
-                            DeviceUpdate::Channels(channels) => {
-                                // An NVR's list carries no names; ask for the
-                                // ones we do not have (once per channel).
-                                let unnamed: Vec<u8> = channels
-                                    .iter()
-                                    .filter(|c| c.online && c.name.is_empty())
-                                    .map(|c| c.channel_id)
-                                    .filter(|id| asked_names.insert(*id))
-                                    .collect();
-                                client.request_channel_names(&unnamed).await;
-                                DeviceEvent::Channels(channels)
-                            }
-                            DeviceUpdate::ChannelName { channel_id, name } => {
-                                DeviceEvent::ChannelName { channel_id, name }
-                            }
-                            DeviceUpdate::Abilities(abilities) => DeviceEvent::Abilities(abilities),
-                            DeviceUpdate::ZoomFocus { channel_id, zoom, focus } => {
-                                DeviceEvent::ZoomFocus { channel_id, zoom, focus }
-                            }
-                            DeviceUpdate::Presets { channel_id, presets } => {
-                                DeviceEvent::Presets { channel_id, presets }
-                            }
-                            DeviceUpdate::MonitorPoint { channel_id, state } => {
-                                DeviceEvent::MonitorPoint { channel_id, state }
-                            }
-                            DeviceUpdate::MonitorPointImage { channel_id, jpeg } => {
-                                DeviceEvent::MonitorPointImage { channel_id, jpeg }
-                            }
-                            DeviceUpdate::Snapshot { preset_id, jpeg, .. } => {
-                                DeviceEvent::Snapshot { preset_id, jpeg }
-                            }
-                            DeviceUpdate::ImageNotFound { preset_id, .. } => {
-                                DeviceEvent::ImageNotFound { preset_id }
-                            }
-                            DeviceUpdate::PresetImage { channel_id, preset_id, jpeg } => {
-                                DeviceEvent::PresetImage { channel_id, preset_id, jpeg }
-                            }
-                            DeviceUpdate::ControlReply { msg_id, code } => {
-                                DeviceEvent::ControlReply { msg_id, code }
-                            }
-                            DeviceUpdate::Encoding { channel_id, encoding } => {
-                                DeviceEvent::Encoding { channel_id, encoding }
-                            }
-                            DeviceUpdate::EncodeProfiles { channel_id, profiles } => {
-                                DeviceEvent::ChannelEncodeProfiles { channel_id, profiles }
-                            }
-                            DeviceUpdate::ChannelVersion { channel_id, model, firmware, .. } => {
-                                DeviceEvent::ChannelVersion { channel_id, model, firmware }
-                            }
-                            DeviceUpdate::Settings { page, read } => DeviceEvent::Settings { page, read },
-                            DeviceUpdate::SettingsWritten { target, group, results } => {
-                                DeviceEvent::SettingsWritten { target, group, results }
-                            }
-                        };
-                        if tx.send(event).await.is_err() {
-                            break;
-                        }
-                    }
-                    frame = async {
-                        match frames.as_mut() {
-                            Some(f) => f.next().await,
-                            None => std::future::pending().await,
-                        }
-                    } => match frame {
-                        Some(Ok(frame)) => {
-                            let live = LiveStream { frames: &mut frames, sink: &mut sink, announced: &mut announced };
-                            let next = on_live_frame(&frame, channel, live, &sink_request_tx, &tx, || {
-                                client.stop_video(channel)
-                            });
-                            match next.await {
-                                AfterFrame::Shown | AfterFrame::Stopped => {}
-                                AfterFrame::End => break,
-                            }
-                        }
-                        Some(Err(e)) => {
-                            frames = None;
-                            let _ = tx.send(DeviceEvent::PlayFailed { channel, reason: e.to_string() }).await;
-                        }
-                        None => frames = None,
-                    },
-                    item = async {
-                        match driver.units() {
-                            Some(units) => units.next().await,
-                            None => std::future::pending().await,
-                        }
-                    } => driver.on_unit(item, &tx).await,
-                    unit = async {
-                        match download.as_mut() {
-                            Some(job) => job.next_unit().await,
-                            None => std::future::pending().await,
-                        }
-                    } => {
-                        let ended = match download.as_mut() {
-                            Some(job) => job.on_unit(unit, &tx).await,
-                            None => None,
-                        };
-                        if let Some(ended) = ended {
-                            if let Some(job) = download.take() {
-                                job.finish(ended, &mut client, &tx).await;
-                            }
-                        }
-                    },
-                    _ = playback_tick.tick(), if replay_active => driver.tick(&mut client, &tx).await,
-                    error = client.wait_for_pushes(), if frames.is_none() => {
-                        let _ = tx.send(DeviceEvent::Lost(error.to_string())).await;
-                        break;
-                    }
-                }
-            }
-            // Every exit path ends the session — tell the device before
-            // this task (and the client with it) goes away. A download
-            // under way goes with it (its partial file is removed).
-            if let Some(job) = download.take() {
-                job.abandon();
-            }
-            client.disconnect().await;
+            serve(
+                client,
+                command_rx,
+                tx,
+                channel_updates,
+                audio,
+                driver_gen,
+                sink_request_tx,
+                replay_sink_request_tx,
+                audio_out,
+            )
+            .await;
         });
     });
 
     DeviceLink { events: rx, commands, playback_gen }
 }
 
+/// A logged-in connection (see `spawn_device`), until a `Shutdown`, the
+/// window's going or the connection's loss: the commands, the pushes, live
+/// video, playback and downloads. Then the session ends on the device.
+#[allow(clippy::too_many_arguments)]
+async fn serve(
+    mut client: ReolinkClient,
+    mut command_rx: tokio::sync::mpsc::UnboundedReceiver<Command>,
+    tx: async_channel::Sender<DeviceEvent>,
+    mut channel_updates: tokio::sync::mpsc::UnboundedReceiver<DeviceUpdate>,
+    mut audio: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    driver_gen: Arc<AtomicU64>,
+    sink_request_tx: tokio::sync::mpsc::Sender<SinkRequest>,
+    replay_sink_request_tx: tokio::sync::mpsc::Sender<ReplaySinkRequest>,
+    audio_out: std::sync::Arc<crate::ui::audio::AudioOutput>,
+) {
+    let mut frames: Option<tokio_stream::wrappers::ReceiverStream<reoling::Result<VideoFrame>>> =
+        None;
+    let mut sink: Option<VideoSink> = None;
+    let mut announced = false;
+    let mut channel = 0u8;
+    let mut asked_names: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    let mut driver = PlaybackDriver::new(driver_gen, replay_sink_request_tx);
+    let mut playback_tick = tokio::time::interval(PLAYBACK_TICK);
+    playback_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // A running download, and the commands that wait for it: live
+    // video and playback need the connection's reader, which the
+    // download has (as a search would). They run, in order, once
+    // it is over.
+    let mut download: Option<DownloadJob> = None;
+    let mut deferred: VecDeque<Command> = VecDeque::new();
+
+    loop {
+        let replay_active = driver.is_active();
+        let downloading = download.is_some();
+        let has_deferred = !downloading && !deferred.is_empty();
+        tokio::select! {
+            incoming = async {
+                if has_deferred { Incoming::Deferred } else { Incoming::Received(command_rx.recv().await) }
+            } => match incoming.command(&mut deferred) {
+                Some(
+                    command @ (Command::Play { .. }
+                    | Command::Stop
+                    | Command::Playback(_)
+                    | Command::QuerySettings { .. }
+                    | Command::WriteSettings { .. }),
+                ) if downloading =>
+                {
+                    if let Some(job) = download.as_mut() {
+                        deferral_notice(&command, job, &driver, &deferred, &tx).await;
+                    }
+                    deferred.push_back(command);
+                }
+                Some(Command::Download(request)) => {
+                    if download.is_some() {
+                        let outcome =
+                            DownloadOutcome::Failed("A download is already running on this device".to_string());
+                        let event = DownloadEvent::Finished { session: request.session, outcome };
+                        let _ = tx.send(DeviceEvent::Download(event)).await;
+                    } else {
+                        // Live video and a download never share
+                        // the connection's reader.
+                        if frames.take().is_some() {
+                            let _ = client.stop_video(channel).await;
+                            sink = None;
+                            announced = false;
+                        }
+                        download = DownloadJob::start(request, &mut driver, &mut client, &tx).await;
+                    }
+                }
+                Some(Command::DownloadCancel) => {
+                    if let Some(job) = download.as_ref() {
+                        job.cancel();
+                    }
+                }
+                Some(Command::Play { channel: wanted, profile }) => {
+                    // Live and playback never share the connection.
+                    // Nothing happens here while no playback runs.
+                    driver.end(&mut client).await;
+                    if frames.take().is_some() {
+                        let _ = client.stop_video(channel).await;
+                    }
+                    channel = wanted;
+                    sink = None;
+                    announced = false;
+                    match client.start_video(channel, profile).await {
+                        Ok(f) => frames = Some(f),
+                        Err(e) => {
+                            let event = DeviceEvent::PlayFailed { channel, reason: e.to_string() };
+                            let _ = tx.send(event).await;
+                        }
+                    }
+                }
+                Some(Command::QueryEncoding { channel }) => client.query_encoding(channel).await,
+                Some(Command::QueryEncodeProfiles { channel }) => client.query_encode_profiles(channel).await,
+                Some(Command::QueryChannelVersion { channel }) => client.query_channel_version(channel).await,
+                Some(Command::QuerySettings { target, gates, read }) => {
+                    client.query_settings(target, &gates, read).await
+                }
+                Some(Command::WriteSettings { target, kind, group, writes }) => {
+                    client.write_settings(target, kind, group, writes).await
+                }
+                Some(Command::SetEncoding { channel, body }) => {
+                    if let Err(e) = client.set_encoding(channel, body).await {
+                        let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                    }
+                }
+                Some(Command::Siren { channel }) => {
+                    if let Err(e) = client.play_siren(channel).await {
+                        let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                    }
+                }
+                Some(Command::Spotlight { channel, on }) => {
+                    if let Err(e) = client.set_spotlight(channel, on).await {
+                        let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                    }
+                }
+                Some(Command::Ptz { channel, command, speed }) => {
+                    if let Err(e) = client.ptz(channel, command, speed).await {
+                        let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                    }
+                }
+                Some(Command::QueryZoomFocus { channel }) => {
+                    client.query_zoom_focus(channel).await;
+                }
+                Some(Command::Zoom { channel, position }) => {
+                    if let Err(e) = client.set_zoom(channel, position).await {
+                        let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                    }
+                }
+                Some(Command::QueryPresets { channel }) => {
+                    client.query_presets(channel).await;
+                }
+                Some(Command::SetPreset { channel, id, name }) => {
+                    if let Err(e) = client.set_preset(channel, id, &name).await {
+                        let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                    }
+                }
+                Some(Command::GotoPreset { channel, id }) => {
+                    if let Err(e) = client.goto_preset(channel, id).await {
+                        let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                    }
+                }
+                Some(Command::DeletePreset { channel, id }) => {
+                    if let Err(e) = client.delete_preset(channel, id).await {
+                        let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                    }
+                }
+                Some(Command::Calibrate { channel }) => {
+                    if let Err(e) = client.calibrate_ptz(channel).await {
+                        let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                    }
+                }
+                Some(Command::QueryMonitorPoint { channel }) => {
+                    client.query_monitor_point(channel).await;
+                }
+                Some(Command::QueryMonitorPointImage { channel }) => {
+                    client.query_monitor_point_image(channel).await;
+                }
+                Some(Command::CapturePresetImage { channel, preset_id }) => {
+                    client.request_snapshot(channel, preset_id).await;
+                }
+                Some(Command::UploadPresetImage { channel, preset_id, jpeg }) => {
+                    client.upload_preset_image(channel, preset_id, jpeg).await;
+                }
+                Some(Command::SavePresetWithImage { channel, id, name }) => {
+                    if let Err(e) = client.save_preset_with_image(channel, id, &name).await {
+                        let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                    }
+                }
+                Some(Command::ModifyPreset { channel, id, name, with_image }) => {
+                    if let Err(e) = client.modify_preset(channel, id, &name, with_image).await {
+                        let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                    }
+                }
+                Some(Command::QueryPresetImage { channel, preset_id }) => {
+                    client.query_preset_image(channel, preset_id).await;
+                }
+                Some(Command::SetMonitorPointConfig { channel, enabled, timeout_seconds }) => {
+                    if let Err(e) = client.set_monitor_point_config(channel, enabled, timeout_seconds).await {
+                        let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                    }
+                }
+                Some(Command::SetMonitorPointHere { channel, enabled, timeout_seconds }) => {
+                    if let Err(e) =
+                        client.set_current_position_as_monitor_point(channel, enabled, timeout_seconds).await
+                    {
+                        let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                    }
+                }
+                Some(Command::GoToMonitorPoint { channel, timeout_seconds }) => {
+                    if let Err(e) = client.go_to_monitor_point(channel, timeout_seconds).await {
+                        let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                    }
+                }
+                Some(Command::Focus { channel, position }) => {
+                    if let Err(e) = client.set_focus(channel, position).await {
+                        let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                    }
+                }
+                Some(Command::TalkStart { channel }) => {
+                    if let Err(e) = client.talk_start(channel).await {
+                        let _ = tx.send(DeviceEvent::ControlFailed(e.to_string())).await;
+                    }
+                }
+                Some(Command::TalkBlock { channel, block }) => {
+                    let _ = client.talk_block(channel, &block).await;
+                }
+                Some(Command::TalkStop { channel }) => {
+                    let _ = client.talk_stop(channel).await;
+                }
+                Some(Command::Playback(command)) => {
+                    // Live and playback never share the connection's
+                    // reader.
+                    if frames.take().is_some() {
+                        let _ = client.stop_video(channel).await;
+                        sink = None;
+                        announced = false;
+                    }
+                    driver.command(command, &mut client, &tx).await;
+                }
+                Some(Command::Stop) => {
+                    if frames.take().is_some() {
+                        let _ = client.stop_video(channel).await;
+                    }
+                }
+                Some(Command::Shutdown) | None => break,
+            },
+            // Live sound only: a playback's audio travels with its
+            // video (`driver.units()`) into the replay sink.
+            Some(frame) = audio.recv() => audio_out.push(&frame),
+            Some(update) = channel_updates.recv() => {
+                let event = match update {
+                    DeviceUpdate::Channels(channels) => {
+                        // An NVR's list carries no names; ask for the
+                        // ones we do not have (once per channel).
+                        let unnamed: Vec<u8> = channels
+                            .iter()
+                            .filter(|c| c.online && c.name.is_empty())
+                            .map(|c| c.channel_id)
+                            .filter(|id| asked_names.insert(*id))
+                            .collect();
+                        client.request_channel_names(&unnamed).await;
+                        DeviceEvent::Channels(channels)
+                    }
+                    DeviceUpdate::ChannelName { channel_id, name } => {
+                        DeviceEvent::ChannelName { channel_id, name }
+                    }
+                    DeviceUpdate::Abilities(abilities) => DeviceEvent::Abilities(abilities),
+                    DeviceUpdate::ZoomFocus { channel_id, zoom, focus } => {
+                        DeviceEvent::ZoomFocus { channel_id, zoom, focus }
+                    }
+                    DeviceUpdate::Presets { channel_id, presets } => {
+                        DeviceEvent::Presets { channel_id, presets }
+                    }
+                    DeviceUpdate::MonitorPoint { channel_id, state } => {
+                        DeviceEvent::MonitorPoint { channel_id, state }
+                    }
+                    DeviceUpdate::MonitorPointImage { channel_id, jpeg } => {
+                        DeviceEvent::MonitorPointImage { channel_id, jpeg }
+                    }
+                    DeviceUpdate::Snapshot { preset_id, jpeg, .. } => {
+                        DeviceEvent::Snapshot { preset_id, jpeg }
+                    }
+                    DeviceUpdate::ImageNotFound { preset_id, .. } => {
+                        DeviceEvent::ImageNotFound { preset_id }
+                    }
+                    DeviceUpdate::PresetImage { channel_id, preset_id, jpeg } => {
+                        DeviceEvent::PresetImage { channel_id, preset_id, jpeg }
+                    }
+                    DeviceUpdate::ControlReply { msg_id, code } => {
+                        DeviceEvent::ControlReply { msg_id, code }
+                    }
+                    DeviceUpdate::Encoding { channel_id, encoding } => {
+                        DeviceEvent::Encoding { channel_id, encoding }
+                    }
+                    DeviceUpdate::EncodeProfiles { channel_id, profiles } => {
+                        DeviceEvent::ChannelEncodeProfiles { channel_id, profiles }
+                    }
+                    DeviceUpdate::ChannelVersion { channel_id, model, firmware, .. } => {
+                        DeviceEvent::ChannelVersion { channel_id, model, firmware }
+                    }
+                    DeviceUpdate::Settings { page, read } => DeviceEvent::Settings { page, read },
+                    DeviceUpdate::SettingsWritten { target, group, results } => {
+                        DeviceEvent::SettingsWritten { target, group, results }
+                    }
+                };
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+            frame = async {
+                match frames.as_mut() {
+                    Some(f) => f.next().await,
+                    None => std::future::pending().await,
+                }
+            } => match frame {
+                Some(Ok(frame)) => {
+                    let live = LiveStream { frames: &mut frames, sink: &mut sink, announced: &mut announced };
+                    let next = on_live_frame(&frame, channel, live, &sink_request_tx, &tx, || {
+                        client.stop_video(channel)
+                    });
+                    match next.await {
+                        AfterFrame::Shown | AfterFrame::Stopped => {}
+                        AfterFrame::End => break,
+                    }
+                }
+                Some(Err(e)) => {
+                    frames = None;
+                    let _ = tx.send(DeviceEvent::PlayFailed { channel, reason: e.to_string() }).await;
+                }
+                None => frames = None,
+            },
+            item = async {
+                match driver.units() {
+                    Some(units) => units.next().await,
+                    None => std::future::pending().await,
+                }
+            } => driver.on_unit(item, &tx).await,
+            unit = async {
+                match download.as_mut() {
+                    Some(job) => job.next_unit().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let ended = match download.as_mut() {
+                    Some(job) => job.on_unit(unit, &tx).await,
+                    None => None,
+                };
+                if let Some(ended) = ended {
+                    if let Some(job) = download.take() {
+                        job.finish(ended, &mut client, &tx).await;
+                    }
+                }
+            },
+            _ = playback_tick.tick(), if replay_active => driver.tick(&mut client, &tx).await,
+            error = client.wait_for_pushes(), if frames.is_none() => {
+                let _ = tx.send(DeviceEvent::Lost(error.to_string())).await;
+                break;
+            }
+        }
+    }
+    // Every exit path ends the session — tell the device before
+    // this task (and the client with it) goes away. A download
+    // under way goes with it (its partial file is removed).
+    if let Some(job) = download.take() {
+        job.abandon();
+    }
+    client.disconnect().await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        login_refused, on_live_frame, request_sink, AfterFrame, DeviceEvent, LiveStream, SinkAnswer, SinkRequest,
+        login_refused, on_live_frame, request_sink, serve, AfterFrame, Command, DeviceEvent, LiveStream, SinkAnswer,
+        SinkRequest,
     };
+    use crate::ui::audio::AudioOutput;
     use crate::ui::video_view::fixtures::{self, View};
-    use reoling::{VideoFrame, VideoType};
+    use reoling::protocol::bc::model::{
+        Bc, BcBody, BcMeta, ModernMsg, MSG_ID_GET_COMPRESSION, MSG_ID_LINK_TYPE, MSG_ID_LOGOUT, MSG_ID_VIDEO,
+        MSG_ID_VIDEO_STOP,
+    };
+    use reoling::protocol::bc::xml::{Extension, XML_VERSION};
+    use reoling::protocol::crypto::EncryptionProtocol;
+    use reoling::transport::connection::BcConnection;
+    use reoling::transport::discovery::PeerHandle;
+    use reoling::{ReolinkClient, StreamProfile, VideoFrame, VideoType};
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::net::UdpSocket;
 
     #[test]
     fn only_a_wrong_password_is_a_rejected_login() {
@@ -1034,15 +1077,18 @@ mod tests {
         }
     }
 
+    /// An event the window hears, as read here.
+    fn said(event: DeviceEvent) -> String {
+        match event {
+            DeviceEvent::PlayFailed { channel, reason } => format!("PlayFailed {channel}: {reason}"),
+            DeviceEvent::Playing => "Playing".to_string(),
+            _ => "another event".to_string(),
+        }
+    }
+
     /// The events the window has had since last asked, as read here.
     fn heard(events: &async_channel::Receiver<DeviceEvent>) -> Vec<String> {
-        std::iter::from_fn(|| events.try_recv().ok())
-            .map(|event| match event {
-                DeviceEvent::PlayFailed { channel, reason } => format!("PlayFailed {channel}: {reason}"),
-                DeviceEvent::Playing => "Playing".to_string(),
-                _ => "another event".to_string(),
-            })
-            .collect()
+        std::iter::from_fn(|| events.try_recv().ok()).map(said).collect()
     }
 
     #[tokio::test]
@@ -1143,5 +1189,138 @@ mod tests {
         assert!(matches!(request_sink(&requests, VideoType::H264).await, SinkAnswer::Gone));
         drop(requests);
         window.await.expect("the window's task");
+    }
+
+    const PLAIN: EncryptionProtocol = EncryptionProtocol::Unencrypted;
+
+    /// A client and the device's end of a connection over UDP on the
+    /// loopback (BCUDP, unencrypted, no login), as the client's own tests
+    /// make one.
+    async fn client_and_device() -> (ReolinkClient, BcConnection) {
+        let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("a socket"));
+        let device_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("a socket"));
+        let peer = |addr, local_connection_id, remote_connection_id| PeerHandle {
+            addr,
+            local_connection_id,
+            remote_connection_id,
+            nonce: None,
+            is_direct: false,
+        };
+        let (client_addr, device_addr) = (client_socket.local_addr(), device_socket.local_addr());
+        let device = BcConnection::new(device_socket, peer(client_addr.expect("an address"), 2, 1));
+        let connection = BcConnection::new(client_socket, peer(device_addr.expect("an address"), 1, 2));
+        (ReolinkClient::from_connection(connection, PLAIN), device)
+    }
+
+    /// A message of the device's under the number of `request`, code 200.
+    fn device_message(request: &BcMeta, extension: Option<Vec<u8>>, payload: Option<Vec<u8>>) -> Bc {
+        let meta = BcMeta { response_code: 200, class: 0x0000, ..request.clone() };
+        Bc { meta, body: BcBody::Modern(ModernMsg { extension_xml: extension, payload }) }
+    }
+
+    /// One BcMedia key frame of `codec`, without an extra header.
+    fn key_frame(codec: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut unit = 0x6364_3030u32.to_le_bytes().to_vec();
+        unit.extend_from_slice(codec);
+        unit.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        unit.extend_from_slice(&0u32.to_le_bytes());
+        unit.extend_from_slice(&0u32.to_le_bytes());
+        unit.extend_from_slice(&0u32.to_le_bytes());
+        unit.extend_from_slice(data);
+        unit.resize(unit.len() + (8 - data.len() % 8) % 8, 0);
+        unit
+    }
+
+    /// The device's end: a Preview is answered and its stream starts with an
+    /// H.265 key frame, a stop is answered. Every request but the idle
+    /// keepalive goes to `asked`; the logout ends it.
+    async fn h265_camera(mut device: BcConnection, asked: tokio::sync::mpsc::UnboundedSender<BcMeta>) {
+        while let Ok(request) = device.recv_bc(&PLAIN).await {
+            let meta = request.meta;
+            if meta.msg_id == MSG_ID_LINK_TYPE {
+                continue;
+            }
+            let _ = asked.send(meta.clone());
+            match meta.msg_id {
+                MSG_ID_VIDEO => {
+                    device.send_bc(&device_message(&meta, None, None), &PLAIN).await.expect("the answer sent");
+                    let binary = Extension {
+                        version: XML_VERSION.to_string(),
+                        binary_data: Some(1),
+                        channel_id: Some(meta.channel_id),
+                        ..Default::default()
+                    };
+                    let frame = key_frame(b"H265", &[0, 0, 0, 1, 0x40, 0x01]);
+                    let media = device_message(&meta, Some(binary.to_bytes()), Some(frame));
+                    device.send_bc(&media, &PLAIN).await.expect("the frame sent");
+                }
+                MSG_ID_VIDEO_STOP => {
+                    device.send_bc(&device_message(&meta, None, None), &PLAIN).await.expect("the answer sent")
+                }
+                MSG_ID_LOGOUT => return,
+                _ => {}
+            }
+        }
+    }
+
+    /// `future`'s output, if it comes within 5 s.
+    async fn soon<T>(future: impl std::future::Future<Output = T>, what: &str) -> T {
+        tokio::time::timeout(Duration::from_secs(5), future).await.unwrap_or_else(|_| panic!("no {what} within 5 s"))
+    }
+
+    #[tokio::test]
+    async fn after_a_refused_live_sink_the_connection_serves_the_next_command() {
+        // The connection's own loop (`serve`) with a client on the loopback,
+        // and the window's live responder of the test above.
+        let (requests, mut incoming) = tokio::sync::mpsc::channel::<SinkRequest>(8);
+        let window = std::thread::spawn(move || {
+            let view = View::live(Some(VideoType::H265));
+            while let Some((video_type, reply)) = incoming.blocking_recv() {
+                let _ = reply.send(view.ensure_sink(video_type));
+            }
+            view.reset();
+        });
+        let (mut client, device) = client_and_device().await;
+        let (asked_tx, mut asked) = tokio::sync::mpsc::unbounded_channel();
+        let device = tokio::spawn(h265_camera(device, asked_tx));
+        let updates = client.take_channel_updates().expect("taken once per client");
+        let audio = client.take_audio().expect("taken once per client");
+        let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, events) = async_channel::unbounded();
+        let (replay_requests, _replay_incoming) = tokio::sync::mpsc::channel(1);
+        let (gen, audio_out) = (Arc::new(AtomicU64::new(0)), Arc::new(AudioOutput::new(1.0)));
+        let connection = serve(client, command_rx, tx, updates, audio, gen, requests, replay_requests, audio_out);
+        tokio::pin!(connection);
+        let script = async {
+            // Play: the stream's first frame is H.265, which this system
+            // cannot show. The window hears why...
+            commands.send(Command::Play { channel: CHANNEL, profile: StreamProfile::Sub }).expect("a connection");
+            let failed = soon(events.recv(), "event").await.expect("the connection's events");
+            assert_eq!(said(failed), format!("PlayFailed {CHANNEL}: Cannot show this stream: h265parse is missing."));
+            // ...and the next command reaches the device.
+            commands.send(Command::QueryEncoding { channel: CHANNEL }).expect("the connection takes commands");
+            let mut seen: Vec<BcMeta> = Vec::new();
+            while seen.last().map(|meta| meta.msg_id) != Some(MSG_ID_GET_COMPRESSION) {
+                seen.push(soon(asked.recv(), "request").await.expect("the device"));
+            }
+            seen
+        };
+        let seen = tokio::select! {
+            () = &mut connection => panic!("the connection ended after a refused stream"),
+            seen = script => seen,
+        };
+        // The device was told to stop the stream, once, before the next
+        // command; no logout.
+        let requests: Vec<(u32, u8)> = seen.iter().map(|meta| (meta.msg_id, meta.channel_id)).collect();
+        let stopped = [(MSG_ID_VIDEO, CHANNEL), (MSG_ID_VIDEO_STOP, CHANNEL), (MSG_ID_GET_COMPRESSION, CHANNEL)];
+        assert_eq!(requests, stopped);
+        assert!(heard(&events).is_empty());
+        // The session ends with `Shutdown` only, on the device too.
+        commands.send(Command::Shutdown).expect("the connection takes commands");
+        soon(connection, "end of the connection").await;
+        assert_eq!(soon(asked.recv(), "logout").await.map(|meta| meta.msg_id), Some(MSG_ID_LOGOUT));
+        soon(device, "end of the device").await.expect("the device");
+        assert!(heard(&events).is_empty());
+        window.join().expect("the window's thread");
     }
 }
