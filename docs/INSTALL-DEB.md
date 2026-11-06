@@ -5,8 +5,8 @@ derived from them that have at least those library versions, on x86_64.
 You need `sudo` and the package from the
 [latest release](https://github.com/derSobi/Reoling/releases/latest),
 `reoling_<version>-1_amd64.deb`. It is built on Ubuntu 24.04 LTS, so it
-installs on 24.04 and everything newer. On another distribution, use the
-[AppImage](INSTALL-APPIMAGE.md).
+installs on 24.04 and everything newer. On another distribution, use one
+of the [AppImages](INSTALL-APPIMAGE.md).
 
 ## Install
 
@@ -87,7 +87,7 @@ devices, the settings and the passwords stay.
    ```
 
 This removes what the package installed. What Reoling keeps in your home
-folder stays, for the .deb and the AppImage alike; delete it by hand if
+folder stays, for the .deb and the AppImages alike; delete it by hand if
 you want it gone:
 
 - `~/.config/reoling`: the devices and the settings;
@@ -98,7 +98,7 @@ you want it gone:
 
 ## Troubleshooting
 
-- **Reoling is missing from the applications menu.** The AppImage ran on
+- **Reoling is missing from the applications menu.** An AppImage ran on
   this machine before and its file is gone: its per-user menu entry hides
   the .deb's. Quit Reoling if it runs, then start `reoling` once from a
   terminal, and the .deb's entry takes over; see
