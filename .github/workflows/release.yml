@@ -263,7 +263,9 @@ jobs:
           requirements "$APP_ONLY" "$appimage_sink" "Plugins: the system's, under the AppImage"
           # Then the .deb, installed; it does none of the above, and its
           # start removes the per-user desktop entry the AppImage started
-          # last wrote, which would hide the .deb's own.
+          # last wrote, which would hide the .deb's own. (The runner has no
+          # GTK 4 sink besides the .deb's; deb-distributions runs it beside
+          # a distribution's.)
           sudo apt-get install -y ./dist/reoling_*.deb
           test "$(xvfb-run -a reoling --version)" = "reoling $VERSION"
           smoke reoling
@@ -338,10 +340,35 @@ jobs:
           SCENARIO: ${{ matrix.scenario }}
         run: scripts/smoke-app-only-in-docker.sh "$APP_ONLY" "$SCENARIO"
 
+  deb-distributions:
+    # The .deb on the distributions that have a GTK 4 sink of their own
+    # (gstreamer1.0-gtk4; Ubuntu 24.04 has none): the app must still use the
+    # .deb's, and start and report as on the runner.
+    name: .deb on ${{ matrix.scenario }}
+    needs: packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [ubuntu-26.04-gtk4, debian-13-gtk4]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: reoling-packages
+          path: dist
+
+      - name: Smoke test in a container
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+        run: scripts/smoke-deb-in-docker.sh dist/reoling_*.deb "$SCENARIO"
+
   release:
     # Only files every test passed for reach the release.
     name: Upload to the release
-    needs: [packages, app-only-distributions]
+    needs: [packages, app-only-distributions, deb-distributions]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 15

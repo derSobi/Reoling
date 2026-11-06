@@ -19,7 +19,7 @@
 # Display line must be there, name the expected plugin, and the missing
 # features must be exactly the expected ones.
 #
-#   scripts/assert-requirements.sh <program> <status> <gaps> <sink> [<text>...]
+#   scripts/assert-requirements.sh <program> <status> <gaps> <sink> [<text>...] [--absent <text>...]
 #
 #   program  the AppImage, or reoling (found in PATH) for the .deb
 #   status   the status it must end with: 0, 1 or 2
@@ -30,6 +30,9 @@
 #            bash pattern (extglob: @(a|b) for either)
 #   text     what the report must also say, each a fixed string (an install
 #            command, the embed AppImage's name)
+#   --absent what the report must not say, each text after it a fixed string
+#            (the package of a plugin the system has loaded, which installing
+#            again would not change)
 #
 # Environment:
 #   SINK_VERSION  the gtk4paintablesink version the Display line must name;
@@ -39,11 +42,22 @@ shopt -s extglob
 export LC_ALL=C.UTF-8
 
 if [ $# -lt 4 ]; then
-    echo "usage: $0 <program> <status> <gaps> <sink> [<text>...]" >&2
+    echo "usage: $0 <program> <status> <gaps> <sink> [<text>...] [--absent <text>...]" >&2
     exit 2
 fi
 program=$1 status=$2 gaps=$3 sink=$4
 shift 4
+# The texts to find, and after --absent those not to.
+texts=()
+absent=()
+while [ $# -gt 0 ] && [ "$1" != --absent ]; do
+    texts+=("$1")
+    shift
+done
+if [ $# -gt 0 ]; then
+    shift
+    absent=("$@")
+fi
 fail() { echo "FAIL requirements of $program: $*" >&2; exit 1; }
 
 if [ -z "${SINK_VERSION:-}" ]; then
@@ -125,7 +139,14 @@ else
     [ "$found_list" = "$expected_list" ] || fail "missing features reported: $found_list; expected $expected_list"
 fi
 
-for text in "$@"; do
+for text in "${texts[@]}"; do
     grep -qF -- "$text" "$report" || fail "the report does not say: $text"
 done
-echo "requirements of $program: status $rc, missing ${found_list:-nothing}, gtk4paintablesink $version ($file)"
+for text in "${absent[@]}"; do
+    [ -n "$text" ] || fail "an empty text after --absent"
+    match=$(grep -nF -- "$text" "$report" | head -n1 || true)
+    [ -z "$match" ] || fail "the report must not say $text, but its line ${match%%:*} does: ${match#*:}"
+done
+summary="requirements of $program: status $rc, missing ${found_list:-nothing}, gtk4paintablesink $version ($file)"
+[ ${#absent[@]} -eq 0 ] || summary+="; not said: $(printf '%s, ' "${absent[@]}" | sed 's/, $//')"
+echo "$summary"
