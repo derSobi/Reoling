@@ -47,10 +47,11 @@
 # plugin registry of its own whose one gtk4paintablesink is the AppImage's.
 # Then its requirements report (scripts/assert-requirements.sh,
 # `reoling --check-requirements`) must end with the scenario's status, report
-# exactly the scenario's missing features and name the AppImage's
-# gtk4paintablesink, in the version scripts/build-gst-gtk4-plugin.sh builds;
-# the line the app prints at start for what is missing must be there exactly
-# where something is.
+# exactly the scenario's missing features, name the AppImage's
+# gtk4paintablesink, in the version scripts/build-gst-gtk4-plugin.sh builds,
+# and not name the package of a plugin the scenario has loaded; the line the
+# app prints at start for what is missing must be there exactly where
+# something is.
 #
 #   scripts/smoke-app-only-in-docker.sh <AppImage> [<scenario>...]   (default: all)
 #
@@ -229,7 +230,7 @@ SH
 # for 20 s, then reports its requirements.
 run() {
     local log=/tmp/smoke/run.log maps=/tmp/smoke/maps.txt rc=0 job pid lines count gtk registry sinks element
-    local texts=()
+    local texts=() absent=()
     fresh_home
     echo "=== $scenario: $(. /etc/os-release && echo "$PRETTY_NAME"), with GTK 4 and GStreamer"
     # Meanwhile, once the app has mapped GTK (the runtime unpacks the image
@@ -296,14 +297,19 @@ run() {
     echo "registry $(basename "$registry"): $ELEMENTS"
     # The report, with the scenario's status, gaps and texts, and the plugins
     # the system's, as the hook told the app; where something is missing, it
-    # points at the embed AppImage by the release's own file name.
+    # points at the embed AppImage by the release's own file name. The texts
+    # it must not say follow --absent.
     if [ -n "${EXPECT_TEXTS:-}" ]; then
         IFS=';' read -r -a texts <<< "$EXPECT_TEXTS"
     fi
     texts+=("Plugins: the system's, under the AppImage")
     [ "$EXPECT_STATUS" = 0 ] || texts+=("Or use $BUNDLED_NAME")
+    if [ -n "${ABSENT_TEXTS:-}" ]; then
+        IFS=';' read -r -a absent <<< "$ABSENT_TEXTS"
+        absent=(--absent "${absent[@]}")
+    fi
     bash /smoke/assert-requirements.sh /smoke/Reoling.AppImage "$EXPECT_STATUS" "$EXPECT_GAPS" \
-        '*/appimage_extracted_*/usr/lib/gstreamer-1.0/libgstgtk4.so' "${texts[@]}" \
+        '*/appimage_extracted_*/usr/lib/gstreamer-1.0/libgstgtk4.so' "${texts[@]}" "${absent[@]}" \
         || fail "the requirements report (above)"
     echo "PASS $scenario: started, requirements as expected"
 }
@@ -400,7 +406,9 @@ harness() {
 # the desktop, the distribution's GTK 4 sink where it has one), the elements
 # its registry must have, and the requirements report it must give: status,
 # missing features, texts (';' between them; "Or use <the embed AppImage>"
-# is added wherever something is missing). The reports are the app's
+# is added wherever something is missing) and the texts it must not give
+# (';' between them: the packages of the plugins loaded there, which the app
+# names only for a plugin that is not). The reports are the app's
 # (src/ui/requirements.rs); "measured" rows rest on these containers' plugin
 # lists (gst-inspect-1.0 in the hook's environment), the others on the
 # packages' contents. A one-image scenario may also give the package
@@ -409,7 +417,7 @@ harness() {
 full="appsrc queue decodebin videoconvert h264parse h265parse avdec_h264 avdec_h265 avdec_aac gtk4paintablesink"
 openh264="appsrc queue decodebin videoconvert h264parse h265parse openh264dec avdec_aac gtk4paintablesink"
 scenario_setup() {
-    expect_texts="" installer_options="" rpms_installed="" rpms_absent=""
+    expect_texts="" absent_texts="" installer_options="" rpms_installed="" rpms_absent=""
     case $1 in
         ubuntu-24.04-bare)
             base=ubuntu:24.04 setup=two-phase extras=gstreamer1.0-alsa elements=$full status=0 gaps=none ;;
@@ -442,29 +450,35 @@ scenario_setup() {
         fedora-44)
             # Measured: openh264dec (with Cisco's openh264, not the stub),
             # no avdec_h264 or avdec_h265: FFmpeg without H.264 and H.265
-            # until RPM Fusion's.
+            # until RPM Fusion's. gst-libav is loaded (avdec_aac), so its
+            # package is not named.
             base=fedora:44 setup=two-phase extras=gstreamer1-plugin-gtk4 elements=$openh264
-            status=1 gaps=h265 expect_texts="dnf swap ffmpeg-free ffmpeg --allowerasing" ;;
+            status=1 gaps=h265 expect_texts="dnf swap ffmpeg-free ffmpeg --allowerasing"
+            absent_texts="gstreamer1-plugin-libav" ;;
         fedora-44-noopenh264)
             # A stock Fedora desktop: the install command's packages with
             # noopenh264 in place of openh264 (fedora-cisco-openh264 left
             # out). openh264dec registers but cannot start, so the app counts
             # no H.264 decoder. Its plugin is loaded, so the app names the
             # library alone (sudo dnf install openh264), not the plugin's
-            # package, and says that it replaces the noopenh264 stand-in.
+            # package, and says that it replaces the noopenh264 stand-in;
+            # gst-libav is loaded too (avdec_aac), so its package is not
+            # named either.
             base=fedora:44 setup=one-image elements=$openh264
             installer_options="--disablerepo='fedora-cisco-openh264*'"
             extras="gtk4 gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free"
             extras+=" gstreamer1-plugin-libav gstreamer1-plugin-openh264 noopenh264 gstreamer1-plugin-gtk4"
             rpms_installed=noopenh264 rpms_absent=openh264 status=1 gaps=h264,h265
-            expect_texts="sudo dnf install openh264;noopenh264;dnf swap ffmpeg-free ffmpeg --allowerasing" ;;
+            expect_texts="sudo dnf install openh264;noopenh264;dnf swap ffmpeg-free ffmpeg --allowerasing"
+            absent_texts="gstreamer1-plugin-openh264;gstreamer1-plugin-libav" ;;
         opensuse-tumbleweed)
             # Measured: openh264dec, no avdec_h264 or avdec_h265 (Packman
             # has them). Which openh264 library is installed is printed; the
             # stub's decoder would make H.264 a gap too, where the app tells
-            # it apart.
+            # it apart. gst-libav is loaded (avdec_aac), so its package is
+            # not named.
             base=opensuse/tumbleweed setup=two-phase extras="" elements=$openh264
-            status=1 gaps=h265 expect_texts="opi codecs" ;;
+            status=1 gaps=h265 expect_texts="opi codecs" absent_texts="gstreamer-plugins-libav" ;;
         archlinux)
             base=archlinux:latest setup=two-phase extras=gst-plugin-gtk4 elements=$full status=0 gaps=none ;;
         *) echo "no such scenario: $1 (scenarios: $(xargs <<< "$all_scenarios"))" >&2; return 1 ;;
@@ -487,7 +501,8 @@ build_image() {
 in_container() {
     docker run --rm --network none \
         -e EXPECT_LINE="$line" -e BUNDLED_NAME="$bundled_name" -e SINK_VERSION="$sink_version" \
-        -e EXPECT_STATUS="$status" -e EXPECT_GAPS="$gaps" -e EXPECT_TEXTS="$expect_texts" -e ELEMENTS="$elements" \
+        -e EXPECT_STATUS="$status" -e EXPECT_GAPS="$gaps" -e EXPECT_TEXTS="$expect_texts" \
+        -e ABSENT_TEXTS="$absent_texts" -e ELEMENTS="$elements" \
         -v "$appimage:/smoke/Reoling.AppImage:ro" -v "$self:/smoke/smoke-app-only-in-docker.sh:ro" \
         -v "$here/assert-requirements.sh:/smoke/assert-requirements.sh:ro" \
         "$1" bash /smoke/smoke-app-only-in-docker.sh --inside "$2" "$scenario"

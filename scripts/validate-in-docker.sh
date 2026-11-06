@@ -15,13 +15,14 @@
 #
 # The workflow then starts the AppImages in containers for other systems
 # (scripts/smoke-appimage-in-docker.sh for the embed AppImage,
-# scripts/smoke-app-only-in-docker.sh for the system AppImage), which cannot
-# be done from inside a container. Run on the host with --host, this script
-# does both:
+# scripts/smoke-app-only-in-docker.sh for the system AppImage) and the .deb
+# beside a distribution's own GTK 4 sink (scripts/smoke-deb-in-docker.sh),
+# which cannot be done from inside a container. Run on the host with --host,
+# this script does both:
 #
 #   scripts/validate-in-docker.sh --host /some/output
 #       the rehearsal above in a fresh ubuntu:24.04 container, then the
-#       container smoke tests on the AppImages it built
+#       container smoke tests on the AppImages and the .deb it built
 #   scripts/validate-in-docker.sh --host /some/output <AppImage>...
 #       the smoke tests of one or both AppImages built elsewhere: in an
 #       Ubuntu 24.04 container with the workflow's packages (the embed one
@@ -74,6 +75,11 @@ if [ "${1:-}" = --host ]; then
         bundled="$out/$(appimage_file_name bundled "$version")"
         app_only="$out/$(appimage_file_name app-only "$version")"
     fi
+    # The .deb, where this run built it.
+    deb=""
+    if [ $# -eq 0 ]; then
+        deb=$(ls "$out"/reoling_*.deb 2>/dev/null | head -n1 || true)
+    fi
     if [ -n "$bundled" ]; then
         "$repo/scripts/smoke-appimage-in-docker.sh" "$bundled"
     fi
@@ -83,9 +89,8 @@ if [ "${1:-}" = --host ]; then
             scenarios=(ubuntu-24.04-bare ubuntu-24.04-desktop ubuntu-24.04-notify ubuntu-24.04-zenity-fails
                        ubuntu-24.04-zenity-closed ubuntu-24.04-zenity-no-display)
         fi
-        # The .deb's dependencies, where this run built the .deb.
-        deb=$(ls "$out"/reoling_*.deb 2>/dev/null | head -n1 || true)
-        if [ $# -eq 0 ] && [ -n "$deb" ]; then
+        # The .deb's dependencies.
+        if [ -n "$deb" ]; then
             [ ${#scenarios[@]} -eq 0 ] || scenarios+=(ubuntu-24.04-deb-deps)
             DEB=$deb "$repo/scripts/smoke-app-only-in-docker.sh" "$app_only" "${scenarios[@]}"
         elif [ ${#scenarios[@]} -eq 0 ]; then
@@ -97,9 +102,12 @@ if [ "${1:-}" = --host ]; then
             "$repo/scripts/smoke-app-only-in-docker.sh" "$app_only" "${scenarios[@]}"
         fi
     fi
+    if [ -n "$deb" ]; then
+        "$repo/scripts/smoke-deb-in-docker.sh" "$deb"
+    fi
     echo
-    echo "validated ${bundled:+$bundled }${app_only:+$app_only}: the Ubuntu 24.04 smoke tests and the container" \
-         "smoke tests passed"
+    echo "validated ${bundled:+$bundled }${app_only:+$app_only}${deb:+ $deb}: the Ubuntu 24.04 smoke tests and the" \
+         "container smoke tests passed"
     exit 0
 fi
 
