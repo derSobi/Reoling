@@ -6,6 +6,7 @@ use crate::ui::icon;
 use glib::translate::{FromGlib, IntoGlib};
 use gstreamer::prelude::*;
 use gtk4::glib::{self, KeyFile, KeyFileFlags};
+use reoling::VideoType;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -105,6 +106,9 @@ pub struct Settings {
     /// `~/Videos/Reoling`.
     pub screenshot_dir: Option<String>,
     pub recording_dir: Option<String>,
+    /// The missing parts the user asked not to hear about again at start
+    /// (see `requirements::Report::dismiss_key`).
+    pub requirements_dismissed: Option<String>,
 }
 
 fn path() -> PathBuf {
@@ -123,6 +127,7 @@ impl Default for Settings {
             auto_live_view: true,
             screenshot_dir: None,
             recording_dir: None,
+            requirements_dismissed: None,
         }
     }
 }
@@ -152,6 +157,7 @@ impl Settings {
             screenshot_dir: get("screenshot_dir").filter(|s| !s.is_empty()),
             recording_dir: get("recording_dir").filter(|s| !s.is_empty()),
             volume: get("volume").and_then(|v| v.parse().ok()).map_or(0.5, |v: f64| v.clamp(0.0, 1.0)),
+            requirements_dismissed: get("requirements_dismissed").filter(|s| !s.is_empty()),
         }
     }
 
@@ -182,6 +188,7 @@ impl Settings {
         file.set_string("settings", "screenshot_dir", self.screenshot_dir.as_deref().unwrap_or(""));
         file.set_string("settings", "recording_dir", self.recording_dir.as_deref().unwrap_or(""));
         file.set_string("settings", "hardware_decoder", self.hardware_decoder.as_deref().unwrap_or(""));
+        file.set_string("settings", "requirements_dismissed", self.requirements_dismissed.as_deref().unwrap_or(""));
         let path = path();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -293,9 +300,142 @@ pub fn latency() -> std::time::Duration {
     std::time::Duration::from_millis(LATENCY_MS.load(Ordering::Relaxed))
 }
 
-/// Whether new pipelines must use software decoders only.
-pub fn force_software() -> bool {
-    FORCE_SOFTWARE.load(Ordering::Relaxed)
+/// Whether new pipelines for `video_type` must use software decoders only:
+/// "Software" is set and a software decoder for the codec is installed (see
+/// `software_fallback`).
+pub fn force_software(video_type: VideoType) -> bool {
+    FORCE_SOFTWARE.load(Ordering::Relaxed) && !fallback_slot(video_type).load(Ordering::Relaxed)
+}
+
+/// Which kinds of decoder decodebin can pick for one codec.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Installed {
+    pub software: bool,
+    pub hardware: bool,
+}
+
+impl Installed {
+    pub fn any(self) -> bool {
+        self.software || self.hardware
+    }
+}
+
+/// `Installed` from each decoder's kind (hardware or not) and the rank
+/// GStreamer gave it: decodebin leaves out anything below MARGINAL.
+fn installed_of(decoders: impl IntoIterator<Item = (bool, i32)>) -> Installed {
+    let marginal = gstreamer::Rank::MARGINAL.into_glib();
+    let mut installed = Installed::default();
+    for (hardware, _) in decoders.into_iter().filter(|(_, rank)| *rank >= marginal) {
+        if hardware {
+            installed.hardware = true;
+        } else {
+            installed.software = true;
+        }
+    }
+    installed
+}
+
+fn media_of(video_type: VideoType) -> &'static str {
+    match video_type {
+        VideoType::H264 => "video/x-h264",
+        VideoType::H265 => "video/x-h265",
+    }
+}
+
+/// Whether `factory` takes `media` on its sink pad.
+fn handles(factory: &gstreamer::ElementFactory, media: &str) -> bool {
+    factory
+        .static_pad_templates()
+        .iter()
+        .any(|t| t.direction() == gstreamer::PadDirection::Sink && t.caps().to_string().contains(media))
+}
+
+/// The decoders decodebin can pick for `video_type`, at the ranks GStreamer
+/// gave them (whatever a Decoding mode changed since, see `original_rank`).
+pub fn installed_decoders(video_type: VideoType) -> Installed {
+    installed_among(&video_decoders(), video_type)
+}
+
+/// `installed_decoders` among `decoders` (see `video_decoders`).
+fn installed_among(decoders: &[(gstreamer::ElementFactory, bool)], video_type: VideoType) -> Installed {
+    let media = media_of(video_type);
+    let candidates: Vec<(glib::GString, bool, i32)> = decoders
+        .iter()
+        .filter(|(factory, _)| handles(factory, media))
+        .map(|(factory, hardware)| (factory.name(), *hardware, original_rank(factory)))
+        .collect();
+    let candidates: Vec<(&str, bool, i32)> =
+        candidates.iter().map(|(name, hardware, rank)| (name.as_str(), *hardware, *rank)).collect();
+    installed_with_openh264(&candidates, openh264_starts)
+}
+
+/// `installed_of` over each decoder's name, kind (hardware or not) and rank,
+/// where OpenH264's decoder counts only if `starts` says it can start (see
+/// `openh264_starts`), which is asked only where it is the one software
+/// decoder decodebin would consider.
+fn installed_with_openh264(decoders: &[(&str, bool, i32)], starts: impl FnOnce() -> bool) -> Installed {
+    let mut installed = installed_of(decoders.iter().map(|(_, hardware, rank)| (*hardware, *rank)));
+    let marginal = gstreamer::Rank::MARGINAL.into_glib();
+    let mut software =
+        decoders.iter().filter(|(_, hardware, rank)| !hardware && *rank >= marginal).map(|(name, _, _)| *name);
+    let only_openh264 = software.next() == Some(OPENH264_DECODER) && software.next().is_none();
+    if only_openh264 && !starts() {
+        installed.software = false;
+    }
+    installed
+}
+
+const OPENH264_DECODER: &str = "openh264dec";
+
+/// Whether OpenH264's decoder can start here. Fedora installs `noopenh264`, a
+/// stand-in for the OpenH264 library that decodes nothing, until the real one
+/// from its fedora-cisco-openh264 repository replaces it: openh264dec is
+/// registered all the same (rank MARGINAL), then fails to start, and
+/// decodebin finds no decoder. Measured in a fedora:44 container
+/// (2026-11-06): with the stand-in the element does not reach PAUSED ("Failed
+/// to create OpenH264 decoder"), with the real library it does, and decodes.
+/// Asked once, and only where openh264dec is the one software H.264 decoder
+/// (see `installed_among`): a system with another one never loads it here.
+fn openh264_starts() -> bool {
+    static STARTS: OnceLock<bool> = OnceLock::new();
+    *STARTS.get_or_init(|| {
+        let Ok(decoder) = gstreamer::ElementFactory::make(OPENH264_DECODER).build() else { return false };
+        let started = decoder.set_state(gstreamer::State::Paused).is_ok();
+        let _ = decoder.set_state(gstreamer::State::Null);
+        started
+    })
+}
+
+/// The codecs "Software" decodes as "Auto" does, for want of a software
+/// decoder (see `software_fallback`).
+static SOFTWARE_FALLBACK: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+const CODECS: [VideoType; 2] = [VideoType::H264, VideoType::H265];
+
+fn fallback_slot(video_type: VideoType) -> &'static AtomicBool {
+    &SOFTWARE_FALLBACK[match video_type {
+        VideoType::H264 => 0,
+        VideoType::H265 => 1,
+    }]
+}
+
+fn codec_label(video_type: VideoType) -> &'static str {
+    match video_type {
+        VideoType::H264 => "H.264",
+        VideoType::H265 => "H.265",
+    }
+}
+
+/// Whether "Software" leaves a codec to decode as "Auto": with no software
+/// decoder for it, forcing software would leave decodebin none at all (a
+/// black picture), as "Hardware" without a hardware decoder would (see
+/// `effective_decoding`).
+fn software_fallback(mode: Decoding, software_installed: bool) -> bool {
+    mode == Decoding::Software && !software_installed
+}
+
+/// The codecs "Software" decodes as "Auto" does, for System Status.
+pub fn software_fallback_codecs() -> Vec<&'static str> {
+    CODECS.into_iter().filter(|codec| fallback_slot(*codec).load(Ordering::Relaxed)).map(codec_label).collect()
 }
 
 /// One hardware decoder (a GPU or a decoding engine), possibly offering both
@@ -563,6 +703,22 @@ fn apply_decoding(settings: &Settings) {
     if !fallback {
         HARDWARE_FALLBACK.store(false, Ordering::Relaxed);
     }
+    // "Software" for a codec without a software decoder would leave decodebin
+    // none (Fedora has none for H.265 without RPM Fusion): that codec decodes
+    // as "Auto", the other stays in software (see `force_software`).
+    let mut decodes_as_auto = false;
+    for codec in CODECS {
+        // Only "Software" looks at which decoders there are.
+        let fallback =
+            mode == Decoding::Software && software_fallback(mode, installed_among(&decoders, codec).software);
+        if fallback && !fallback_slot(codec).swap(true, Ordering::Relaxed) {
+            eprintln!("no software {} decoder found: \"Software\" decoding runs it as Auto", codec_label(codec));
+        }
+        if !fallback {
+            fallback_slot(codec).store(false, Ordering::Relaxed);
+        }
+        decodes_as_auto |= fallback;
+    }
     // A chosen device that is not there any more does not narrow the pick.
     let chosen = settings.hardware_decoder.as_deref().filter(|key| available.iter().any(|d| d.key == *key));
     for (factory, hardware) in &decoders {
@@ -571,7 +727,10 @@ fn apply_decoding(settings: &Settings) {
             never(factory);
         }
     }
-    if let Some(prefer) = mode.preferred_gpu() {
+    // A codec "Software" decodes as Auto gets Auto's order too. That moves
+    // only hardware decoders, which force-sw-decoders keeps away from the
+    // codec that stays in software.
+    if let Some(prefer) = mode.preferred_gpu().or(decodes_as_auto.then_some(GpuKind::Integrated)) {
         let primary = gstreamer::Rank::PRIMARY.into_glib();
         let ranked: Vec<Ranked> = decoders
             .iter()
@@ -797,6 +956,63 @@ mod tests {
         assert_eq!(effective_decoding(Decoding::Hardware, true), Decoding::Hardware);
         // Without one, "Hardware" must not leave decodebin empty-handed.
         assert_eq!(effective_decoding(Decoding::Hardware, false), Decoding::AutoIntegrated);
+    }
+
+    #[test]
+    fn software_without_a_software_decoder_decodes_as_auto() {
+        // Fedora without RPM Fusion: no software H.265 decoder at all.
+        assert!(software_fallback(Decoding::Software, false));
+        assert!(!software_fallback(Decoding::Software, true));
+        // Every other mode is applied as before, decoders or not.
+        for mode in [Decoding::AutoIntegrated, Decoding::AutoDedicated, Decoding::Hardware] {
+            for installed in [true, false] {
+                assert!(!software_fallback(mode, installed), "{mode:?}, software decoder {installed}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_decoders_decodebin_considers_count() {
+        // Below MARGINAL decodebin never plugs a decoder.
+        let marginal = gstreamer::Rank::MARGINAL.into_glib();
+        assert_eq!(installed_of([(true, 0)]), Installed::default());
+        assert_eq!(installed_of([(false, marginal - 1)]), Installed::default());
+        assert_eq!(installed_of([(false, marginal)]), Installed { software: true, hardware: false });
+        assert_eq!(installed_of([(true, 257), (true, 0)]), Installed { software: false, hardware: true });
+        assert!(!installed_of([]).any());
+        // A hardware decoder alone is enough.
+        assert!(installed_of([(true, 257)]).any());
+        // This machine's H.265 decoders: software and hardware.
+        let decoders = this_machine(GpuKind::Integrated, GpuKind::Dedicated);
+        let h265 = installed_of(decoders.iter().filter(|d| d.name.contains("265")).map(|d| (d.hardware, d.rank)));
+        assert_eq!(h265, Installed { software: true, hardware: true });
+        // Only its rank-0 Vulkan decoder for H.264 counts for nothing.
+        let vulkan = decoders.iter().filter(|d| d.name.starts_with("vulkan")).map(|d| (d.hardware, d.rank));
+        let vulkan = installed_of(vulkan);
+        assert!(!vulkan.any());
+    }
+
+    #[test]
+    fn openh264_counts_only_if_it_starts_and_is_asked_only_when_alone() {
+        let marginal = gstreamer::Rank::MARGINAL.into_glib();
+        let never = || -> bool { panic!("OpenH264's decoder was started with another software decoder there") };
+        // Fedora's stand-in library: registered, but it cannot start.
+        let stand_in = [("openh264dec", false, marginal)];
+        assert_eq!(installed_with_openh264(&stand_in, || false), Installed::default());
+        // The real library.
+        assert_eq!(installed_with_openh264(&stand_in, || true), Installed { software: true, hardware: false });
+        // Another software decoder there: OpenH264 is not asked (not loaded).
+        let with_libav = [("openh264dec", false, marginal), ("avdec_h264", false, 256)];
+        assert_eq!(installed_with_openh264(&with_libav, never), Installed { software: true, hardware: false });
+        let libav_only = [("avdec_h264", false, 256)];
+        assert_eq!(installed_with_openh264(&libav_only, never), Installed { software: true, hardware: false });
+        // Below MARGINAL decodebin never plugs it: it counts for nothing,
+        // and is not asked either.
+        let ranked_out = [("openh264dec", false, marginal - 1), ("vah264dec", true, 256)];
+        assert_eq!(installed_with_openh264(&ranked_out, never), Installed { software: false, hardware: true });
+        // The stand-in with a GPU decoder: the hardware one still counts.
+        let with_gpu = [("vah264dec", true, 256), ("openh264dec", false, marginal)];
+        assert_eq!(installed_with_openh264(&with_gpu, || false), Installed { software: false, hardware: true });
     }
 
     #[test]

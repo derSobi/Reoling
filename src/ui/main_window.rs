@@ -207,6 +207,12 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
 
     let settings = Settings::load();
     settings.apply();
+    // One line on stderr when this system lacks something (see
+    // `requirements`); nothing otherwise. Here, not in main(): only the
+    // first instance builds the window.
+    if let Some(line) = crate::ui::requirements::check().summary_line() {
+        eprintln!("{line}");
+    }
 
     let audio = Arc::new(AudioOutput::new(settings.volume));
     let video = Rc::new(VideoView::new());
@@ -917,7 +923,8 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
     // device or page left meanwhile would otherwise show on the new one, or
     // build a pipeline nobody sees. Such a request goes unanswered and its
     // frame is dropped. A codec change (sub to main stream) builds a new
-    // pipeline.
+    // pipeline. A sink this system cannot build is answered with why; the
+    // page shows it and pauses (see `PlaybackPage::picture_unavailable`).
     let weak = Rc::downgrade(&main);
     glib::spawn_future_local(async move {
         while let Some((session, video_type, reply)) = replay_sink_request_rx.recv().await {
@@ -925,6 +932,22 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             if m.playback.shows_session(session) {
                 let _ = reply.send(m.replay_video.ensure_sink_for(video_type));
             }
+        }
+    });
+
+    // Why a picture cannot be shown (an element or a decoder this system
+    // lacks, see `requirements`): said over the live picture; the Playback
+    // page pauses with it.
+    let weak = Rc::downgrade(&main);
+    main.video.connect_problem(move |text| {
+        if let Some(m) = weak.upgrade() {
+            m.picture_problem(text);
+        }
+    });
+    let weak = Rc::downgrade(&main);
+    main.replay_video.connect_problem(move |text| {
+        if let Some(m) = weak.upgrade() {
+            m.playback.picture_unavailable(text);
         }
     });
 
@@ -961,6 +984,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
     }
 
     window.present();
+    main.warn_about_requirements();
     main
 }
 
@@ -1077,6 +1101,31 @@ impl MainWindow {
     fn show_message(&self, text: &str) {
         self.message.set_text(text);
         self.message.set_visible(true);
+    }
+
+    /// The watched stream cannot be shown (see `VideoView::connect_problem`):
+    /// why, over the picture. The stream runs on (its sound, a recording),
+    /// and the stream selector stays usable for one that can be shown.
+    fn picture_problem(&self, text: &str) {
+        if self.playing_key().is_some() {
+            self.show_message(text);
+        }
+    }
+
+    /// Says at start what this system lacks (see `requirements`), unless the
+    /// user asked not to hear about this very set of missing parts again.
+    fn warn_about_requirements(self: &Rc<Self>) {
+        let report = crate::ui::requirements::check();
+        let Some(key) = report.dismiss_key() else { return };
+        if self.settings.borrow().requirements_dismissed.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        let this = Rc::clone(self);
+        crate::ui::requirements::show_dialog(self.window.upcast_ref(), report, move || {
+            let mut settings = this.settings.borrow_mut();
+            settings.requirements_dismissed = Some(key.clone());
+            settings.save();
+        });
     }
 
     fn device(&self, key: &str) -> Option<Device> {
@@ -2100,7 +2149,13 @@ impl MainWindow {
             }
             DeviceEvent::Playing => {
                 if self.playing_key().as_deref() == Some(key) {
-                    self.message.set_visible(false);
+                    // A stream no decoder takes keeps saying so (see
+                    // `picture_problem`): the watch on its bus and this event
+                    // come by different ways, in either order.
+                    match self.video.problem() {
+                        Some(text) => self.show_message(&text),
+                        None => self.message.set_visible(false),
+                    }
                     self.streaming.set(true);
                     self.refused.set(false);
                     self.update_controls();

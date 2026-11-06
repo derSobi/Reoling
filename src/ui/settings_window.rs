@@ -504,6 +504,9 @@ fn system_status(parent: &Window, decoding: Decoding) {
             Decoding::Software => "Software",
         }
     ));
+    for codec in settings::software_fallback_codecs() {
+        lines.push(format!("{codec}: no software decoder installed, decoded as Auto"));
+    }
     lines.push(format!(
         "Live view decoder: {}",
         settings::decoder_in_use(false).unwrap_or_else(|| "none started yet".to_string())
@@ -511,6 +514,7 @@ fn system_status(parent: &Window, decoding: Decoding) {
     if let Some(replay) = settings::decoder_in_use(true) {
         lines.push(format!("Playback decoder: {replay}"));
     }
+    lines.extend(crate::ui::requirements::check().status_lines());
     lines.push(format!("Settings: {}", glib::user_config_dir().join("reoling").join("settings.ini").display()));
     let text = Label::new(Some(&lines.join("\n")));
     text.set_selectable(true);

@@ -1,8 +1,10 @@
 use super::zoom_picture::ZoomPicture;
 use gstreamer::prelude::*;
 use gstreamer_app::AppSrc;
+use gtk4::glib;
 use reoling::{VideoFrame, VideoType};
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -95,6 +97,9 @@ pub struct VideoSink {
     /// Set on a replay sink (recorded footage, see `VideoView::new_replay`);
     /// `None` on a live one, whose timing this never touches.
     replay: Option<Arc<Replay>>,
+    /// No decoder took the stream (see `watch_for_no_decoder`): nothing is
+    /// fed to the pipeline any more.
+    no_picture: Arc<AtomicBool>,
 }
 
 /// Writes the incoming H.264/H.265 units into a Matroska file (which stays
@@ -181,13 +186,136 @@ impl Recorder {
     }
 }
 
-pub struct VideoView {
-    picture: ZoomPicture,
+/// Why a view shows no picture, and who hears it (see
+/// `VideoView::connect_problem`).
+#[derive(Default)]
+struct Problem {
+    text: RefCell<Option<String>>,
+    handler: RefCell<Option<Rc<dyn Fn(&str)>>>,
+}
 
+impl Problem {
+    fn connect(&self, handler: impl Fn(&str) + 'static) {
+        *self.handler.borrow_mut() = Some(Rc::new(handler));
+    }
+
+    fn text(&self) -> Option<String> {
+        self.text.borrow().clone()
+    }
+
+    /// Sets the text and tells the handler, holding no borrow while it runs
+    /// (it looks at the view).
+    fn report(&self, text: &str) {
+        *self.text.borrow_mut() = Some(text.to_string());
+        let handler = self.handler.borrow().clone();
+        if let Some(handler) = handler {
+            handler(text);
+        }
+    }
+}
+
+/// A view's sink, and why there is no picture when there is none:
+/// everything of `VideoView` that needs no widget, so that tests can drive
+/// it with sinks of their own.
+#[derive(Default)]
+struct SinkSlot {
     // The codec (H.264 vs H.265) is only known once the first frame
     // arrives, so the pipeline is built lazily on the first ensure_sink()
     // call.
     sink: RefCell<Option<VideoSink>>,
+    /// The last sink built for this codec failed (why): asked again,
+    /// `ensure` answers at once. `take` forgets it.
+    failed: RefCell<Option<(VideoType, String)>>,
+    /// Why the current stream shows no picture (an element or a decoder is
+    /// missing); cleared by `take` and by a sink that builds.
+    problem: Rc<Problem>,
+    /// The current sink's bus watch (see `watch_for_no_decoder`), dropped
+    /// with the sink.
+    bus_watch: RefCell<Option<gstreamer::bus::BusWatchGuard>>,
+}
+
+impl SinkSlot {
+    /// The sink for `video_type`: the one held, else the one `build` makes,
+    /// kept and handed out from then on. A build that failed is kept too,
+    /// for its codec: asked again, the same `Err` comes at once without
+    /// building, until `take` or a sink that builds (for another codec: the
+    /// failure is then no longer this view's). `problem` hears every `Err`.
+    fn ensure(
+        &self,
+        video_type: VideoType,
+        build: impl FnOnce() -> Result<(VideoSink, Option<gstreamer::bus::BusWatchGuard>), String>,
+    ) -> Result<VideoSink, String> {
+        if let Some(sink) = self.sink.borrow().as_ref() {
+            return Ok(sink.clone());
+        }
+        let failed =
+            self.failed.borrow().as_ref().filter(|(codec, _)| *codec == video_type).map(|(_, why)| why.clone());
+        let built = match failed {
+            Some(why) => Err(why),
+            None => build(),
+        };
+        match built {
+            Ok((sink, watch)) => {
+                *self.bus_watch.borrow_mut() = watch;
+                self.failed.borrow_mut().take();
+                self.problem.text.borrow_mut().take();
+                *self.sink.borrow_mut() = Some(sink.clone());
+                Ok(sink)
+            }
+            Err(why) => {
+                *self.failed.borrow_mut() = Some((video_type, why.clone()));
+                self.problem.report(&why);
+                Err(why)
+            }
+        }
+    }
+
+    /// Lets go of the sink, handed back to be taken down, and of everything
+    /// said about it: its bus watch first, so that nothing of a dying
+    /// pipeline is looked at.
+    fn take(&self) -> Option<VideoSink> {
+        self.bus_watch.borrow_mut().take();
+        self.failed.borrow_mut().take();
+        self.problem.text.borrow_mut().take();
+        self.sink.borrow_mut().take()
+    }
+
+    /// `ensure` for a stream that can change codec on the way: a sink built
+    /// for another codec is taken down first (`reset`, which `take`s it).
+    fn ensure_for(
+        &self,
+        video_type: VideoType,
+        reset: impl FnOnce(),
+        build: impl FnOnce() -> Result<(VideoSink, Option<gstreamer::bus::BusWatchGuard>), String>,
+    ) -> Result<VideoSink, String> {
+        let current = self.sink.borrow().as_ref().map(|sink| sink.video_type);
+        if needs_rebuild(current, video_type) {
+            reset();
+        }
+        self.ensure(video_type, build)
+    }
+
+    /// The picture failed here: a sink could not be built, or no decoder
+    /// takes the one there is.
+    fn has_failed(&self) -> bool {
+        self.failed.borrow().is_some() || self.sink.borrow().as_ref().is_some_and(VideoSink::shows_no_picture)
+    }
+
+    /// `VideoView::retry_picture`: `reset` (which `take`s the sink) only when
+    /// the picture failed; whether it did.
+    fn retry(&self, reset: impl FnOnce()) -> bool {
+        if !self.has_failed() {
+            return false;
+        }
+        reset();
+        true
+    }
+}
+
+pub struct VideoView {
+    picture: ZoomPicture,
+
+    slot: SinkSlot,
 
     /// Whether `ensure_sink` builds replay sinks — see `new_replay`.
     replay: bool,
@@ -201,7 +329,7 @@ impl VideoView {
     pub fn new() -> Self {
         Self {
             picture: ZoomPicture::new(),
-            sink: RefCell::new(None),
+            slot: SinkSlot::default(),
             replay: false,
             replay_volume: std::cell::Cell::new(1.0),
             replay_audio_unavailable: std::cell::Cell::new(false),
@@ -220,13 +348,34 @@ impl VideoView {
     /// `audio::AudioOutput`'s.
     pub fn set_volume(&self, volume: f64) {
         self.replay_volume.set(volume);
-        if let Some(sink) = self.sink.borrow().as_ref() {
+        if let Some(sink) = self.slot.sink.borrow().as_ref() {
             sink.set_replay_volume(volume);
         }
     }
 
     pub fn widget(&self) -> &ZoomPicture {
         &self.picture
+    }
+
+    /// `on_problem` hears (GTK main thread) why this view shows no picture:
+    /// a sink that could not be built, or a stream no decoder takes.
+    pub fn connect_problem(&self, on_problem: impl Fn(&str) + 'static) {
+        self.slot.problem.connect(on_problem);
+    }
+
+    /// Why the current stream shows no picture, if it does not.
+    pub fn problem(&self) -> Option<String> {
+        self.slot.problem.text()
+    }
+
+    /// Play pressed again over footage this view could not show (a sink that
+    /// could not be built, or one no decoder takes): that sink is retired and
+    /// taken down, its watch and what was said about it forgotten, so that
+    /// the next `ensure_sink` builds a new one (another Decoding setting may
+    /// help by now). A sink that shows its picture is kept. Whether there was
+    /// anything to forget.
+    pub fn retry_picture(&self) -> bool {
+        self.slot.retry(|| self.reset())
     }
 
     /// Build:
@@ -261,7 +410,10 @@ impl VideoView {
     /// the same reserve of compressed data is a few MB. decodebin's sink
     /// pad is always-present/static; its *output* is a dynamic pad, so
     /// decodebin -> videoconvert is connected in the pad-added callback.
-    fn build_sink(&self, video_type: VideoType) -> VideoSink {
+    ///
+    /// `Err` says what this system lacks (see `requirements`); the watch on
+    /// the pipeline's bus comes with the sink (see `watch_for_no_decoder`).
+    fn build_sink(&self, video_type: VideoType) -> Result<(VideoSink, Option<gstreamer::bus::BusWatchGuard>), String> {
         let (parse_name, media_type) = match video_type {
             VideoType::H264 => ("h264parse", "video/x-h264"),
             VideoType::H265 => ("h265parse", "video/x-h265"),
@@ -274,9 +426,9 @@ impl VideoView {
          */
         let appsrc = gstreamer::ElementFactory::make("appsrc")
             .build()
-            .expect("appsrc element missing — install gstreamer1.0-plugins-base")
+            .map_err(|_| missing("appsrc"))?
             .downcast::<AppSrc>()
-            .expect("appsrc is always an AppSrc");
+            .map_err(|_| "appsrc is not an AppSrc".to_string())?;
 
         appsrc.set_caps(Some(
             &gstreamer::Caps::builder(media_type)
@@ -298,12 +450,7 @@ impl VideoView {
         let parse = gstreamer::ElementFactory::make(parse_name)
             .property_from_str("config-interval", "-1")
             .build()
-            .unwrap_or_else(|_| {
-                panic!(
-                    "{parse_name} element missing — install the appropriate \
-                     GStreamer parser plugin"
-                )
-            });
+            .map_err(|_| missing(parse_name))?;
 
         /*
          * queue
@@ -332,7 +479,7 @@ impl VideoView {
             .property("max-size-time", 3_000_000_000u64) // 3s
             .property_from_str("leaky", "no")
             .build()
-            .expect("queue element missing — install gstreamer1.0-plugins-base");
+            .map_err(|_| missing("queue"))?;
 
         /*
          * decodebin
@@ -342,9 +489,9 @@ impl VideoView {
          * systems.
          */
         let decodebin = gstreamer::ElementFactory::make("decodebin")
-            .property("force-sw-decoders", crate::ui::settings::force_software())
+            .property("force-sw-decoders", crate::ui::settings::force_software(video_type))
             .build()
-            .expect("decodebin element missing — install gstreamer1.0-plugins-base");
+            .map_err(|_| missing("decodebin"))?;
 
         /*
          * videoconvert
@@ -364,7 +511,7 @@ impl VideoView {
         let convert = gstreamer::ElementFactory::make("videoconvert")
             .property("qos", false)
             .build()
-            .expect("videoconvert element missing — install gstreamer1.0-plugins-base");
+            .map_err(|_| missing("videoconvert"))?;
 
         /*
          * GTK4 video sink
@@ -373,9 +520,7 @@ impl VideoView {
             .name("display")
             .property("max-lateness", -1i64)
             .build()
-            .expect(
-                "gtk4paintablesink missing — install GStreamer GTK4 support",
-            );
+            .map_err(|_| missing("gtk4paintablesink"))?;
 
         /*
          * Add elements.
@@ -389,7 +534,7 @@ impl VideoView {
                 &convert,
                 &sink,
             ])
-            .expect("adding elements to pipeline failed");
+            .map_err(|e| format!("Cannot build the video pipeline: {e}"))?;
 
         /*
          * Static part before decodebin: appsrc -> parse -> queue ->
@@ -397,22 +542,22 @@ impl VideoView {
          */
         appsrc
             .link(&parse)
-            .expect("linking appsrc -> parser failed");
+            .map_err(|e| format!("linking appsrc -> parser failed: {e}"))?;
 
         parse
             .link(&queue)
-            .expect("linking parser -> queue failed");
+            .map_err(|e| format!("linking parser -> queue failed: {e}"))?;
 
         queue
             .link(&decodebin)
-            .expect("linking queue -> decodebin failed");
+            .map_err(|e| format!("linking queue -> decodebin failed: {e}"))?;
 
         /*
          * Static part after decodebin.
          */
         convert
             .link(&sink)
-            .expect("linking videoconvert -> gtk4paintablesink failed");
+            .map_err(|e| format!("linking videoconvert -> gtk4paintablesink failed: {e}"))?;
 
         /*
          * decodebin has dynamic source pads.
@@ -525,6 +670,13 @@ impl VideoView {
             }
         });
 
+        // In place before the first state change: the one failure that
+        // leaves this pipeline without a picture once built.
+        let no_picture = Arc::new(AtomicBool::new(false));
+        let watch = watch_for_no_decoder(&pipeline, &decodebin, &no_picture, &self.slot.problem, move || {
+            crate::ui::requirements::check().no_decoder_text(video_type)
+        });
+
         /*
          * Connect gtk4paintablesink to the ZoomPicture.
          */
@@ -552,11 +704,17 @@ impl VideoView {
             crate::ui::settings::latency().as_millis() as u64,
         ));
 
-        pipeline
-            .set_state(gstreamer::State::Playing)
-            .expect("failed to start GStreamer pipeline");
+        if let Err(e) = pipeline.set_state(gstreamer::State::Playing) {
+            drop(watch);
+            self.picture.set_paintable(None::<&gtk4::gdk::Paintable>);
+            // Off the GTK thread, as `reset` does it.
+            std::thread::spawn(move || {
+                let _ = pipeline.set_state(gstreamer::State::Null);
+            });
+            return Err(format!("Cannot start the video pipeline: {e}"));
+        }
 
-        VideoSink {
+        let sink = VideoSink {
             appsrc,
             pipeline,
             pts_state: Arc::new(Mutex::new(PtsState::default())),
@@ -564,22 +722,15 @@ impl VideoView {
             video_type,
             decoded_frames,
             replay: None,
-        }
+            no_picture,
+        };
+        Ok((sink, watch))
     }
 
-    /// Returns a `Send`-safe handle to this view's `appsrc`, building the
-    /// pipeline first if this is the first call — building (and the
-    /// `self.picture.set_paintable` call inside it) touches a GTK widget,
-    /// so this method itself must still run on the GTK main thread. The
-    /// returned `VideoSink`, unlike this method, does not need to be — see
-    /// its own doc comment. Reconnecting reuses whatever pipeline already
-    /// exists rather than rebuilding (matches this file's prior
-    /// lazy-build-once behavior; a mid-session codec change was never
-    /// supported before this either).
     /// Tears the pipeline down so the next `ensure_sink` builds a fresh one
     /// (a different device or stream can have another codec/resolution).
     pub fn reset(&self) {
-        let old = self.sink.borrow_mut().take();
+        let old = self.slot.take();
         self.picture.set_paintable(None::<&gtk4::gdk::Paintable>);
         if let Some(sink) = old {
             sink.stop_recording();
@@ -595,7 +746,7 @@ impl VideoView {
     /// holds (seconds of buffered video) is not shown. `reset` (or a new
     /// stream) takes the pipeline down later.
     pub fn freeze(&self) {
-        if let Some(sink) = self.sink.borrow().as_ref() {
+        if let Some(sink) = self.slot.sink.borrow().as_ref() {
             let pipeline = sink.pipeline.clone();
             let replay = sink.replay.clone();
             // Off the GTK thread, like the teardown in `reset`. A replay
@@ -612,7 +763,7 @@ impl VideoView {
 
     /// The pipeline's handle, if a stream has built one.
     pub fn current_sink(&self) -> Option<VideoSink> {
-        self.sink.borrow().clone()
+        self.slot.sink.borrow().clone()
     }
 
     /// The picture on screen right now, as a texture.
@@ -630,24 +781,104 @@ impl VideoView {
         Some(renderer.render_texture(&node, None))
     }
 
-    pub fn ensure_sink(&self, video_type: VideoType) -> VideoSink {
-        if self.sink.borrow().is_none() {
-            let sink = if self.replay { self.build_replay_sink(video_type) } else { self.build_sink(video_type) };
-            *self.sink.borrow_mut() = Some(sink);
-        }
-        self.sink.borrow().as_ref().expect("sink must exist after initialization").clone()
+    /// Returns a `Send`-safe handle to this view's `appsrc`, building the
+    /// pipeline first if this is the first call — building (and the
+    /// `self.picture.set_paintable` call inside it) touches a GTK widget,
+    /// so this method itself must still run on the GTK main thread. The
+    /// returned `VideoSink`, unlike this method, does not need to be — see
+    /// its own doc comment. Reconnecting reuses whatever pipeline already
+    /// exists rather than rebuilding (matches this file's prior
+    /// lazy-build-once behavior; a mid-session codec change was never
+    /// supported before this either). `Err` says what this system lacks
+    /// (see `requirements`), and `connect_problem`'s handler hears it, at
+    /// every refusal (a refused codec is not built again until `reset`).
+    pub fn ensure_sink(&self, video_type: VideoType) -> Result<VideoSink, String> {
+        self.slot.ensure(video_type, || self.build_any(video_type))
     }
 
     /// `ensure_sink` for a view whose stream can change codec on the way
     /// (recorded footage: the main stream may be H.265 where the sub stream
     /// is H.264): a sink built for another codec is torn down first and a
     /// new one built. GTK main thread only, like `ensure_sink`.
-    pub fn ensure_sink_for(&self, video_type: VideoType) -> VideoSink {
-        let current = self.sink.borrow().as_ref().map(|sink| sink.video_type);
-        if needs_rebuild(current, video_type) {
-            self.reset();
+    pub fn ensure_sink_for(&self, video_type: VideoType) -> Result<VideoSink, String> {
+        self.slot.ensure_for(video_type, || self.reset(), || self.build_any(video_type))
+    }
+
+    /// A replay sink on a view for recorded footage, a live one otherwise.
+    fn build_any(
+        &self,
+        video_type: VideoType,
+    ) -> Result<(VideoSink, Option<gstreamer::bus::BusWatchGuard>), String> {
+        if self.replay {
+            self.build_replay_sink(video_type)
+        } else {
+            self.build_sink(video_type)
         }
-        self.ensure_sink(video_type)
+    }
+}
+
+/// What the user reads when the element `name` is missing from this system
+/// (see `requirements`).
+fn missing(name: &str) -> String {
+    crate::ui::requirements::check().missing_element_text(name)
+}
+
+/// Whether `message`, from a live or replay pipeline's bus, says for good
+/// that no decoder takes the picture's stream: an error, the terminal message
+/// (not decodebin's `missing-plugin` element message before it), posted by
+/// the video's `decodebin` or an element inside it, of the kinds decodebin
+/// posts when no decoder takes its caps, which are only ever the codec's (a
+/// missing plugin; codec not found). Measured with GStreamer 1.28, live and
+/// replay chains: every H.265 decoder ranked out, and Fedora's OpenH264
+/// stand-in (its decoder fails to start), both end in decodebin's
+/// `CoreError::MissingPlugin`. The "Internal data stream error" the source
+/// and the queue post after it, every other message, and anything from the
+/// replay sound's chain (in the same pipeline, without a decodebin) do not
+/// count.
+fn says_no_decoder(message: &gstreamer::MessageRef, decodebin: &gstreamer::Element) -> bool {
+    let gstreamer::MessageView::Error(error) = message.view() else { return false };
+    let from_decodebin = message
+        .src()
+        .is_some_and(|src| src == decodebin.upcast_ref::<gstreamer::Object>() || src.has_as_ancestor(decodebin));
+    let error = error.error();
+    from_decodebin
+        && (error.matches(gstreamer::CoreError::MissingPlugin) || error.matches(gstreamer::StreamError::CodecNotFound))
+}
+
+/// Watches `pipeline`'s bus, on this thread's main context (the GTK main
+/// thread's), for the one thing that leaves a built pipeline without a
+/// picture: no decoder for its stream (`says_no_decoder`, about
+/// `decodebin`). Then the pipeline is fed no more (`no_picture`: it would only
+/// queue every frame) and `problem` hears `text()`, once. Every other message
+/// is only taken off the bus, where nothing reads it today: no sync handler,
+/// no state change, the watch always goes on. It lasts as long as the guard;
+/// `None` without a bus, or when another thread holds this thread's main
+/// context (`add_watch_local` would panic).
+fn watch_for_no_decoder(
+    pipeline: &gstreamer::Pipeline,
+    decodebin: &gstreamer::Element,
+    no_picture: &Arc<AtomicBool>,
+    problem: &Rc<Problem>,
+    text: impl Fn() -> String + 'static,
+) -> Option<gstreamer::bus::BusWatchGuard> {
+    let bus = pipeline.bus()?;
+    let context = glib::MainContext::ref_thread_default();
+    let _owner = context.acquire().ok()?;
+    let (problem, no_picture, decodebin) = (Rc::clone(problem), Arc::clone(no_picture), decodebin.downgrade());
+    let watch = bus.add_watch_local(move |_, message| {
+        let no_decoder = || decodebin.upgrade().is_some_and(|decodebin| says_no_decoder(message, &decodebin));
+        if !no_picture.load(Ordering::Relaxed) && no_decoder() {
+            no_picture.store(true, Ordering::Relaxed);
+            problem.report(&text());
+        }
+        glib::ControlFlow::Continue
+    });
+    match watch {
+        Ok(watch) => Some(watch),
+        Err(e) => {
+            eprintln!("cannot watch the video pipeline: {e}");
+            None
+        }
     }
 }
 
@@ -673,6 +904,11 @@ fn needs_rebuild(current: Option<VideoType>, wanted: VideoType) -> bool {
 }
 
 impl VideoSink {
+    /// No decoder took this sink's stream (see `watch_for_no_decoder`).
+    fn shows_no_picture(&self) -> bool {
+        self.no_picture.load(Ordering::Relaxed)
+    }
+
     /// Starts recording what this sink shows to `path`.
     pub fn start_recording(&self, path: &std::path::Path) -> Result<(), String> {
         let recorder = Recorder::start(path, self.video_type)?;
@@ -863,6 +1099,13 @@ impl VideoSink {
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(format!("{path}.idx")) {
                 let _ = writeln!(f, "{} {} {}", frame.data.len(), frame.is_keyframe, frame.microseconds);
             }
+        }
+
+        // No decoder took this stream (see `watch_for_no_decoder`): the
+        // pipeline has stopped and would only queue the frames. The recording
+        // and REOLING_DUMP_VIDEO above still get every one.
+        if self.no_picture.load(Ordering::Relaxed) {
+            return;
         }
 
         /*
@@ -1374,16 +1617,16 @@ fn playing_running_time_us(pipeline: &gstreamer::Pipeline) -> Option<u64> {
 /// The replay source: not live, so the pipeline clock starts with the first
 /// frame shown instead of following arrival, and its own queue holds the
 /// device's lead. It never blocks `push_frame`.
-fn replay_appsrc(video_type: VideoType) -> AppSrc {
+fn replay_appsrc(video_type: VideoType) -> Result<AppSrc, String> {
     let media_type = match video_type {
         VideoType::H264 => "video/x-h264",
         VideoType::H265 => "video/x-h265",
     };
     let appsrc = gstreamer::ElementFactory::make("appsrc")
         .build()
-        .expect("appsrc element missing — install gstreamer1.0-plugins-base")
+        .map_err(|_| missing("appsrc"))?
         .downcast::<AppSrc>()
-        .expect("appsrc is always an AppSrc");
+        .map_err(|_| "appsrc is not an AppSrc".to_string())?;
     appsrc.set_caps(Some(
         &gstreamer::Caps::builder(media_type)
             .field("stream-format", "byte-stream")
@@ -1396,16 +1639,16 @@ fn replay_appsrc(video_type: VideoType) -> AppSrc {
     // With `block` off this is no hard limit (past it the source only says
     // it has enough); `push_replay_frame` enforces it.
     appsrc.set_max_bytes(REPLAY_MAX_QUEUED_BYTES);
-    appsrc
+    Ok(appsrc)
 }
 
 /// The sound's source: as `replay_appsrc`, for AAC (ADTS) units.
-fn replay_audio_appsrc() -> AppSrc {
+fn replay_audio_appsrc() -> Result<AppSrc, String> {
     let appsrc = gstreamer::ElementFactory::make("appsrc")
         .build()
-        .expect("appsrc element missing — install gstreamer1.0-plugins-base")
+        .map_err(|e| format!("appsrc is missing: {e}"))?
         .downcast::<AppSrc>()
-        .expect("appsrc is always an AppSrc");
+        .map_err(|_| "appsrc is not an AppSrc".to_string())?;
     appsrc.set_caps(Some(
         &gstreamer::Caps::builder("audio/mpeg").field("mpegversion", 4i32).field("stream-format", "adts").build(),
     ));
@@ -1413,7 +1656,7 @@ fn replay_audio_appsrc() -> AppSrc {
     appsrc.set_format(gstreamer::Format::Time);
     appsrc.set_block(false);
     appsrc.set_max_bytes(REPLAY_AUDIO_MAX_QUEUED_BYTES);
-    appsrc
+    Ok(appsrc)
 }
 
 /// Builds the sound's chain into `pipeline` (see `ReplayAudio`), at
@@ -1424,7 +1667,7 @@ fn build_replay_audio(pipeline: &gstreamer::Pipeline, volume: f64) -> Result<Rep
             .build()
             .map_err(|e| format!("{name} is missing: {e}"))
     };
-    let appsrc = replay_audio_appsrc();
+    let appsrc = replay_audio_appsrc()?;
     let parse = make("aacparse")?;
     let decoder = make("avdec_aac").or_else(|_| make("faad"))?;
     let convert = make("audioconvert")?;
@@ -1470,14 +1713,14 @@ pub(crate) fn adts_unit_duration_us(unit: &[u8]) -> u64 {
 /// A small reserve in front of the decoder, by time and by bytes; the lead
 /// itself waits in the appsrc. 1 s of PTS is 16 s of footage at 16x: 4-16
 /// I-frames, a few MB even on main.
-fn replay_queue() -> gstreamer::Element {
+fn replay_queue() -> Result<gstreamer::Element, String> {
     gstreamer::ElementFactory::make("queue")
         .property("max-size-buffers", 0u32)
         .property("max-size-bytes", 16u32 * 1024 * 1024)
         .property("max-size-time", 1_000_000_000u64)
         .property_from_str("leaky", "no")
         .build()
-        .expect("queue element missing — install gstreamer1.0-plugins-base")
+        .map_err(|_| missing("queue"))
 }
 
 /// The decoder settings live video uses (see `build_sink`): a late frame is
@@ -1594,6 +1837,7 @@ fn assemble_replay_sink(
             retired: AtomicBool::new(false),
             control: Mutex::new(()),
         })),
+        no_picture: Arc::new(AtomicBool::new(false)),
     }
 }
 
@@ -1624,38 +1868,42 @@ impl VideoView {
     /// plus the sound's own chain (`build_replay_audio`) in the same
     /// pipeline, when its elements are there. No pipeline latency: nothing
     /// here is live, the clock simply starts with the first frame shown.
-    fn build_replay_sink(&self, video_type: VideoType) -> VideoSink {
+    /// `Err` and the watch as for `build_sink`.
+    fn build_replay_sink(
+        &self,
+        video_type: VideoType,
+    ) -> Result<(VideoSink, Option<gstreamer::bus::BusWatchGuard>), String> {
         let parse_name = match video_type {
             VideoType::H264 => "h264parse",
             VideoType::H265 => "h265parse",
         };
         let pipeline = gstreamer::Pipeline::new();
-        let appsrc = replay_appsrc(video_type);
+        let appsrc = replay_appsrc(video_type)?;
         let parse = gstreamer::ElementFactory::make(parse_name)
             .property_from_str("config-interval", "-1")
             .build()
-            .unwrap_or_else(|_| panic!("{parse_name} element missing — install the appropriate GStreamer parser plugin"));
-        let queue = replay_queue();
+            .map_err(|_| missing(parse_name))?;
+        let queue = replay_queue()?;
         let decodebin = gstreamer::ElementFactory::make("decodebin")
-            .property("force-sw-decoders", crate::ui::settings::force_software())
+            .property("force-sw-decoders", crate::ui::settings::force_software(video_type))
             .build()
-            .expect("decodebin element missing — install gstreamer1.0-plugins-base");
+            .map_err(|_| missing("decodebin"))?;
         let convert = gstreamer::ElementFactory::make("videoconvert")
             .property("qos", false)
             .build()
-            .expect("videoconvert element missing — install gstreamer1.0-plugins-base");
+            .map_err(|_| missing("videoconvert"))?;
         let display = gstreamer::ElementFactory::make("gtk4paintablesink")
             .name("display")
             .property("max-lateness", -1i64)
             .build()
-            .expect("gtk4paintablesink missing — install GStreamer GTK4 support");
+            .map_err(|_| missing("gtk4paintablesink"))?;
 
         pipeline
             .add_many([appsrc.upcast_ref(), &parse, &queue, &decodebin, &convert, &display])
-            .expect("adding elements to pipeline failed");
+            .map_err(|e| format!("Cannot build the video pipeline: {e}"))?;
         gstreamer::Element::link_many([appsrc.upcast_ref(), &parse, &queue, &decodebin])
-            .expect("linking appsrc -> parser -> queue -> decodebin failed");
-        convert.link(&display).expect("linking videoconvert -> gtk4paintablesink failed");
+            .map_err(|e| format!("linking appsrc -> parser -> queue -> decodebin failed: {e}"))?;
+        convert.link(&display).map_err(|e| format!("linking videoconvert -> gtk4paintablesink failed: {e}"))?;
 
         let decoded_frames = Arc::new(AtomicU64::new(0));
         let decoded_for_pad = decoded_frames.clone();
@@ -1696,10 +1944,19 @@ impl VideoView {
         self.picture.set_paintable(Some(&display.property::<gtk4::gdk::Paintable>("paintable")));
 
         let sink = assemble_replay_sink(video_type, pipeline, appsrc, &queue, &display, audio, decoded_frames);
-        sink.pipeline
-            .set_state(gstreamer::State::Playing)
-            .expect("failed to start GStreamer pipeline");
-        sink
+        // Here and in `build_sink`, never in `assemble_replay_sink`: the
+        // tests call that on threads without a main loop.
+        let watch = watch_for_no_decoder(&sink.pipeline, &decodebin, &sink.no_picture, &self.slot.problem, move || {
+            crate::ui::requirements::check().no_decoder_text(video_type)
+        });
+        if let Err(e) = sink.pipeline.set_state(gstreamer::State::Playing) {
+            drop(watch);
+            self.picture.set_paintable(None::<&gtk4::gdk::Paintable>);
+            // Retired, and taken to NULL off the GTK thread.
+            tear_down(sink);
+            return Err(format!("Cannot start the video pipeline: {e}"));
+        }
+        Ok((sink, watch))
     }
 }
 
@@ -1853,6 +2110,10 @@ impl VideoSink {
         if replay.retired.load(Ordering::SeqCst) {
             return;
         }
+        // No decoder took the picture (see `watch_for_no_decoder`).
+        if self.no_picture.load(Ordering::Relaxed) {
+            return;
+        }
         let (pts_us, reopen) = {
             let mut state = replay.state.lock().expect("replay mutex poisoned");
             if state.ended || state.clock.speed != 1.0 {
@@ -1975,7 +2236,8 @@ impl VideoSink {
             recorder.push(frame, gstreamer::ClockTime::from_useconds(stamp.recording_us));
         }
         dump_replay_unit(frame);
-        if !queue_it {
+        // Nor once no decoder took the picture (see `watch_for_no_decoder`).
+        if !queue_it || self.no_picture.load(Ordering::Relaxed) {
             return;
         }
 
@@ -1994,8 +2256,175 @@ impl VideoSink {
     }
 }
 
+/// Stand-ins for the tests here and of the code that asks for sinks
+/// (bridge.rs, playback_driver.rs): sinks over GStreamer's core elements
+/// only (no display, no decoder), and a view without its widget.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::*;
+    use std::cell::Cell;
+
+    /// A live sink, `appsrc ! fakesink`, paused: a live source sends nothing
+    /// before it plays, so what is pushed stays in it.
+    pub(crate) fn live_sink(video_type: VideoType) -> VideoSink {
+        gstreamer::init().expect("gstreamer init");
+        let pipeline = gstreamer::Pipeline::new();
+        let appsrc =
+            gstreamer::ElementFactory::make("appsrc").build().expect("appsrc").downcast::<AppSrc>().expect("an AppSrc");
+        appsrc.set_is_live(true);
+        appsrc.set_format(gstreamer::Format::Time);
+        let display = gstreamer::ElementFactory::make("fakesink").name("display").build().expect("fakesink");
+        pipeline.add_many([appsrc.upcast_ref(), &display]).expect("add");
+        appsrc.link(&display).expect("link");
+        let _ = pipeline.set_state(gstreamer::State::Paused);
+        VideoSink {
+            appsrc,
+            pipeline,
+            pts_state: Arc::new(Mutex::new(PtsState::default())),
+            recorder: Arc::new(Mutex::new(None)),
+            video_type,
+            decoded_frames: Arc::new(AtomicU64::new(0)),
+            replay: None,
+            no_picture: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// What a sink's source holds, not yet taken by its pipeline (a paused
+    /// `live_sink` keeps all it is given).
+    pub(crate) fn queued_bytes(sink: &VideoSink) -> u64 {
+        sink.appsrc.current_level_bytes()
+    }
+
+    /// A replay sink, playing, with the element standing for the display:
+    ///   appsrc ! queue [! identity] ! fakesink   (the picture)
+    ///   appsrc ! fakesink                        (the sound)
+    /// `slow_element_us`: an element that takes that long a frame, for a
+    /// decoder that cannot keep up.
+    pub(crate) fn replay_sink(video_type: VideoType, slow_element_us: Option<u32>) -> (VideoSink, gstreamer::Element) {
+        gstreamer::init().expect("gstreamer init");
+        let pipeline = gstreamer::Pipeline::new();
+        let appsrc = replay_appsrc(video_type).expect("appsrc");
+        let queue = replay_queue().expect("queue");
+        let display = gstreamer::ElementFactory::make("fakesink")
+            .property("sync", true)
+            .property("max-lateness", -1i64)
+            .property("qos", false)
+            .build()
+            .expect("fakesink");
+        let mut chain: Vec<gstreamer::Element> = vec![appsrc.clone().upcast(), queue.clone()];
+        if let Some(us) = slow_element_us {
+            // Stands in for a decoder that cannot keep up.
+            chain.push(gstreamer::ElementFactory::make("identity").property("sleep-time", us).build().expect("identity"));
+        }
+        chain.push(display.clone());
+        pipeline.add_many(&chain).expect("add");
+        gstreamer::Element::link_many(&chain).expect("link");
+        // The sound: its source straight into a sink that plays by the clock
+        // and takes part in the preroll, as an audio output does.
+        let audio_appsrc = replay_audio_appsrc().expect("appsrc");
+        let speaker = gstreamer::ElementFactory::make("fakesink")
+            .name("speaker")
+            .property("sync", true)
+            .property("max-lateness", -1i64)
+            .property("qos", false)
+            .build()
+            .expect("fakesink");
+        pipeline.add_many([audio_appsrc.upcast_ref(), &speaker]).expect("add");
+        audio_appsrc.link(&speaker).expect("link");
+        let audio = Some(ReplayAudio { appsrc: audio_appsrc, volume: None });
+        let decoded = Arc::new(AtomicU64::new(0));
+        let sink = assemble_replay_sink(video_type, pipeline, appsrc, &queue, &display, audio, decoded);
+        sink.pipeline.set_state(gstreamer::State::Playing).expect("play");
+        (sink, display)
+    }
+
+    /// A view as the window's responders use one (`VideoView::ensure_sink`,
+    /// `ensure_sink_for`, `retry_picture`, `problem`), without its widget:
+    /// its sinks are `replay_sink`s (`live_sink`s for `live`), but it refuses
+    /// `refuses` as a system without that codec's parser would.
+    pub(crate) struct View {
+        slot: SinkSlot,
+        refuses: Option<VideoType>,
+        live: bool,
+        /// Sinks built, or tried, so far.
+        pub(crate) builds: Cell<u32>,
+    }
+
+    impl View {
+        pub(crate) fn new(refuses: Option<VideoType>) -> Self {
+            View { slot: SinkSlot::default(), refuses, live: false, builds: Cell::new(0) }
+        }
+
+        /// A live view (`VideoView::new`), as the window's live responder
+        /// uses.
+        pub(crate) fn live(refuses: Option<VideoType>) -> Self {
+            View { live: true, ..Self::new(refuses) }
+        }
+
+        fn build(&self, video_type: VideoType) -> Result<(VideoSink, Option<gstreamer::bus::BusWatchGuard>), String> {
+            self.builds.set(self.builds.get() + 1);
+            match (self.refuses, video_type) {
+                (Some(refused), VideoType::H264) if refused == video_type => {
+                    Err("Cannot show this stream: h264parse is missing.".to_string())
+                }
+                (Some(refused), VideoType::H265) if refused == video_type => {
+                    Err("Cannot show this stream: h265parse is missing.".to_string())
+                }
+                _ if self.live => Ok((live_sink(video_type), None)),
+                _ => Ok((replay_sink(video_type, None).0, None)),
+            }
+        }
+
+        /// `VideoView::ensure_sink`, the same `SinkSlot::ensure`.
+        pub(crate) fn ensure_sink(&self, video_type: VideoType) -> Result<VideoSink, String> {
+            self.slot.ensure(video_type, || self.build(video_type))
+        }
+
+        /// `VideoView::ensure_sink_for`, the same `SinkSlot::ensure_for`.
+        pub(crate) fn ensure_sink_for(&self, video_type: VideoType) -> Result<VideoSink, String> {
+            self.slot.ensure_for(video_type, || self.reset(), || self.build(video_type))
+        }
+
+        pub(crate) fn current_sink(&self) -> Option<VideoSink> {
+            self.slot.sink.borrow().clone()
+        }
+
+        pub(crate) fn problem(&self) -> Option<String> {
+            self.slot.problem.text()
+        }
+
+        pub(crate) fn connect_problem(&self, on_problem: impl Fn(&str) + 'static) {
+            self.slot.problem.connect(on_problem);
+        }
+
+        /// `VideoView::reset` without the widget; the pipeline is down when
+        /// it returns.
+        pub(crate) fn reset(&self) {
+            if let Some(sink) = self.slot.take() {
+                sink.stop_recording();
+                tear_down(sink).join().expect("teardown thread");
+            }
+        }
+
+        /// `VideoView::retry_picture`, the same `SinkSlot::retry`.
+        pub(crate) fn retry_picture(&self) -> bool {
+            self.slot.retry(|| self.reset())
+        }
+
+        /// What the bus watch does when no decoder takes the stream (see
+        /// `watch_for_no_decoder`).
+        pub(crate) fn no_decoder(&self, text: &str) {
+            if let Some(sink) = self.slot.sink.borrow().as_ref() {
+                sink.no_picture.store(true, Ordering::Relaxed);
+            }
+            self.slot.problem.report(text);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::fixtures::View;
     use super::*;
 
     const SEC: u64 = 1_000_000;
@@ -2306,41 +2735,7 @@ mod tests {
     //   appsrc ! fakesink                        (the sound)
 
     fn test_sink(slow_element_us: Option<u32>) -> (VideoSink, gstreamer::Element) {
-        gstreamer::init().expect("gstreamer init");
-        let pipeline = gstreamer::Pipeline::new();
-        let appsrc = replay_appsrc(VideoType::H264);
-        let queue = replay_queue();
-        let display = gstreamer::ElementFactory::make("fakesink")
-            .property("sync", true)
-            .property("max-lateness", -1i64)
-            .property("qos", false)
-            .build()
-            .expect("fakesink");
-        let mut chain: Vec<gstreamer::Element> = vec![appsrc.clone().upcast(), queue.clone()];
-        if let Some(us) = slow_element_us {
-            // Stands in for a decoder that cannot keep up.
-            chain.push(gstreamer::ElementFactory::make("identity").property("sleep-time", us).build().expect("identity"));
-        }
-        chain.push(display.clone());
-        pipeline.add_many(&chain).expect("add");
-        gstreamer::Element::link_many(&chain).expect("link");
-        // The sound: its source straight into a sink that plays by the clock
-        // and takes part in the preroll, as an audio output does.
-        let audio_appsrc = replay_audio_appsrc();
-        let speaker = gstreamer::ElementFactory::make("fakesink")
-            .name("speaker")
-            .property("sync", true)
-            .property("max-lateness", -1i64)
-            .property("qos", false)
-            .build()
-            .expect("fakesink");
-        pipeline.add_many([audio_appsrc.upcast_ref(), &speaker]).expect("add");
-        audio_appsrc.link(&speaker).expect("link");
-        let audio = Some(ReplayAudio { appsrc: audio_appsrc, volume: None });
-        let sink =
-            assemble_replay_sink(VideoType::H264, pipeline, appsrc, &queue, &display, audio, Arc::new(AtomicU64::new(0)));
-        sink.pipeline.set_state(gstreamer::State::Playing).expect("play");
-        (sink, display)
+        fixtures::replay_sink(VideoType::H264, slow_element_us)
     }
 
     fn frame(us: u32, key: bool) -> VideoFrame {
@@ -2663,13 +3058,14 @@ mod tests {
     fn live_sinks_ignore_replay_controls() {
         gstreamer::init().expect("gstreamer init");
         let sink = VideoSink {
-            appsrc: replay_appsrc(VideoType::H264),
+            appsrc: replay_appsrc(VideoType::H264).expect("appsrc"),
             pipeline: gstreamer::Pipeline::new(),
             pts_state: Arc::new(Mutex::new(PtsState::default())),
             recorder: Arc::new(Mutex::new(None)),
             video_type: VideoType::H264,
             decoded_frames: Arc::new(AtomicU64::new(0)),
             replay: None,
+            no_picture: Arc::new(AtomicBool::new(false)),
         };
         sink.reset_for_open(Duration::from_secs(1), 2.0);
         sink.chain_open(Duration::from_secs(1));
@@ -2677,6 +3073,222 @@ mod tests {
         sink.set_paused(true);
         assert!(sink.replay_status().is_none());
         assert_eq!(sink.pipeline.current_state(), gstreamer::State::Null);
+    }
+
+    /// A pipeline as the views build them, for the bus: a stand-in for the
+    /// video's decodebin (a bin) with a decoder in it, the replay sound's
+    /// decoder beside it, and the source.
+    fn bus_test_pipeline() -> (gstreamer::Pipeline, gstreamer::Element, [gstreamer::Element; 3]) {
+        gstreamer::init().expect("gstreamer init");
+        let identity = |name: &str| gstreamer::ElementFactory::make("identity").name(name).build().expect("identity");
+        let pipeline = gstreamer::Pipeline::new();
+        let decodebin = gstreamer::Bin::builder().name("decodebin").build();
+        let (decoder, sound_decoder, source) = (identity("decoder"), identity("sound-decoder"), identity("source"));
+        decodebin.add(&decoder).expect("add");
+        let decodebin: gstreamer::Element = decodebin.upcast();
+        pipeline.add_many([&decodebin, &sound_decoder, &source]).expect("add");
+        (pipeline, decodebin, [decoder, sound_decoder, source])
+    }
+
+    fn error_from(src: &gstreamer::Element, error: impl gstreamer::MessageErrorDomain) -> gstreamer::Message {
+        gstreamer::message::Error::builder(error, "test").src(src).build()
+    }
+
+    fn missing_plugin_from(src: &gstreamer::Element) -> gstreamer::Message {
+        let structure = gstreamer::Structure::builder("missing-plugin").field("type", "decoder").build();
+        gstreamer::message::Element::builder(structure).src(src).build()
+    }
+
+    #[test]
+    fn only_a_missing_decoder_takes_the_picture_away() {
+        let (_pipeline, decodebin, [decoder, sound_decoder, source]) = bus_test_pipeline();
+        let says = |message: gstreamer::Message| says_no_decoder(&message, &decodebin);
+        // decodebin's terminal error, or one from an element in it.
+        assert!(says(error_from(&decodebin, gstreamer::CoreError::MissingPlugin)));
+        assert!(says(error_from(&decoder, gstreamer::CoreError::MissingPlugin)));
+        assert!(says(error_from(&decoder, gstreamer::StreamError::CodecNotFound)));
+        // Not its element message before the error, nor a warning.
+        assert!(!says(missing_plugin_from(&decodebin)));
+        let warning = gstreamer::message::Warning::builder(gstreamer::CoreError::MissingPlugin, "test").src(&decodebin);
+        assert!(!says(warning.build()));
+        // Not the replay sound's chain, which shares the pipeline.
+        assert!(!says(error_from(&sound_decoder, gstreamer::CoreError::MissingPlugin)));
+        assert!(!says(error_from(&sound_decoder, gstreamer::StreamError::CodecNotFound)));
+        // Not "Internal data stream error" after it, from the source or the
+        // queue or decodebin, nor a frame that does not decode.
+        assert!(!says(error_from(&source, gstreamer::StreamError::Failed)));
+        assert!(!says(error_from(&decodebin, gstreamer::StreamError::Failed)));
+        assert!(!says(error_from(&decoder, gstreamer::StreamError::Decode)));
+        // Nothing else.
+        assert!(!says(gstreamer::message::Eos::new()));
+        assert!(!says(gstreamer::message::Error::new(gstreamer::CoreError::MissingPlugin, "no source")));
+    }
+
+    #[test]
+    fn decodebin_without_a_decoder_says_so() {
+        gstreamer::init().expect("gstreamer init");
+        let Ok(decodebin) = gstreamer::ElementFactory::make("decodebin").build() else {
+            eprintln!("no decodebin here: not checked");
+            return;
+        };
+        // Caps no decoder anywhere takes, so no decoder is picked.
+        let appsrc =
+            gstreamer::ElementFactory::make("appsrc").build().expect("appsrc").downcast::<AppSrc>().expect("an AppSrc");
+        appsrc.set_caps(Some(&gstreamer::Caps::builder("video/x-reoling-test").build()));
+        let pipeline = gstreamer::Pipeline::new();
+        pipeline.add_many([appsrc.upcast_ref(), &decodebin]).expect("add");
+        appsrc.link(&decodebin).expect("link");
+        let _ = pipeline.set_state(gstreamer::State::Playing);
+        let _ = appsrc.push_buffer(gstreamer::Buffer::from_slice(vec![0u8; 64]));
+        let bus = pipeline.bus().expect("bus");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut said = false;
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            let types = [gstreamer::MessageType::Element, gstreamer::MessageType::Error];
+            let left = gstreamer::ClockTime::from_nseconds(left.as_nanos() as u64);
+            let Some(message) = bus.timed_pop_filtered(left, &types) else { break };
+            if says_no_decoder(&message, &decodebin) {
+                said = true;
+                break;
+            }
+        }
+        let _ = pipeline.set_state(gstreamer::State::Null);
+        assert!(said, "decodebin posted no missing-plugin error");
+    }
+
+    #[test]
+    fn the_watch_tells_once_and_goes_with_its_guard() {
+        let (pipeline, decodebin, [decoder, sound_decoder, source]) = bus_test_pipeline();
+        // A main context of this test's own, as GTK's is the main thread's.
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let pump = || while context.iteration(false) {};
+                let no_picture = Arc::new(AtomicBool::new(false));
+                let problem = Rc::new(Problem::default());
+                let heard = Rc::new(RefCell::new(Vec::<String>::new()));
+                let into = Rc::clone(&heard);
+                let hear = move |text: &str| into.borrow_mut().push(text.to_string());
+                *problem.handler.borrow_mut() = Some(Rc::new(hear));
+                let text = || "No H.265 decoder on this system.".to_string();
+                let watch = watch_for_no_decoder(&pipeline, &decodebin, &no_picture, &problem, text).expect("a watch");
+                let bus = pipeline.bus().expect("bus");
+                // What comes before, or beside, a missing decoder: nothing.
+                for message in [
+                    missing_plugin_from(&decodebin),
+                    error_from(&sound_decoder, gstreamer::CoreError::MissingPlugin),
+                    error_from(&source, gstreamer::StreamError::Failed),
+                ] {
+                    bus.post(message).expect("post");
+                }
+                pump();
+                assert!(!no_picture.load(Ordering::Relaxed));
+                assert!(heard.borrow().is_empty());
+                assert_eq!(*problem.text.borrow(), None);
+                // decodebin's error, twice: the feed stops, said once.
+                for _ in 0..2 {
+                    bus.post(error_from(&decoder, gstreamer::CoreError::MissingPlugin)).expect("post");
+                }
+                pump();
+                assert!(no_picture.load(Ordering::Relaxed));
+                assert_eq!(*heard.borrow(), ["No H.265 decoder on this system."]);
+                assert_eq!(problem.text.borrow().as_deref(), Some("No H.265 decoder on this system."));
+                // A bus takes one watch at most: this one is gone with its
+                // guard.
+                assert!(bus.add_watch_local(|_, _| glib::ControlFlow::Continue).is_err());
+                drop(watch);
+                let again = bus.add_watch_local(|_, _| glib::ControlFlow::Continue);
+                assert!(again.is_ok(), "the watch outlived its guard");
+            })
+            .expect("this test's main context");
+    }
+
+    #[test]
+    fn without_a_decoder_nothing_is_fed_any_more() {
+        // Live: a paused live source keeps what it is given.
+        let live = fixtures::live_sink(VideoType::H265);
+        live.push_frame(&frame(0, true));
+        let level = live.appsrc.current_level_bytes();
+        assert!(level > 0, "the live fixture took nothing");
+        live.no_picture.store(true, Ordering::Relaxed);
+        for i in 1..10u32 {
+            live.push_frame(&frame(i * 40_000, false));
+        }
+        assert_eq!(live.appsrc.current_level_bytes(), level, "frames queued after no decoder took the stream");
+        let _ = live.pipeline.set_state(gstreamer::State::Null);
+
+        // Replay: the lead, picture and sound, waits in the pipeline...
+        let (sink, _display) = test_sink(None);
+        sink.reset_for_open(Duration::from_secs(10), 1.0);
+        push_with_sound(&sink, 0, 30, 10);
+        assert!(sink.replay_status().expect("replay sink").buffered_bytes > 0);
+        assert!(audio_appsrc(&sink).current_level_bytes() > 0);
+        // ...but none once no decoder took the picture.
+        sink.reset_for_open(Duration::from_secs(20), 1.0);
+        sink.no_picture.store(true, Ordering::Relaxed);
+        push_with_sound(&sink, 5_000_000, 30, 10);
+        assert_eq!(sink.replay_status().expect("replay sink").buffered_bytes, 0);
+        assert_eq!(audio_appsrc(&sink).current_level_bytes(), 0);
+        let _ = sink.pipeline.set_state(gstreamer::State::Null);
+    }
+
+    #[test]
+    fn a_refused_codec_is_answered_at_once_and_said_every_time() {
+        let view = Rc::new(View::new(Some(VideoType::H265)));
+        let heard = Rc::new(RefCell::new(Vec::<String>::new()));
+        let (weak, into) = (Rc::downgrade(&view), Rc::clone(&heard));
+        view.connect_problem(move |text| {
+            // The handler looks at the view, as the Playback page does
+            // (`freeze`, `refresh`): no borrow may be held while it runs.
+            let view = weak.upgrade().expect("the view");
+            assert_eq!(view.problem().as_deref(), Some(text));
+            assert!(view.current_sink().is_none());
+            into.borrow_mut().push(text.to_string());
+        });
+        let refused = view.ensure_sink_for(VideoType::H265).err().expect("refused");
+        assert!(refused.contains("h265parse"), "{refused}");
+        assert_eq!(view.ensure_sink_for(VideoType::H265).err().as_deref(), Some(refused.as_str()));
+        assert_eq!(view.builds.get(), 1, "a refusal is kept, not built again");
+        assert_eq!(heard.borrow().len(), 2, "the handler hears every refusal");
+        // Play again: forgotten, and tried once more.
+        assert!(view.retry_picture());
+        assert_eq!(view.problem(), None);
+        assert!(view.ensure_sink_for(VideoType::H265).is_err());
+        assert_eq!(view.builds.get(), 2);
+        // A stream that can be shown: built, and the reason goes with it, so
+        // that Play keeps this sink.
+        let sink = view.ensure_sink_for(VideoType::H264).expect("H.264 builds");
+        assert_eq!(view.problem(), None);
+        assert!(!view.retry_picture());
+        assert!(!sink.is_retired());
+        view.reset();
+        assert!(sink.is_retired());
+    }
+
+    #[test]
+    fn play_again_rebuilds_only_a_sink_without_picture() {
+        let view = View::new(None);
+        let first = view.ensure_sink_for(VideoType::H264).expect("a sink");
+        // A picture that works keeps its sink.
+        assert!(!view.retry_picture());
+        assert!(!first.is_retired());
+        let same = view.ensure_sink_for(VideoType::H264).expect("the sink");
+        assert_eq!(same.pipeline, first.pipeline);
+        assert_eq!(view.builds.get(), 1);
+        // No decoder took the stream: Play retires that sink, and the next
+        // frame gets a new one.
+        view.no_decoder("No H.264 decoder on this system.");
+        assert!(first.shows_no_picture());
+        assert_eq!(view.problem().as_deref(), Some("No H.264 decoder on this system."));
+        assert!(view.retry_picture());
+        assert!(first.is_retired());
+        assert_eq!(first.pipeline.current_state(), gstreamer::State::Null);
+        assert_eq!(view.problem(), None);
+        let second = view.ensure_sink_for(VideoType::H264).expect("a new sink");
+        assert_ne!(second.pipeline, first.pipeline);
+        assert!(!second.shows_no_picture());
+        assert_eq!(view.builds.get(), 2);
+        view.reset();
     }
 
     #[test]

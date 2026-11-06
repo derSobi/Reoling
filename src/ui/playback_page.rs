@@ -1064,6 +1064,8 @@ impl PlaybackPage {
         self.timeline.set_position(Some(seconds));
         self.time.set_text(&time_text(at));
         self.playing.set(true);
+        // Plays: a picture that failed is tried again (see `toggle_play`).
+        self.video.retry_picture();
         self.send_player(|link| link.playback_seek(at));
         self.refresh();
     }
@@ -1079,7 +1081,23 @@ impl PlaybackPage {
             self.send_player(DeviceLink::playback_pause);
         } else {
             self.playing.set(true);
+            // After "no picture" (see `picture_unavailable`), Play tries
+            // again with a new sink; a picture that works keeps its sink.
+            self.video.retry_picture();
             self.send_player(DeviceLink::playback_play);
+        }
+        self.refresh();
+    }
+
+    /// The footage cannot be shown here (see `VideoView::connect_problem`;
+    /// the view keeps the reason, which the message over the picture shows):
+    /// playback pauses as Pause would, so that the device stops sending what
+    /// nothing can show. Play tries again.
+    pub fn picture_unavailable(&self, _text: &str) {
+        if self.playing.get() && self.is_ready() {
+            self.video.freeze();
+            self.playing.set(false);
+            self.send_player(DeviceLink::playback_pause);
         }
         self.refresh();
     }
@@ -1439,6 +1457,7 @@ impl PlaybackPage {
         let lost = self.lost.borrow();
         let last_error = self.last_error.borrow();
         let phase = state.as_ref().map(|s| s.phase);
+        let problem = self.video.problem();
         let situation = Situation {
             device: self.device.borrow().is_some(),
             lost: lost.as_deref(),
@@ -1451,6 +1470,7 @@ impl PlaybackPage {
             picture: self.video.current_sink().is_some(),
             played_out: phase == Some(PlayerPhase::Ended) && self.played_out(),
             error: last_error.as_deref(),
+            problem: problem.as_deref(),
         };
         match message_of(&situation) {
             Some(text) => {
@@ -1733,6 +1753,8 @@ struct Situation<'a> {
     /// After the day's last recording, the picture has played out.
     played_out: bool,
     error: Option<&'a str>,
+    /// Why the footage cannot be shown (see `VideoView::problem`).
+    problem: Option<&'a str>,
 }
 
 /// The message over the picture, or none when the picture speaks for
@@ -1761,6 +1783,9 @@ fn message_of(s: &Situation) -> Option<String> {
         Some(Err(e)) => return Some(format!("Could not list the recordings: {e}")),
         Some(Ok(0)) => return Some("No recordings on this day".to_string()),
         Some(Ok(_)) => {}
+    }
+    if let Some(problem) = s.problem {
+        return Some(problem.to_string());
     }
     match s.phase {
         None | Some(PlayerPhase::Idle) => Some("Click the timeline or press Play".to_string()),
@@ -1921,6 +1946,7 @@ mod tests {
             picture: true,
             played_out: false,
             error: None,
+            problem: None,
         }
     }
 
@@ -1976,6 +2002,31 @@ mod tests {
         assert_eq!(message(Some(PlayerPhase::Failed), true, false).as_deref(), Some("The recording broke off"));
         let failed = Situation { phase: Some(PlayerPhase::Failed), error: Some("The recording broke off: reset"), ..playing() };
         assert_eq!(message_of(&failed).as_deref(), Some("The recording broke off: reset"));
+    }
+
+    #[test]
+    fn a_picture_problem_shows_over_the_footage() {
+        let problem = "No H.265 decoder on this system. Install one with: sudo apt install gstreamer1.0-libav";
+        // Playing, paused, failed: the reason.
+        for phase in [PlayerPhase::Playing, PlayerPhase::Paused, PlayerPhase::Opening, PlayerPhase::Failed] {
+            let s = Situation { phase: Some(phase), problem: Some(problem), ..playing() };
+            assert_eq!(message_of(&s).as_deref(), Some(problem), "{phase:?}");
+        }
+        let s = Situation { phase: Some(PlayerPhase::Paused), picture: false, problem: Some(problem), ..playing() };
+        assert_eq!(message_of(&s).as_deref(), Some(problem));
+        // The device, the connection, the readiness, the day and its
+        // recordings still come first.
+        let with = |s: Situation<'static>| message_of(&Situation { problem: Some(problem), ..s });
+        assert_eq!(with(Situation { device: false, ..playing() }).as_deref(), Some("Select a device"));
+        let lost = Situation { lost: Some("timed out"), ..playing() };
+        assert_eq!(with(lost).as_deref(), Some("Disconnected: timed out"));
+        assert_eq!(with(Situation { readiness: Readiness::Connecting, ..playing() }).as_deref(), Some("Connecting…"));
+        let no_day = Situation { day: false, files: None, phase: None, ..playing() };
+        assert_eq!(with(no_day).as_deref(), Some("Choose a day"));
+        assert_eq!(
+            with(Situation { files: Some(Ok(0)), phase: None, ..playing() }).as_deref(),
+            Some("No recordings on this day")
+        );
     }
 
     #[test]

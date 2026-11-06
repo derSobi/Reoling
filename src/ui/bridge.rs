@@ -443,15 +443,98 @@ impl Drop for DeviceLink {
 /// One connection's request for a `VideoSink`, sent to `main.rs`'s
 /// GTK-main-thread responder task the first time a connection knows its
 /// codec (from the first video frame) — see `spawn_connection`'s doc
-/// comment.
-pub type SinkRequest = (VideoType, tokio::sync::oneshot::Sender<VideoSink>);
+/// comment. Answered with the sink, or with why this system cannot build
+/// one (see `requirements`).
+pub type SinkRequest = (VideoType, tokio::sync::oneshot::Sender<Result<VideoSink, String>>);
 
 /// A device thread's request for a replay `VideoSink`: as `SinkRequest`,
 /// with the playback session whose footage it is for. The window serves only
 /// the Playback page's current session; a request for any other (frames of a
 /// day, device or page left meanwhile) gets no answer, and that frame is
 /// dropped.
-pub type ReplaySinkRequest = (u64, VideoType, tokio::sync::oneshot::Sender<VideoSink>);
+pub type ReplaySinkRequest = (u64, VideoType, tokio::sync::oneshot::Sender<Result<VideoSink, String>>);
+
+/// What a connection does with the live frame that made it ask for a sink
+/// (see `request_sink`).
+enum SinkAnswer {
+    /// Pushes it into this sink, and every frame of the stream after it.
+    Built(VideoSink),
+    /// This system cannot show the stream (see `requirements`): the stream
+    /// stops, the connection stays (PTZ, pushes, Playback, another stream),
+    /// and the window says why.
+    Refused(String),
+    /// The window is gone: the connection ends.
+    Gone,
+}
+
+/// Asks the window for a live sink for `video_type`.
+async fn request_sink(requests: &tokio::sync::mpsc::Sender<SinkRequest>, video_type: VideoType) -> SinkAnswer {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if requests.send((video_type, reply_tx)).await.is_err() {
+        return SinkAnswer::Gone;
+    }
+    match reply_rx.await {
+        Ok(Ok(sink)) => SinkAnswer::Built(sink),
+        Ok(Err(reason)) => SinkAnswer::Refused(reason),
+        Err(_) => SinkAnswer::Gone,
+    }
+}
+
+/// A connection's live stream, as `on_live_frame` finds and leaves it: the
+/// device's frames (`None`: no stream), the sink they go into (asked for
+/// with the stream's first frame) and whether `Playing` was said.
+struct LiveStream<'a, Frames> {
+    frames: &'a mut Option<Frames>,
+    sink: &'a mut Option<VideoSink>,
+    announced: &'a mut bool,
+}
+
+/// What the connection does after a live frame (see `on_live_frame`).
+#[derive(Debug, PartialEq, Eq)]
+enum AfterFrame {
+    /// Goes on with the stream: the frame went into its sink.
+    Shown,
+    /// Goes on without the stream, which this system cannot show.
+    Stopped,
+    /// Ends: the window is gone.
+    End,
+}
+
+/// One live frame of the stream on `channel`: the stream's first asks the
+/// window for a sink (`request_sink`), the frame goes into it, and the first
+/// one in says `Playing`. A refused sink stops the stream: its frames are let
+/// go first, then `stop_video` tells the device, and the window hears why
+/// (`PlayFailed`); the connection goes on (PTZ, pushes, Playback, another
+/// stream).
+async fn on_live_frame<Frames, Stop: std::future::Future>(
+    frame: &VideoFrame,
+    channel: u8,
+    live: LiveStream<'_, Frames>,
+    requests: &tokio::sync::mpsc::Sender<SinkRequest>,
+    tx: &async_channel::Sender<DeviceEvent>,
+    stop_video: impl FnOnce() -> Stop,
+) -> AfterFrame {
+    if live.sink.is_none() {
+        match request_sink(requests, frame.video_type).await {
+            SinkAnswer::Built(built) => *live.sink = Some(built),
+            SinkAnswer::Refused(reason) => {
+                *live.frames = None;
+                let _ = stop_video().await;
+                let _ = tx.send(DeviceEvent::PlayFailed { channel, reason }).await;
+                return AfterFrame::Stopped;
+            }
+            SinkAnswer::Gone => return AfterFrame::End, // GTK side gone
+        }
+    }
+    live.sink.as_ref().expect("just built").push_frame(frame);
+    if !*live.announced {
+        *live.announced = true;
+        if tx.send(DeviceEvent::Playing).await.is_err() {
+            return AfterFrame::End;
+        }
+    }
+    AfterFrame::Shown
+}
 
 /// How the user chose to reach the device — set by the explicit UID/IP
 /// toggle in the connect dialog, never inferred or auto-detected.
@@ -850,20 +933,13 @@ pub fn spawn_device(
                         }
                     } => match frame {
                         Some(Ok(frame)) => {
-                            if sink.is_none() {
-                                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                                if sink_request_tx.send((frame.video_type, reply_tx)).await.is_err() {
-                                    break; // GTK side gone
-                                }
-                                let Ok(built) = reply_rx.await else { break };
-                                sink = Some(built);
-                            }
-                            sink.as_ref().expect("just built").push_frame(&frame);
-                            if !announced {
-                                announced = true;
-                                if tx.send(DeviceEvent::Playing).await.is_err() {
-                                    break;
-                                }
+                            let live = LiveStream { frames: &mut frames, sink: &mut sink, announced: &mut announced };
+                            let next = on_live_frame(&frame, channel, live, &sink_request_tx, &tx, || {
+                                client.stop_video(channel)
+                            });
+                            match next.await {
+                                AfterFrame::Shown | AfterFrame::Stopped => {}
+                                AfterFrame::End => break,
                             }
                         }
                         Some(Err(e)) => {
@@ -916,7 +992,13 @@ pub fn spawn_device(
 
 #[cfg(test)]
 mod tests {
-    use super::{login_refused, DeviceEvent};
+    use super::{
+        login_refused, on_live_frame, request_sink, AfterFrame, DeviceEvent, LiveStream, SinkAnswer, SinkRequest,
+    };
+    use crate::ui::video_view::fixtures::{self, View};
+    use reoling::{VideoFrame, VideoType};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[test]
     fn only_a_wrong_password_is_a_rejected_login() {
@@ -933,5 +1015,133 @@ mod tests {
                 _ => panic!("code {code} must keep the saved password"),
             }
         }
+    }
+
+    const CHANNEL: u8 = 3;
+
+    /// A live frame, as the device's frames come.
+    fn frame(video_type: VideoType, microseconds: u32, is_keyframe: bool) -> VideoFrame {
+        VideoFrame { video_type, is_keyframe, microseconds, data: vec![0u8; 2_000] }
+    }
+
+    /// Stands for a stream's frames from the device, and says in `log` when
+    /// the connection lets go of them.
+    struct Frames(Rc<RefCell<Vec<&'static str>>>);
+
+    impl Drop for Frames {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("frames let go");
+        }
+    }
+
+    /// The events the window has had since last asked, as read here.
+    fn heard(events: &async_channel::Receiver<DeviceEvent>) -> Vec<String> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| match event {
+                DeviceEvent::PlayFailed { channel, reason } => format!("PlayFailed {channel}: {reason}"),
+                DeviceEvent::Playing => "Playing".to_string(),
+                _ => "another event".to_string(),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_refused_live_sink_stops_the_stream_and_the_connection_goes_on() {
+        // The window's live responder (main_window.rs) on a thread of its
+        // own, as on GTK's: a live view on a system without h265parse.
+        let (requests, mut incoming) = tokio::sync::mpsc::channel::<SinkRequest>(8);
+        let window = std::thread::spawn(move || {
+            let view = View::live(Some(VideoType::H265));
+            while let Some((video_type, reply)) = incoming.blocking_recv() {
+                let _ = reply.send(view.ensure_sink(video_type));
+            }
+            view.reset();
+        });
+        let (tx, events) = async_channel::unbounded();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let (mut sink, mut announced) = (None, false);
+        // Play, twice (the window still answers after a refusal; in 1.0.4
+        // its responder died with the panic): a stream this system cannot
+        // show.
+        let h265 = frame(VideoType::H265, 0, true);
+        for played in 1..=2 {
+            let mut frames = Some(Frames(Rc::clone(&log)));
+            let live = LiveStream { frames: &mut frames, sink: &mut sink, announced: &mut announced };
+            let stopped = Rc::clone(&log);
+            let next = on_live_frame(&h265, CHANNEL, live, &requests, &tx, || async move {
+                stopped.borrow_mut().push("stop_video");
+            });
+            // The connection goes on without the stream. Its frames are let
+            // go before the device is told to stop sending them (a reader
+            // whose frames no one takes would hold up the reply), once.
+            assert_eq!(next.await, AfterFrame::Stopped);
+            assert!(frames.is_none() && sink.is_none() && !announced);
+            assert_eq!(*log.borrow(), ["frames let go", "stop_video"].repeat(played));
+            let failed = format!("PlayFailed {CHANNEL}: Cannot show this stream: h265parse is missing.");
+            assert_eq!(heard(&events), [failed]);
+        }
+        // Play again, a stream it can show: into its sink, `Playing` once,
+        // not stopped.
+        let mut frames = Some(Frames(Rc::clone(&log)));
+        for i in 0..3u32 {
+            let h264 = frame(VideoType::H264, i * 40_000, i == 0);
+            let live = LiveStream { frames: &mut frames, sink: &mut sink, announced: &mut announced };
+            let next = on_live_frame(&h264, CHANNEL, live, &requests, &tx, || async {
+                unreachable!("a stream that is shown was stopped")
+            });
+            assert_eq!(next.await, AfterFrame::Shown);
+        }
+        assert!(frames.is_some() && announced);
+        assert_eq!(log.borrow().len(), 4);
+        assert_eq!(heard(&events), ["Playing"]);
+        assert!(fixtures::queued_bytes(sink.as_ref().expect("a sink")) > 0, "the frames did not go into the sink");
+        drop(sink.take());
+        drop(requests);
+        window.join().expect("the window's thread");
+    }
+
+    #[tokio::test]
+    async fn without_the_window_a_live_frame_ends_the_connection() {
+        let (tx, events) = async_channel::unbounded();
+        let (mut frames, mut sink, mut announced) = (Some(()), None, false);
+        let h264 = frame(VideoType::H264, 0, true);
+        // Gone before the stream's first frame...
+        let (requests, incoming) = tokio::sync::mpsc::channel::<SinkRequest>(1);
+        drop(incoming);
+        let live = LiveStream { frames: &mut frames, sink: &mut sink, announced: &mut announced };
+        let next = on_live_frame(&h264, CHANNEL, live, &requests, &tx, || async {
+            unreachable!("the stream was stopped instead of the connection ended")
+        });
+        assert_eq!(next.await, AfterFrame::End);
+        assert!(heard(&events).is_empty());
+        // ...or before `Playing` is said.
+        let view = View::live(None);
+        sink = Some(view.ensure_sink(VideoType::H264).expect("a sink"));
+        drop(events);
+        let live = LiveStream { frames: &mut frames, sink: &mut sink, announced: &mut announced };
+        let next = on_live_frame(&h264, CHANNEL, live, &requests, &tx, || async {
+            unreachable!("the stream was stopped instead of the connection ended")
+        });
+        assert_eq!(next.await, AfterFrame::End);
+        drop(sink);
+        view.reset();
+    }
+
+    #[tokio::test]
+    async fn without_the_window_the_connection_ends() {
+        // Gone before the request...
+        let (requests, incoming) = tokio::sync::mpsc::channel::<SinkRequest>(1);
+        drop(incoming);
+        assert!(matches!(request_sink(&requests, VideoType::H264).await, SinkAnswer::Gone));
+        // ...or before its answer.
+        let (requests, mut incoming) = tokio::sync::mpsc::channel::<SinkRequest>(1);
+        let window = tokio::spawn(async move {
+            while let Some((_, reply)) = incoming.recv().await {
+                drop(reply);
+            }
+        });
+        assert!(matches!(request_sink(&requests, VideoType::H264).await, SinkAnswer::Gone));
+        drop(requests);
+        window.await.expect("the window's task");
     }
 }

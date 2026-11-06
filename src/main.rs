@@ -18,6 +18,17 @@ fn main() {
     gstreamer::init().expect("failed to initialize GStreamer");
     scan_private_plugins();
 
+    // `--check-requirements` prints what this system lacks for each feature
+    // (see `requirements`) and exits before GTK opens a display: the
+    // packaging smoke tests run it. Exit status 0: nothing missing, 1: no
+    // video for a codec (or none at all), 2: another feature misses
+    // something.
+    if std::env::args().skip(1).any(|a| a == "--check-requirements") {
+        let report = ui::requirements::check();
+        print!("{}", report.check_text());
+        std::process::exit(report.exit_code());
+    }
+
     // Plain UDP/P2P is the default and the only path the real app
     // targets — the official Reolink client never uses TCP for the BC
     // protocol (confirmed by the user 2026-09-15: UDP:9000 direct when a
