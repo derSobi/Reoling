@@ -1110,11 +1110,22 @@ impl PlaybackPage {
     }
 
     /// The other stream has other files: the day is listed again, and the
-    /// timeline keeps the old ones until they come.
+    /// timeline keeps the old ones until they come. Why the old stream showed
+    /// no picture (see `picture_unavailable`) does not hold for the new one:
+    /// that picture and its reason go first (`VideoView::retry_picture`), as
+    /// the live view's do on a stream switch, and Play builds a sink for the
+    /// new stream.
     fn stream_chosen(&self, stream: RecordStream) {
+        let failed = self.video.problem().is_some();
+        if failed {
+            self.video.retry_picture();
+        }
         self.want_stream.set(stream);
         if self.is_ready() && self.day.get().is_some() {
             self.send(|link| link.playback_stream(stream));
+        }
+        if failed {
+            self.refresh();
         }
     }
 

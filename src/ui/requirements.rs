@@ -290,9 +290,9 @@ fn plugin_loaded(flags: gstreamer::PluginFlags) -> bool {
 }
 
 /// The plugin registry GStreamer writes, `~` for the home folder `home`: the
-/// one the AppRun hooks give it (`GST_REGISTRY_1_0`), else GStreamer's own
-/// default in the user's cache folder `cache` (`XDG_CACHE_HOME`, else
-/// ~/.cache), a file per architecture.
+/// one the .deb's start or the AppRun hooks give it (`GST_REGISTRY_1_0`),
+/// else GStreamer's own default in the user's cache folder `cache`
+/// (`XDG_CACHE_HOME`, else ~/.cache), a file per architecture.
 fn registry_of(variable: Option<String>, cache: &std::path::Path, home: &str) -> String {
     let path = variable
         .filter(|path| !path.is_empty())
@@ -303,8 +303,17 @@ fn registry_of(variable: Option<String>, cache: &std::path::Path, home: &str) ->
     }
 }
 
+/// The registry the .deb's start gave GStreamer for `init` and took back from
+/// the environment afterwards (see `init_gstreamer` in main.rs).
+static PRIVATE_REGISTRY: OnceLock<String> = OnceLock::new();
+
+/// Called once, right after `gstreamer::init`, by the .deb's start.
+pub fn set_private_registry(file: &std::path::Path) {
+    let _ = PRIVATE_REGISTRY.set(file.display().to_string());
+}
+
 impl Facts {
-    /// Reads the registry: after `gstreamer::init` and `scan_private_plugins`.
+    /// Reads the registry: after `gstreamer::init` (`init_gstreamer`).
     /// Ranks are the ones GStreamer gave (see `settings::installed_decoders`),
     /// whatever a Decoding mode changed since. Loads no plugin, except
     /// OpenH264's decoder where it is the one software H.264 decoder (see
@@ -324,7 +333,7 @@ impl Facts {
             (plugin.version().to_string(), file)
         });
         let registry = registry_of(
-            std::env::var("GST_REGISTRY_1_0").ok(),
+            PRIVATE_REGISTRY.get().cloned().or_else(|| std::env::var("GST_REGISTRY_1_0").ok()),
             &glib::user_cache_dir(),
             &glib::home_dir().display().to_string(),
         );
@@ -600,7 +609,7 @@ pub struct Report {
 static REPORT: OnceLock<Report> = OnceLock::new();
 
 /// This system's report, gathered on the first call (after
-/// `gstreamer::init` and `scan_private_plugins`).
+/// `gstreamer::init`, see `init_gstreamer` in main.rs).
 pub fn check() -> &'static Report {
     REPORT.get_or_init(|| {
         let plugins = plugins_of(std::env::var("REOLING_PLUGINS").ok().as_deref());
@@ -1000,9 +1009,11 @@ mod tests {
     #[test]
     fn the_registry_to_remove_is_the_one_gstreamer_writes() {
         let (cache, home) = (std::path::Path::new("/home/user/.cache"), "/home/user");
-        // The AppRun hooks' own.
+        // The AppRun hooks' own, and the .deb's (`init_gstreamer`).
         let hook = Some("/home/user/.cache/reoling/gstreamer-registry-system-1.28.2.bin".to_string());
         assert_eq!(registry_of(hook, cache, home), "~/.cache/reoling/gstreamer-registry-system-1.28.2.bin");
+        let deb = Some("/home/user/.cache/reoling/gstreamer-registry-deb-1.28.2.bin".to_string());
+        assert_eq!(registry_of(deb, cache, home), "~/.cache/reoling/gstreamer-registry-deb-1.28.2.bin");
         // GStreamer's default, in the cache folder XDG_CACHE_HOME names.
         assert_eq!(registry_of(None, cache, home), "~/.cache/gstreamer-1.0/registry.*.bin");
         assert_eq!(registry_of(Some(String::new()), cache, home), "~/.cache/gstreamer-1.0/registry.*.bin");
