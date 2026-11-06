@@ -24,13 +24,14 @@
 # Each container runs the AppImage (unpacked by its runtime, no FUSE in
 # there) for 20 s on a virtual display with a session bus and an empty
 # configuration, as the smoke tests do: it must still be running when the
-# time is up (124 from timeout), print none of the loading failures they
-# look for, name the expected GTK stack in exactly one line and have
-# mapped libgtk-4 from where that stack keeps it. Its requirements report
-# (scripts/assert-requirements.sh, `reoling --check-requirements`) must say
-# that nothing is missing (status 0), with the AppImage's own
-# gtk4paintablesink; the AppImage brings every plugin the app uses, so any
-# gap, and the app's line at start for one, is a packaging bug.
+# time is up (124 from timeout), print none of the loading failures and
+# critical warnings they look for, name the expected GTK stack in exactly
+# one line and have mapped libgtk-4 from where that stack keeps it. Its
+# requirements report (scripts/assert-requirements.sh,
+# `reoling --check-requirements`) must say that nothing is missing
+# (status 0), with the AppImage's own gtk4paintablesink; the AppImage
+# brings every plugin the app uses, so any gap, and the app's line at start
+# for one, is a packaging bug.
 #
 #   scripts/smoke-appimage-in-docker.sh <AppImage> [<scenario>...]   (default: all three)
 #
@@ -50,10 +51,12 @@ resolute_base="libglib2.0-0t64 fonts-dejavu-core shared-mime-info libgl1 libegl1
 noble_base="libglib2.0-0t64 libharfbuzz0b libfribidi0 libfontconfig1 libfreetype6 fonts-dejavu-core libx11-6 libxcb1
     libwayland-client0 libgl1 libegl1 libgles2 libxfixes3 shared-mime-info xvfb xauth dbus procps libasound2t64"
 
-# The loading failures the smoke tests of the release workflow look for,
-# and the app's line at start for a part this system lacks.
+# What the smoke tests of the release workflow look for: the loading
+# failures, a critical warning from GTK, GLib or GStreamer ("Gdk-CRITICAL
+# **: ...", a bug or a broken setup, never a good run), and the app's line
+# at start for a part this system lacks.
 failures='Unable to load image-loading module|Failed to load module|Failed to load plugin'
-failures+='|cannot open shared object file|symbol lookup error|undefined symbol|Missing decoder'
+failures+='|cannot open shared object file|symbol lookup error|undefined symbol|Missing decoder|CRITICAL'
 failures+='|^reoling: missing on this system: '
 
 fail() { echo "FAIL $scenario: $*" >&2; exit 1; }
@@ -109,7 +112,7 @@ inside() {
     echo "--- end of the output"
     [ "$rc" -eq 124 ] || fail "the AppImage ended early with status $rc"
     if grep -E "$failures" "$log"; then
-        fail "the AppImage printed a loading failure (above)"
+        fail "the AppImage printed a loading failure, a critical warning or a missing part (above)"
     fi
     local lines
     lines=$(grep '^reoling: GTK and GStreamer core: ' "$log" || true)

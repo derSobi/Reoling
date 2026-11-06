@@ -38,13 +38,14 @@
 #   ubuntu-24.04-zenity-no-display  a zenity that cannot open the display,
 #                          which GTK also ends with 1: the notification
 #
-# Where the app starts, it runs for 20 s on a virtual display with a session
-# bus and an empty configuration (no devices, no network), as the smoke tests
-# do: it must still be running when the time is up (124 from timeout), print
-# none of the loading failures they look for, name the system's GTK stack
-# ("host") in exactly one line, have mapped the system's libgtk-4, and have
-# written a plugin registry of its own whose one gtk4paintablesink is the
-# AppImage's. Then its requirements report (scripts/assert-requirements.sh,
+# Where the app starts, it runs for 20 s on a virtual display (24-bit, on
+# every distribution) with a session bus and an empty configuration (no
+# devices, no network), as the smoke tests do: it must still be running when
+# the time is up (124 from timeout), print none of the loading failures and
+# critical warnings they look for, name the system's GTK stack ("host") in
+# exactly one line, have mapped the system's libgtk-4, and have written a
+# plugin registry of its own whose one gtk4paintablesink is the AppImage's.
+# Then its requirements report (scripts/assert-requirements.sh,
 # `reoling --check-requirements`) must end with the scenario's status, report
 # exactly the scenario's missing features and name the AppImage's
 # gtk4paintablesink, in the version scripts/build-gst-gtk4-plugin.sh builds;
@@ -71,9 +72,17 @@ all_scenarios="ubuntu-24.04-bare ubuntu-24.04-desktop ubuntu-24.04-deb-deps ubun
     ubuntu-24.04-zenity-fails ubuntu-24.04-zenity-closed ubuntu-24.04-zenity-no-display debian-13 ubuntu-26.04
     fedora-44 fedora-44-noopenh264 opensuse-tumbleweed archlinux"
 
-# The loading failures the smoke tests of the release workflow look for.
+# What the smoke tests of the release workflow look for: the loading
+# failures, and a critical warning from GTK, GLib or GStreamer
+# ("Gdk-CRITICAL **: ...", a bug or a broken setup, never a good run).
 failures='Unable to load image-loading module|Failed to load module|Failed to load plugin'
-failures+='|cannot open shared object file|symbol lookup error|undefined symbol|Missing decoder'
+failures+='|cannot open shared object file|symbol lookup error|undefined symbol|Missing decoder|CRITICAL'
+
+# The virtual display's screen, the one xvfb-run gives on Debian and Ubuntu.
+# openSUSE's xvfb-run starts a 640x480 screen with 8 bits per pixel, on
+# which GTK falls back to cairo and prints a Gdk-CRITICAL ("should not be
+# reached") for what it draws; Fedora's and Arch's start 640x480 at 24 bits.
+xvfb_screen='-screen 0 1280x1024x24'
 
 fail() { echo "FAIL $scenario: $*" >&2; exit 1; }
 
@@ -183,7 +192,7 @@ SH
     command -v gdbus >/dev/null || fail "the image has no gdbus"
     # The service ends after the first call; where none is to come, once the
     # AppImage has ended.
-    dbus-run-session -- xvfb-run -a bash -c '
+    dbus-run-session -- xvfb-run -a -s "$xvfb_screen" bash -c '
         python3 -W ignore /tmp/smoke/notifyd.py > /tmp/smoke/notify.txt 2>&1 &
         notifyd=$!
         for _ in $(seq 1 100); do grep -q "^READY" /tmp/smoke/notify.txt && break; sleep 0.1; done
@@ -228,7 +237,7 @@ run() {
     # second later, not one of the hook's short probes, which carry the
     # same name. xvfb-run may send the program's stderr to its stdout, so
     # the log takes both.
-    dbus-run-session -- xvfb-run -a timeout 20 /smoke/Reoling.AppImage > "$log" 2>&1 &
+    dbus-run-session -- xvfb-run -a -s "$xvfb_screen" timeout 20 /smoke/Reoling.AppImage > "$log" 2>&1 &
     job=$!
     : > "$maps"
     for _ in $(seq 1 18); do
@@ -248,7 +257,7 @@ run() {
     echo "--- end of the output"
     [ "$rc" -eq 124 ] || fail "the AppImage ended early with status $rc"
     if grep -E "$failures" "$log"; then
-        fail "the AppImage printed a loading failure (above)"
+        fail "the AppImage printed a loading failure or a critical warning (above)"
     fi
     lines=$(grep '^reoling: GTK and GStreamer core: ' "$log" || true)
     [ "$(printf '%s' "$lines" | grep -c '^')" -eq 1 ] || fail "not exactly one line names the GTK stack"
@@ -440,13 +449,15 @@ scenario_setup() {
             # A stock Fedora desktop: the install command's packages with
             # noopenh264 in place of openh264 (fedora-cisco-openh264 left
             # out). openh264dec registers but cannot start, so the app counts
-            # no H.264 decoder and names the real library and the stand-in.
+            # no H.264 decoder. Its plugin is loaded, so the app names the
+            # library alone (sudo dnf install openh264), not the plugin's
+            # package, and says that it replaces the noopenh264 stand-in.
             base=fedora:44 setup=one-image elements=$openh264
             installer_options="--disablerepo='fedora-cisco-openh264*'"
             extras="gtk4 gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free"
             extras+=" gstreamer1-plugin-libav gstreamer1-plugin-openh264 noopenh264 gstreamer1-plugin-gtk4"
             rpms_installed=noopenh264 rpms_absent=openh264 status=1 gaps=h264,h265
-            expect_texts="gstreamer1-plugin-openh264 openh264;noopenh264;dnf swap ffmpeg-free ffmpeg --allowerasing" ;;
+            expect_texts="sudo dnf install openh264;noopenh264;dnf swap ffmpeg-free ffmpeg --allowerasing" ;;
         opensuse-tumbleweed)
             # Measured: openh264dec, no avdec_h264 or avdec_h265 (Packman
             # has them). Which openh264 library is installed is printed; the

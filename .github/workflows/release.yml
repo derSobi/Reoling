@@ -138,9 +138,11 @@ jobs:
           # bus and an empty configuration (no devices to reach): it must
           # still be running when the time is up (124 from timeout), and
           # nothing it loads may have failed to (a module, a pixbuf loader,
-          # a GStreamer plugin, a library, a symbol, a decoder), and the
-          # app must not say that anything is missing: the runner has every
-          # package the app uses. Ubuntu's xvfb-run sends the program's
+          # a GStreamer plugin, a library, a symbol, a decoder), GTK, GLib
+          # and GStreamer must not have printed a critical warning (a bug
+          # or a broken setup), and the app must not say that anything is
+          # missing: the runner has every package the app uses. Ubuntu's
+          # xvfb-run (a 24-bit screen by default) sends the program's
           # stderr to its stdout, so the log takes both. An AppImage names
           # in one line the GTK and GStreamer core it runs on, the system's
           # ("host") or the embed AppImage's own ("bundled"); the second
@@ -153,8 +155,8 @@ jobs:
               echo "::error::$1 ended early with status $rc"
               exit 1
             fi
-            if grep -E 'Unable to load image-loading module|Failed to load module|Failed to load plugin|cannot open shared object file|symbol lookup error|undefined symbol|Missing decoder|^reoling: missing on this system: ' "$RUNNER_TEMP/smoke.log"; then
-              echo "::error::$1 printed a loading failure or a missing part (above)"
+            if grep -E 'Unable to load image-loading module|Failed to load module|Failed to load plugin|cannot open shared object file|symbol lookup error|undefined symbol|Missing decoder|CRITICAL|^reoling: missing on this system: ' "$RUNNER_TEMP/smoke.log"; then
+              echo "::error::$1 printed a loading failure, a critical warning or a missing part (above)"
               exit 1
             fi
             if [ -n "${2:-}" ]; then
