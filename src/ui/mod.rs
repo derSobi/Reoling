@@ -18,6 +18,7 @@ pub mod playback_timeline;
 pub mod product_image;
 pub mod recording_file;
 pub mod remote;
+pub mod requirements;
 pub mod schedule_grid;
 pub mod secrets;
 pub mod settings;

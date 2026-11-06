@@ -575,6 +575,10 @@ pub(crate) struct PlaybackDriver {
     hold: Option<Hold>,
     phase: PlayerPhase,
     sink: Option<(VideoType, VideoSink)>,
+    /// A codec whose sink this system could not build: its frames are dropped
+    /// without asking the window again until the page's next command (the
+    /// page has said why and pauses).
+    refused: Option<VideoType>,
     /// A frame went into the sink since its last `reset_for_open`.
     pushed_since_reset: bool,
     auto_failures: u32,
@@ -604,6 +608,7 @@ impl PlaybackDriver {
             hold: None,
             phase: PlayerPhase::Idle,
             sink: None,
+            refused: None,
             pushed_since_reset: false,
             auto_failures: 0,
             last_sent: None,
@@ -675,7 +680,7 @@ impl PlaybackDriver {
             }
             _ => {}
         }
-        apply_intent(&mut self.want, &command);
+        self.take_up(&command);
         match command {
             PlaybackCommand::Day { .. } => {
                 // The page starts every session on a fresh picture, so the
@@ -704,6 +709,14 @@ impl PlaybackDriver {
         }
         self.reconcile(client, tx).await;
         self.send_state(tx).await;
+    }
+
+    /// Records the intent of `command`. A codec refused so far may be asked
+    /// for again: the page acted since (Play retries, see
+    /// `VideoView::retry_picture`).
+    fn take_up(&mut self, command: &PlaybackCommand) {
+        apply_intent(&mut self.want, command);
+        self.refused = None;
     }
 
     /// One unit (or the end, or an error) from the running opening.
@@ -1227,24 +1240,7 @@ impl PlaybackDriver {
     /// when there is none for its codec, and placing the opening's first
     /// frame on the timeline.
     async fn push(&mut self, open: &mut Open, frame: VideoFrame) {
-        let mut new_sink = false;
-        // A sink the page has torn down (a new session, another codec) is
-        // no sink.
-        if self.sink.as_ref().is_some_and(|(_, sink)| sink.is_retired()) {
-            self.sink = None;
-        }
-        if self.sink.as_ref().map(|(video_type, _)| *video_type) != Some(frame.video_type) {
-            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            if self.sinks.send((open.session, frame.video_type, reply_tx)).await.is_err() {
-                return; // the window is gone
-            }
-            // No answer: the page has left this session (another day or
-            // device, or the page itself); the frame is dropped.
-            let Ok(sink) = reply_rx.await else { return };
-            self.sink = Some((frame.video_type, sink));
-            self.pushed_since_reset = false;
-            new_sink = true;
-        }
+        let Some(new_sink) = self.sink_for(open.session, frame.video_type).await else { return };
         let Some((_, sink)) = &self.sink else { return };
         if open.first != FirstFrame::Done || new_sink {
             let status = open.stream.progress.status();
@@ -1270,6 +1266,43 @@ impl PlaybackDriver {
         }
         sink.push_frame(&frame);
         self.pushed_since_reset = true;
+    }
+
+    /// Makes `self.sink` the sink for `video_type`'s frames of `session`,
+    /// asking the window for one when there is none for that codec:
+    /// `Some(true)` when it is new. `None` drops the frame: the window is
+    /// gone, the page has left the session, or the codec was refused.
+    async fn sink_for(&mut self, session: u64, video_type: VideoType) -> Option<bool> {
+        // A sink the page has torn down (a new session, another codec, a
+        // retry) is no sink.
+        if self.sink.as_ref().is_some_and(|(_, sink)| sink.is_retired()) {
+            self.sink = None;
+        }
+        if self.sink.as_ref().map(|(video_type, _)| *video_type) == Some(video_type) {
+            return Some(false);
+        }
+        if self.refused == Some(video_type) {
+            return None;
+        }
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if self.sinks.send((session, video_type, reply_tx)).await.is_err() {
+            return None; // the window is gone
+        }
+        let sink = match reply_rx.await {
+            Ok(Ok(sink)) => sink,
+            // This system cannot show the codec; the page says why and
+            // pauses.
+            Ok(Err(_)) => {
+                self.refused = Some(video_type);
+                return None;
+            }
+            // No answer: the page has left this session (another day or
+            // device, or the page itself); the frame is dropped.
+            Err(_) => return None,
+        };
+        self.sink = Some((video_type, sink));
+        self.pushed_since_reset = false;
+        Some(true)
     }
 
     /// Flushes the sink to `at` (nothing held is shown any more).
@@ -1404,6 +1437,7 @@ impl PlaybackDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::video_view::fixtures::View;
     use reoling::{FootageAnchor, InfoBlock, RecordingId, ReplayKeyframe};
 
     fn t(h: u8, m: u8, s: u8) -> CivilTime {
@@ -1820,5 +1854,79 @@ mod tests {
             "Could not play this recording: timed out waiting for a reply"
         );
         assert_eq!(clock_text(t(23, 15, 0)), "23:15:00");
+    }
+
+    const SESSION: u64 = 7;
+
+    /// The driver gets a sink for a frame of `video_type` while the window's
+    /// replay responder (main_window.rs) answers it from `view`: what
+    /// `sink_for` said, and how many requests the window had.
+    async fn ask(
+        driver: &mut PlaybackDriver,
+        incoming: &mut tokio::sync::mpsc::Receiver<ReplaySinkRequest>,
+        view: &View,
+        video_type: VideoType,
+    ) -> (Option<bool>, u32) {
+        let mut served = 0;
+        let mut asking = std::pin::pin!(driver.sink_for(SESSION, video_type));
+        loop {
+            tokio::select! {
+                got = &mut asking => return (got, served),
+                Some((_, video_type, reply)) = incoming.recv() => {
+                    served += 1;
+                    let _ = reply.send(view.ensure_sink_for(video_type));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_codec_waits_for_the_next_command_and_play_rebuilds_a_sink_without_picture() {
+        let (sinks, mut incoming) = tokio::sync::mpsc::channel::<ReplaySinkRequest>(8);
+        let mut driver = PlaybackDriver::new(Arc::new(AtomicU64::new(0)), sinks);
+        // A system without h265parse.
+        let view = View::new(Some(VideoType::H265));
+        // Refused: the frame is dropped, and the next ones of that codec too,
+        // without asking the window (the page has said why and pauses)...
+        assert_eq!(ask(&mut driver, &mut incoming, &view, VideoType::H265).await, (None, 1));
+        assert_eq!(ask(&mut driver, &mut incoming, &view, VideoType::H265).await, (None, 0));
+        // ...until the page's next command: Play asks again.
+        driver.take_up(&PlaybackCommand::Play { gen: 1 });
+        assert_eq!(ask(&mut driver, &mut incoming, &view, VideoType::H265).await, (None, 1));
+        // A codec it can show: a new sink, kept for the frames after it.
+        driver.take_up(&PlaybackCommand::Stream { gen: 2, stream: RecordStream::Sub });
+        assert_eq!(ask(&mut driver, &mut incoming, &view, VideoType::H264).await, (Some(true), 1));
+        assert_eq!(ask(&mut driver, &mut incoming, &view, VideoType::H264).await, (Some(false), 0));
+        let first = driver.sink.as_ref().map(|(_, sink)| sink.clone()).expect("a sink");
+        // Play over a picture that works keeps its sink.
+        assert!(!view.retry_picture());
+        driver.take_up(&PlaybackCommand::Play { gen: 3 });
+        assert_eq!(ask(&mut driver, &mut incoming, &view, VideoType::H264).await, (Some(false), 0));
+        // No decoder took the stream: Play retires that sink, and the next
+        // frame gets a new one.
+        view.no_decoder("No H.264 decoder on this system.");
+        assert!(view.retry_picture());
+        assert!(first.is_retired());
+        driver.take_up(&PlaybackCommand::Play { gen: 4 });
+        assert_eq!(ask(&mut driver, &mut incoming, &view, VideoType::H264).await, (Some(true), 1));
+        assert!(driver.sink.as_ref().is_some_and(|(_, sink)| !sink.is_retired()));
+        // Builds: H.265 once (then answered from the refusal kept), H.264
+        // twice.
+        assert_eq!(view.builds.get(), 3);
+        view.reset();
+    }
+
+    #[tokio::test]
+    async fn a_frame_of_a_session_the_page_left_is_dropped_and_refuses_nothing() {
+        let (sinks, mut incoming) = tokio::sync::mpsc::channel::<ReplaySinkRequest>(8);
+        let mut driver = PlaybackDriver::new(Arc::new(AtomicU64::new(0)), sinks);
+        let (got, ()) = tokio::join!(driver.sink_for(SESSION, VideoType::H264), async {
+            // The window answers no request of a session the page has left.
+            let (_, _, reply) = incoming.recv().await.expect("a request");
+            drop(reply);
+        });
+        assert_eq!(got, None);
+        assert_eq!(driver.refused, None);
+        assert!(driver.sink.is_none());
     }
 }
