@@ -162,7 +162,8 @@ Fedora's own FFmpeg (`ffmpeg-free`) decodes neither H.264 nor H.265:
   rm -f ~/.cache/reoling/gstreamer-registry-system-*.bin
   ```
 
-  (An installed Reoling uses GStreamer's own,
+  (The .deb's is `~/.cache/reoling/gstreamer-registry-deb-*.bin`; a
+  source build uses GStreamer's own,
   `~/.cache/gstreamer-1.0/registry.*.bin`.)
 
 **openSUSE:**
@@ -278,7 +279,9 @@ downloads. Where one is missing:
     (or H.264), which shows once the stream has started: a live stream
     runs on without its picture, its sound and a recording go on, and
     another stream or camera can be picked;
-  - in Playback, either way, playback pauses, and Play tries again.
+  - in Playback, either way, playback pauses, and Play tries again;
+    picking the other stream takes the text away, and Play then tries
+    that one.
 
 Install what it names and start Reoling again: GStreamer reads its
 plugins at start.
@@ -540,10 +543,11 @@ What Reoling keeps in your home folder stays, for the AppImages and the
   video), an H.265 decoder (H.265 video); This AppImage should bring
   these parts along: please report this at ...`** on stderr, or the
   window "Missing parts" with the same two decoders and a request for a
-  report. The first start may also print
-  GStreamer warnings that `libgstlibav.so` failed to load:
-  `libgpg-error.so.0: cannot open shared object file` (or
-  `libcom_err.so.2`). The embed file takes these two libraries from the
+  report. The first start may also print GStreamer warnings that
+  `libgstlibav.so` and `libgstpulseaudio.so` failed to load:
+  `libgpg-error.so.0: cannot open shared object file`. With
+  `libgpg-error.so.0` there, only `libgstlibav.so` fails, on
+  `libcom_err.so.2`. The embed file takes these two libraries from the
   system; a desktop install has both, a minimal one may not. Install
   them and start Reoling again:
 
