@@ -37,10 +37,22 @@ of the [AppImages](INSTALL-APPIMAGE.md).
 The package itself:
 
 - `/usr/bin/reoling`, the app.
-- GStreamer's GTK 4 paintable sink, in `/usr/lib/reoling/gstreamer-1.0`.
-  Ubuntu 24.04 has no `gstreamer1.0-gtk4` package, so the .deb carries the
-  sink itself; `reoling` adds that directory to its plugin registry when it
-  starts.
+- GStreamer's GTK 4 paintable sink, which draws the picture, in
+  `/usr/lib/reoling/gstreamer-1.0`: the version Reoling is built and
+  tested with. Ubuntu 24.04 has no `gstreamer1.0-gtk4` package; Debian 13
+  and Ubuntu 26.04 have one, in another version. `reoling` uses this
+  sink, also where the distribution's is installed or `GST_PLUGIN_PATH`
+  names another: while GStreamer starts, it puts that directory first on
+  GStreamer's plugin path and uses a plugin registry of its own,
+  `~/.cache/reoling/gstreamer-registry-deb-<GStreamer version>.bin`, as
+  the AppImages do. That holds for Reoling alone: it puts the environment
+  back once GStreamer has started, so the programs it starts get yours,
+  and the registry other GStreamer programs share
+  (`~/.cache/gstreamer-1.0`) is not written, so they go on using the
+  distribution's sink. System Status and `reoling --check-requirements`
+  name the sink in use (`Display: gtk4paintablesink <version> (<file>)`).
+  Should the .deb's file fail to load, GStreamer says why on stderr, and
+  Reoling uses the distribution's sink where there is one.
 - The desktop entry and the icons, so Reoling appears in the applications
   menu.
 - This documentation, in `/usr/share/doc/reoling`.
@@ -91,7 +103,8 @@ folder stays, for the .deb and the AppImages alike; delete it by hand if
 you want it gone:
 
 - `~/.config/reoling`: the devices and the settings;
-- `~/.cache/reoling`: cached product pictures;
+- `~/.cache/reoling`: cached product pictures and Reoling's GStreamer
+  plugin registries;
 - the device passwords, in the desktop keyring;
 - the snapshots, recordings and downloads, in `~/Pictures/Reoling` and
   `~/Videos/Reoling` or the folders set in Client Settings.

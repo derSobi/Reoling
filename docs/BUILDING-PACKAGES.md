@@ -32,9 +32,11 @@ Run these from the top of the repository.
    ```
 
 3. Build GStreamer's GTK 4 paintable sink, which all three packages carry
-   (Ubuntu 24.04 has no `gstreamer1.0-gtk4`). Beside `libgstgtk4.so` it
-   writes the sink's licence, `LICENSE-MPL-2.0`, and `SOURCE`, which says
-   where its source is; the system AppImage carries both:
+   and use ahead of one the distribution may have (Ubuntu 24.04 has no
+   `gstreamer1.0-gtk4`; Debian 13 and Ubuntu 26.04 have another
+   version). Beside `libgstgtk4.so` it writes the sink's licence,
+   `LICENSE-MPL-2.0`, and `SOURCE`, which says where its source is; the
+   system AppImage carries both:
 
    ```bash
    scripts/build-gst-gtk4-plugin.sh target/gst-gtk4
@@ -97,10 +99,10 @@ directory, created if missing):
 scripts/validate-in-docker.sh --host ~/reoling-validate
 ```
 
-It runs the system AppImage's Ubuntu 24.04 scenarios; with
-`ALL_DISTROS=1` set, it runs every distribution's. For AppImages built
-elsewhere, name them after the directory: it then runs only their smoke
-tests.
+It runs the system AppImage's Ubuntu 24.04 scenarios (with
+`ALL_DISTROS=1` set, every distribution's) and both of the .deb's. For
+AppImages built elsewhere, name them after the directory: it then runs
+only their smoke tests.
 
 ```bash
 scripts/validate-in-docker.sh --host ~/reoling-validate dist/Reoling-<version>-*-x86_64.AppImage
@@ -115,12 +117,14 @@ A critical warning from GTK, GLib or GStreamer (`Gdk-CRITICAL **: ...`)
 fails the run as well.
 
 Each package's requirements report is checked as well, by
-`scripts/assert-requirements.sh <program> <status> <gaps> <sink> [<text>...]`.
+`scripts/assert-requirements.sh <program> <status> <gaps> <sink> [<text>...] [--absent <text>...]`.
 It runs `<program> --check-requirements` with no display and requires the
 exit status, exactly the missing features given (`none`, or a list of
 `picture`, `h264`, `h265`, `sound`, `talk`, `recording`, `downloads`),
 the `gtk4paintablesink` file and version in the `Display:` line, and each
-text given (an install command, the embed AppImage's name).
+text given (an install command, the embed AppImage's name); a text after
+`--absent` (the package of a plugin the system has loaded) must not be
+there.
 
 The embed AppImage, in containers
 (`scripts/smoke-appimage-in-docker.sh <AppImage> [<scenario>...]`):
@@ -165,8 +169,37 @@ The system AppImage, in containers
   the status and missing features of the table, with the advice texts
   for that distribution, and print the app's line at start exactly when
   something is missing.
+- The report must not name the package of a plugin that is loaded
+  there: on Fedora `gstreamer1-plugin-libav` (with the noopenh264
+  stand-in also `gstreamer1-plugin-openh264`), on openSUSE
+  `gstreamer-plugins-libav`.
 - The release runs the Ubuntu 24.04 scenarios in its job **.deb and
   AppImages**, and each other distribution in a job of its own.
+
+The .deb, in containers of the distributions that have a GTK 4 sink of
+their own (`scripts/smoke-deb-in-docker.sh <.deb> [<scenario>...]`):
+
+| Scenario | System | Report |
+|---|---|---|
+| `ubuntu-26.04-gtk4` | Ubuntu 26.04 with `gstreamer1.0-gtk4` | 0 |
+| `debian-13-gtk4` | Debian 13 with `gstreamer1.0-gtk4` | 0 |
+
+- The image has the distribution's sink and the .deb's dependencies,
+  and apt installs the .deb in it without a network. `reoling
+  --version` must give the .deb's version; the 20 s run must show no
+  loading failure, critical warning or missing part, and write no
+  thumbnailer and no per-user desktop entry.
+- The report must give status 0, nothing missing and the .deb's own
+  sink, `/usr/lib/reoling/gstreamer-1.0/libgstgtk4.so`, in the version
+  `scripts/build-gst-gtk4-plugin.sh` builds, not the distribution's.
+- The plugin registry must be Reoling's own,
+  `~/.cache/reoling/gstreamer-registry-deb-<GStreamer version>.bin`, and
+  the one other GStreamer programs share (`~/.cache/gstreamer-1.0`) must
+  not be written. With `GST_REGISTRY_FORK=no`, where GStreamer loads the
+  plugins in the app's own process while it scans them, the report must
+  be the same, with no registry and with the one that start wrote.
+- The release runs each in a job of its own; its job **.deb and
+  AppImages** runs the .deb on Ubuntu 24.04, which has no such sink.
 
 ## What it touches
 
@@ -180,13 +213,14 @@ The system AppImage, in containers
 - `cargo-deb`, installed by `cargo install`;
 - the system packages of step 1 (apt), and the Rust crates in `~/.cargo`;
 - with the rehearsal and the container smoke tests: the Docker images
-  they build (`reoling-smoke:*` and `reoling-smoke-app-only:*`, set
-  `SMOKE_IMAGE_PREFIX` for other names) and the output directory.
+  they build (`reoling-smoke:*`, `reoling-smoke-app-only:*` and
+  `reoling-smoke-deb:*`, set `SMOKE_IMAGE_PREFIX` for other names) and
+  the output directory.
 
 ## How the release builds and tests them
 
 The release workflow, `.github/workflows/release.yml`, runs on Ubuntu
-24.04, in three jobs:
+24.04, in four jobs:
 
 1. A pushed tag `v<version>` starts it and gets the three packages
    uploaded to its release. A manual run only keeps them, with their
@@ -214,9 +248,13 @@ The release workflow, `.github/workflows/release.yml`, runs on Ubuntu
 3. The jobs **App-only AppImage**, one per distribution, run the system
    AppImage of that artifact on Debian 13, Ubuntu 26.04, Fedora 44 (also
    with the noopenh264 stand-in), openSUSE Tumbleweed and Arch Linux.
-4. Only when both have passed, and only for a tag, the job **Upload to
-   the release** uploads the .deb and the two AppImages to it.
-   `SHA256SUMS` stays in the artifact, for the release notes.
+4. The jobs **.deb on ubuntu-26.04-gtk4** and **.deb on
+   debian-13-gtk4** install the .deb of that artifact beside the
+   distribution's `gstreamer1.0-gtk4`, whose sink it must not use (see
+   [The smoke tests](#the-smoke-tests)).
+5. Only when all of them have passed, and only for a tag, the job
+   **Upload to the release** uploads the .deb and the two AppImages to
+   it. `SHA256SUMS` stays in the artifact, for the release notes.
 
 ## Updating
 
