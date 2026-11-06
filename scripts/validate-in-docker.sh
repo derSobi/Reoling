@@ -185,20 +185,21 @@ fi
 # virtual display with a session bus and an empty configuration (no devices
 # to reach): it must still be running when the time is up (124 from
 # timeout), and nothing it loads may have failed to (a module, a pixbuf
-# loader, a GStreamer plugin, a library, a symbol, a decoder), and on this
-# system, which has every package the app uses, the app must not say that
-# anything is missing. Ubuntu's xvfb-run sends the program's stderr to its
-# stdout, so the log takes both. An AppImage names in one line the GTK and
-# GStreamer core it chose, the system's ("host") or its own ("bundled"); $2
-# is the one it must name.
+# loader, a GStreamer plugin, a library, a symbol, a decoder), GTK, GLib and
+# GStreamer must not have printed a critical warning (a bug or a broken
+# setup), and on this system, which has every package the app uses, the app
+# must not say that anything is missing. Ubuntu's xvfb-run (a 24-bit screen
+# by default) sends the program's stderr to its stdout, so the log takes
+# both. An AppImage names in one line the GTK and GStreamer core it chose,
+# the system's ("host") or its own ("bundled"); $2 is the one it must name.
 run_for_20s() {
     local rc=0 stack
     dbus-run-session -- xvfb-run -a timeout 20 "$1" > /tmp/smoke.log 2>&1 || rc=$?
     cat /tmp/smoke.log
     [ "$rc" -eq 124 ] || { echo "$1 ended early with status $rc" >&2; exit 1; }
-    if grep -E 'Unable to load image-loading module|Failed to load module|Failed to load plugin|cannot open shared object file|symbol lookup error|undefined symbol|Missing decoder' /tmp/smoke.log \
+    if grep -E 'Unable to load image-loading module|Failed to load module|Failed to load plugin|cannot open shared object file|symbol lookup error|undefined symbol|Missing decoder|CRITICAL' /tmp/smoke.log \
         || grep '^reoling: missing on this system: ' /tmp/smoke.log; then
-        echo "$1 printed a loading failure or a missing part (above)" >&2
+        echo "$1 printed a loading failure, a critical warning or a missing part (above)" >&2
         exit 1
     fi
     if [ -n "${2:-}" ]; then
