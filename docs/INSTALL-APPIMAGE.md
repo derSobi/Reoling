@@ -184,14 +184,35 @@ alike; delete it by hand if you want it gone:
 ## Troubleshooting
 
 - **It does not start: "Cannot mount AppImage, please check your FUSE
-  setup."** FUSE is missing: install the `fusermount` program (on Debian
-  and Ubuntu, package `fuse3`). Without FUSE, the AppImage can unpack
-  itself instead:
+  setup."** FUSE is missing or cannot be used, and the lines above the
+  message say why: `No suitable fusermount binary found` means the
+  `fusermount` program is missing (on Debian and Ubuntu, package
+  `fuse3`), `fuse: device not found` that there is no `/dev/fuse`, and
+  `mount failed: Permission denied` alone that the system does not allow
+  the mount. Without FUSE, the AppImage can unpack itself instead:
   - `./Reoling-<version>-x86_64.AppImage --appimage-extract-and-run`
-    unpacks it to a temporary directory, for that run only;
+    unpacks it into `$TMPDIR` (`/tmp` if that is not set) and runs it
+    from there;
   - `./Reoling-<version>-x86_64.AppImage --appimage-extract` unpacks it
     for good, into `squashfs-root/` in the current folder; start that
     copy with `./squashfs-root/AppRun`.
+
+  `--appimage-extract-and-run` leaves its copy, a few hundred MB, in
+  `$TMPDIR` (or `/tmp`) as `appimage_extracted_<checksum>`: the next run
+  of the same file uses it again, and a new version unpacks one of its
+  own beside it. To free the space, with Reoling not running, delete the
+  copies that hold Reoling (other AppImages may leave theirs there too):
+
+  ```bash
+  for f in "${TMPDIR:-/tmp}"/appimage_extracted_*/usr/bin/reoling; do
+      rm -rf "${f%/usr/bin/reoling}"
+  done
+  ```
+
+  Started with `--appimage-extract-and-run`, Reoling still writes its
+  menu entry and, with Run at Startup on, its autostart entry; both start
+  the AppImage file without the option, so without FUSE neither starts
+  Reoling: start it from a terminal as above.
 - **A few "Theme parser error" lines on stderr, and the theme looks a
   little off.** On the bundled GTK, a theme written for a newer GTK may
   print them and lose some of its looks. The stderr line
