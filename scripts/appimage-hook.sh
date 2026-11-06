@@ -211,6 +211,7 @@ echo "reoling: GTK and GStreamer core: $reoling_mode ($reoling_what${reoling_why
 GST_REGISTRY_1_0="${XDG_CACHE_HOME:-$HOME/.cache}/reoling/gstreamer-registry-$reoling_mode-${reoling_gst:-unknown}.bin"
 export GST_REGISTRY_1_0
 mkdir -p "$(dirname "$GST_REGISTRY_1_0")" 2>/dev/null || true
+export REOLING_PLUGINS=bundled # for the app's requirements check: the GStreamer plugins are this AppImage's own
 
 # Fallback symbolic icons for the UI, tried after the desktop's own theme.
 export REOLING_ICON_PATH="$APPDIR/usr/share/reoling/icons"

@@ -1,12 +1,18 @@
 # Builds the release packages on Ubuntu 24.04 (the oldest supported target:
 # glibc 2.39, GTK 4.14, GStreamer 1.24) so that they install on 24.04 and
-# later: reoling_<version>-1_amd64.deb and Reoling-<version>-x86_64.AppImage.
+# later: reoling_<version>-1_amd64.deb and two AppImages, named by
+# scripts/appimage-common.sh: Reoling-<version>-embed-x86_64.AppImage (GTK 4,
+# GStreamer and the decoders inside) and Reoling-<version>-system-x86_64.AppImage
+# (the app alone; the system's GTK 4, GStreamer and decoders). Every package
+# also gives its requirements report (scripts/assert-requirements.sh), which
+# must say exactly what the system it runs on lacks: nothing on the runner.
 #
 # Triggers: a pushed tag v<version> (a GitHub release created from the web
-# UI pushes its tag) uploads both files to that tag's release; a manual run
-# (workflow_dispatch) builds the branch or commit it is dispatched on and
-# only keeps them as a workflow artifact. Either way the version named by
-# the tag or the input must be the one in Cargo.toml.
+# UI pushes its tag) uploads the three files to that tag's release once every
+# test of the run has passed; a manual run (workflow_dispatch) builds the
+# branch or commit it is dispatched on and only keeps them, with their
+# SHA256SUMS, as a workflow artifact. Either way the version named by the tag
+# or the input must be the one in Cargo.toml.
 name: Release packages
 
 on:
@@ -24,11 +30,15 @@ permissions:
 
 jobs:
   packages:
-    name: .deb and AppImage (Ubuntu 24.04)
+    name: .deb and AppImages (Ubuntu 24.04)
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 75
     env:
       CARGO_TERM_COLOR: always
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      bundled: ${{ steps.version.outputs.bundled }}
+      app_only: ${{ steps.version.outputs.app_only }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -47,6 +57,11 @@ jobs:
             exit 1
           fi
           echo "version=$crate" >> "$GITHUB_OUTPUT"
+          # The two AppImages' file names: dist/ holds both, so every step
+          # names the one it means instead of matching a pattern.
+          . scripts/appimage-common.sh
+          echo "bundled=$(appimage_file_name bundled "$crate")" >> "$GITHUB_OUTPUT"
+          echo "app_only=$(appimage_file_name app-only "$crate")" >> "$GITHUB_OUTPUT"
           echo "Packaging reoling $crate"
 
       - name: Install the Ubuntu 24.04 packages
@@ -81,26 +96,55 @@ jobs:
           mkdir -p dist
           cp target/debian/reoling_*.deb dist/
 
-      - name: AppImage
+      - name: AppImages
         run: |
+          # The tools, and the AppImage runtime both AppImages start with.
           scripts/fetch-appimage-tools.sh "$RUNNER_TEMP/appimage-tools"
-          APPIMAGE_TOOLS="$RUNNER_TEMP/appimage-tools" scripts/build-appimage.sh target/release/reoling dist
+          export APPIMAGE_TOOLS="$RUNNER_TEMP/appimage-tools"
+          scripts/build-appimage.sh target/release/reoling dist
+          scripts/build-appimage-app-only.sh target/release/reoling dist
+
+      - name: The two AppImages carry the same desktop files
+        env:
+          BUNDLED: ${{ steps.version.outputs.bundled }}
+          APP_ONLY: ${{ steps.version.outputs.app_only }}
+        run: |
+          # AppRun, the icons and the desktop entry, from which the app gives
+          # the AppImage file its icon and its menu entry, are the same files
+          # in both (scripts/appimage-common.sh writes them for both).
+          for f in "$BUNDLED" "$APP_ONLY"; do
+            mkdir -p "$RUNNER_TEMP/extract/$f"
+            (cd "$RUNNER_TEMP/extract/$f" && "$GITHUB_WORKSPACE/dist/$f" --appimage-extract >/dev/null)
+          done
+          a="$RUNNER_TEMP/extract/$BUNDLED/squashfs-root"
+          b="$RUNNER_TEMP/extract/$APP_ONLY/squashfs-root"
+          for f in AppRun .DirIcon de.dersobi.reoling.png usr/share/applications/de.dersobi.reoling.desktop \
+                   usr/share/icons/hicolor/{16x16,22x22,24x24,32x32,48x48,64x64}/apps/de.dersobi.reoling.png \
+                   usr/share/icons/hicolor/{128x128,256x256,512x512}/apps/de.dersobi.reoling.png; do
+            cmp "$a/$f" "$b/$f"
+          done
+          test "$(readlink "$a/de.dersobi.reoling.desktop")" = "$(readlink "$b/de.dersobi.reoling.desktop")"
+          diff -r "$a/usr/share/reoling/icons" "$b/usr/share/reoling/icons"
+          ls -l dist
 
       - name: Smoke tests
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          BUNDLED: dist/${{ steps.version.outputs.bundled }}
+          APP_ONLY: dist/${{ steps.version.outputs.app_only }}
         run: |
           # --version answers before GTK and GStreamer come up, so each
           # package also runs for 20 s on a virtual display with a session
           # bus and an empty configuration (no devices to reach): it must
           # still be running when the time is up (124 from timeout), and
           # nothing it loads may have failed to (a module, a pixbuf loader,
-          # a GStreamer plugin, a library, a symbol, a decoder). Ubuntu's
-          # xvfb-run sends the program's stderr to its stdout, so the log
-          # takes both. The AppImage names in one line the GTK and
-          # GStreamer core it chose, the system's ("host") or its own
-          # ("bundled"); the second argument is the one it must name.
-          export XDG_CONFIG_HOME="$RUNNER_TEMP/smoke-config" XDG_CACHE_HOME="$RUNNER_TEMP/smoke-cache" XDG_DATA_HOME="$RUNNER_TEMP/smoke-data"
+          # a GStreamer plugin, a library, a symbol, a decoder), and the
+          # app must not say that anything is missing: the runner has every
+          # package the app uses. Ubuntu's xvfb-run sends the program's
+          # stderr to its stdout, so the log takes both. An AppImage names
+          # in one line the GTK and GStreamer core it runs on, the system's
+          # ("host") or the embed AppImage's own ("bundled"); the second
+          # argument is the one it must name.
           smoke() {
             rc=0
             dbus-run-session -- xvfb-run -a timeout 20 "$1" > "$RUNNER_TEMP/smoke.log" 2>&1 || rc=$?
@@ -109,8 +153,8 @@ jobs:
               echo "::error::$1 ended early with status $rc"
               exit 1
             fi
-            if grep -E 'Unable to load image-loading module|Failed to load module|Failed to load plugin|cannot open shared object file|symbol lookup error|undefined symbol|Missing decoder' "$RUNNER_TEMP/smoke.log"; then
-              echo "::error::$1 printed a loading failure (above)"
+            if grep -E 'Unable to load image-loading module|Failed to load module|Failed to load plugin|cannot open shared object file|symbol lookup error|undefined symbol|Missing decoder|^reoling: missing on this system: ' "$RUNNER_TEMP/smoke.log"; then
+              echo "::error::$1 printed a loading failure or a missing part (above)"
               exit 1
             fi
             if [ -n "${2:-}" ]; then
@@ -129,49 +173,95 @@ jobs:
               exit 1
             fi
           }
-          # The AppImage runs first, before the .deb is installed, as on a
-          # machine that has only the AppImage. At its start it (and only
-          # it) gives its own file an icon in the file manager: the Reoling
-          # icon copied into the user's icon theme for the sizes the system
-          # theme lacks (all of them here) and set as the file's custom icon
-          # (an attribute the session's gvfs keeps; not checked here),
-          # thumbnail-cache entries for the file's URI (the runtime names
-          # the file by its real path), and, the system having no Reoling
-          # desktop entry yet, a per-user one that starts the file. The
-          # runner's GTK 4.14 and GStreamer 1.24 are as new as the bundled
-          # ones, so it runs on those first, then on its own
-          # (REOLING_GTK_STACK=bundled). Its --version is read without
-          # xvfb-run, which would add the stack line from stderr.
-          chmod +x dist/Reoling-*.AppImage
-          test "$(dist/Reoling-*.AppImage --version 2>/dev/null)" = "reoling $VERSION"
-          smoke dist/Reoling-*.AppImage host
-          for size in 16 22 24 32 48 64 128 256 512; do
-            png="$XDG_DATA_HOME/icons/hicolor/${size}x${size}/apps/de.dersobi.reoling.png"
-            test -s "$png" || { echo "::error::the AppImage did not copy its $size px icon into the user icon theme ($png)"; exit 1; }
-            cmp "$png" "data/icons/hicolor/${size}x${size}/apps/de.dersobi.reoling.png"
+          # Each AppImage runs with XDG directories of its own ($1), as on a
+          # machine that has only that AppImage.
+          xdg_dirs() {
+            export XDG_CONFIG_HOME="$RUNNER_TEMP/smoke-$1/config" XDG_CACHE_HOME="$RUNNER_TEMP/smoke-$1/cache" \
+                   XDG_DATA_HOME="$RUNNER_TEMP/smoke-$1/data"
+          }
+          # The requirements report of the package $1 (reoling
+          # --check-requirements, no display): on the runner nothing is
+          # missing (status 0), the gtk4paintablesink in use is the
+          # package's own, from the file $2 (a pattern), in the version
+          # scripts/build-gst-gtk4-plugin.sh builds, and the report says
+          # $3 as well: where the plugins come from, as the AppImage's hook
+          # told the app (REOLING_PLUGINS).
+          requirements() {
+            scripts/assert-requirements.sh "$1" 0 none "$2" ${3:+"$3"} \
+              || { echo "::error::$1's requirements report (above)"; exit 1; }
+          }
+          appimage_sink='*/@(.mount_*|appimage_extracted_*)/usr/lib/gstreamer-1.0/libgstgtk4.so'
+          # At its start an AppImage (and only an AppImage) gives its own
+          # file an icon in the file manager: the Reoling icon copied into
+          # the user's icon theme for the sizes the system theme lacks (all
+          # of them here) and set as the file's custom icon (an attribute
+          # the session's gvfs keeps; not checked here), thumbnail-cache
+          # entries for the file's URI (the runtime names the file by its
+          # real path), and, the system having no Reoling desktop entry yet,
+          # a per-user one that starts the file. Checked for the AppImage $1
+          # after its first run.
+          integration() {
+            local appimage key size png line
+            appimage=$(realpath "$1")
+            for size in 16 22 24 32 48 64 128 256 512; do
+              png="$XDG_DATA_HOME/icons/hicolor/${size}x${size}/apps/de.dersobi.reoling.png"
+              test -s "$png" || { echo "::error::$1 did not copy its $size px icon into the user icon theme ($png)"; exit 1; }
+              cmp "$png" "data/icons/hicolor/${size}x${size}/apps/de.dersobi.reoling.png"
+            done
+            key=$(printf 'file://%s' "$appimage" | md5sum | cut -c1-32)
+            for size in large x-large; do
+              png="$XDG_CACHE_HOME/thumbnails/$size/$key.png"
+              test -s "$png" || { echo "::error::$1 wrote no $size thumbnail of itself ($png)"; exit 1; }
+              file "$png"
+            done
+            entry="$XDG_DATA_HOME/applications/de.dersobi.reoling.desktop"
+            test -s "$entry" || { echo "::error::$1 wrote no desktop entry ($entry)"; exit 1; }
+            cat "$entry"
+            for line in "Exec=\"$appimage\"" "TryExec=$appimage" "Icon=de.dersobi.reoling" "X-Reoling-Generated=true"; do
+              grep -qFx "$line" "$entry" || { echo "::error::$1's desktop entry lacks $line"; exit 1; }
+            done
+            if grep -q '^MimeType=' "$entry"; then
+              echo "::error::$1's desktop entry claims MIME types"
+              exit 1
+            fi
+            desktop-file-validate "$entry"
+          }
+          chmod +x "$BUNDLED" "$APP_ONLY"
+          # The bundled AppImage runs first on the runner's GTK 4.14 and
+          # GStreamer 1.24, as new as its own, then on its own
+          # (REOLING_GTK_STACK=bundled). --version is read without xvfb-run,
+          # which would add the stack line from stderr.
+          xdg_dirs bundled
+          test "$("$BUNDLED" --version 2>/dev/null)" = "reoling $VERSION"
+          smoke "$BUNDLED" host
+          integration "$BUNDLED"
+          requirements "$BUNDLED" "$appimage_sink" "Plugins: bundled with the AppImage"
+          REOLING_GTK_STACK=bundled smoke "$BUNDLED" bundled
+          REOLING_GTK_STACK=bundled requirements "$BUNDLED" "$appimage_sink" "Plugins: bundled with the AppImage"
+          # The app-only AppImage runs on the runner's GTK, GStreamer and
+          # plugins (scripts/noble-packages.txt has every plugin the app
+          # uses) with its own sink, from a registry of its own that names
+          # that sink, from the AppImage's mount, and no other.
+          xdg_dirs app-only
+          test "$("$APP_ONLY" --version 2>/dev/null)" = "reoling $VERSION"
+          smoke "$APP_ONLY" host
+          integration "$APP_ONLY"
+          registry=$(ls "$XDG_CACHE_HOME"/reoling/gstreamer-registry-system-*.bin)
+          sinks=$(grep -aoE '/[^[:cntrl:][:space:]]*/libgstgtk4\.so' "$registry" | sed 's|^/*|/|' | sort -u)
+          case $sinks in
+            *$'\n'*|"") echo "::error::the app-only registry names not exactly one GTK 4 sink: $sinks"; exit 1 ;;
+            */.mount_*/usr/lib/gstreamer-1.0/libgstgtk4.so|*/appimage_extracted_*/usr/lib/gstreamer-1.0/libgstgtk4.so)
+              echo "GTK 4 sink: $sinks" ;;
+            *) echo "::error::the app-only registry's GTK 4 sink is not the AppImage's: $sinks"; exit 1 ;;
+          esac
+          for element in appsrc queue decodebin videoconvert h264parse h265parse avdec_h264 avdec_h265 avdec_aac \
+                         gtk4paintablesink; do
+            grep -qa "$element" "$registry" || { echo "::error::$element is not in the app-only registry"; exit 1; }
           done
-          key=$(printf 'file://%s' "$(realpath dist/Reoling-*.AppImage)" | md5sum | cut -c1-32)
-          for size in large x-large; do
-            png="$XDG_CACHE_HOME/thumbnails/$size/$key.png"
-            test -s "$png" || { echo "::error::the AppImage wrote no $size thumbnail of itself ($png)"; exit 1; }
-            file "$png"
-          done
-          entry="$XDG_DATA_HOME/applications/de.dersobi.reoling.desktop"
-          appimage=$(realpath dist/Reoling-*.AppImage)
-          test -s "$entry" || { echo "::error::the AppImage wrote no desktop entry ($entry)"; exit 1; }
-          cat "$entry"
-          for line in "Exec=\"$appimage\"" "TryExec=$appimage" "Icon=de.dersobi.reoling" "X-Reoling-Generated=true"; do
-            grep -qFx "$line" "$entry" || { echo "::error::the AppImage's desktop entry lacks $line"; exit 1; }
-          done
-          if grep -q '^MimeType=' "$entry"; then
-            echo "::error::the AppImage's desktop entry claims MIME types"
-            exit 1
-          fi
-          desktop-file-validate "$entry"
-          REOLING_GTK_STACK=bundled smoke dist/Reoling-*.AppImage bundled
+          requirements "$APP_ONLY" "$appimage_sink" "Plugins: the system's, under the AppImage"
           # Then the .deb, installed; it does none of the above, and its
-          # start removes the AppImage's per-user desktop entry, which would
-          # hide the .deb's own.
+          # start removes the per-user desktop entry the AppImage started
+          # last wrote, which would hide the .deb's own.
           sudo apt-get install -y ./dist/reoling_*.deb
           test "$(xvfb-run -a reoling --version)" = "reoling $VERSION"
           smoke reoling
@@ -179,14 +269,38 @@ jobs:
             echo "::error::the .deb left the AppImage's per-user desktop entry in place ($entry)"
             exit 1
           fi
+          requirements reoling /usr/lib/reoling/gstreamer-1.0/libgstgtk4.so
           ls -l dist
 
       - name: Smoke tests in containers
-        # The AppImage on the systems its two GTK stacks are for: Ubuntu
-        # 26.04 with GTK 4.22 and Yaru-dark (the system's GTK, no theme
-        # parser error), Ubuntu 26.04 without libva-x11 (the software
-        # decoders still register), Ubuntu 24.04 without GTK 4 (its own).
-        run: scripts/smoke-appimage-in-docker.sh dist/Reoling-*.AppImage
+        env:
+          BUNDLED: dist/${{ steps.version.outputs.bundled }}
+          APP_ONLY: dist/${{ steps.version.outputs.app_only }}
+        run: |
+          # The bundled AppImage on the systems its two GTK stacks are for:
+          # Ubuntu 26.04 with GTK 4.22 and Yaru-dark (the system's GTK, no
+          # theme parser error), Ubuntu 26.04 without libva-x11 (the
+          # software decoders still register), Ubuntu 24.04 without GTK 4
+          # (its own).
+          scripts/smoke-appimage-in-docker.sh "$BUNDLED"
+          # The app-only AppImage on Ubuntu 24.04: bare (it refuses and
+          # names the packages, which then make it start), as the desktop
+          # installs it (no -bad, no libav: it starts and reports what it
+          # lacks), with the .deb's dependencies (nothing missing), and its
+          # refusal as a desktop notification, also where zenity is there
+          # but fails or cannot open the display, and none after a zenity
+          # dialog the user closed. The other distributions run in the next
+          # job.
+          DEB=$(ls dist/reoling_*.deb) scripts/smoke-app-only-in-docker.sh "$APP_ONLY" \
+              ubuntu-24.04-bare ubuntu-24.04-desktop ubuntu-24.04-deb-deps ubuntu-24.04-notify \
+              ubuntu-24.04-zenity-fails ubuntu-24.04-zenity-closed ubuntu-24.04-zenity-no-display
+
+      - name: Checksums
+        working-directory: dist
+        env:
+          BUNDLED: ${{ steps.version.outputs.bundled }}
+          APP_ONLY: ${{ steps.version.outputs.app_only }}
+        run: sha256sum "$BUNDLED" "$APP_ONLY" reoling_*.deb | tee SHA256SUMS
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -194,10 +308,53 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  app-only-distributions:
+    # The app-only AppImage on the distributions it is for besides Ubuntu
+    # 24.04, each from its bare image: it refuses and names the packages,
+    # which then make it start, with its own GTK 4 sink ahead of the
+    # distribution's; and on a stock Fedora desktop, whose OpenH264 is the
+    # stand-in that decodes nothing.
+    name: App-only AppImage on ${{ matrix.scenario }}
+    needs: packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [debian-13, ubuntu-26.04, fedora-44, fedora-44-noopenh264, opensuse-tumbleweed, archlinux]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: reoling-packages
+          path: dist
+
+      - name: Smoke test in a container
+        env:
+          APP_ONLY: dist/${{ needs.packages.outputs.app_only }}
+          SCENARIO: ${{ matrix.scenario }}
+        run: scripts/smoke-app-only-in-docker.sh "$APP_ONLY" "$SCENARIO"
+
+  release:
+    # Only files every test passed for reach the release.
+    name: Upload to the release
+    needs: [packages, app-only-distributions]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: reoling-packages
+          path: dist
+
       - name: Upload to the release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUNDLED: ${{ needs.packages.outputs.bundled }}
+          APP_ONLY: ${{ needs.packages.outputs.app_only }}
         run: |
           tag=$GITHUB_REF_NAME
           if ! gh release view "$tag" >/dev/null 2>&1; then
@@ -205,4 +362,7 @@ jobs:
             # files, for the maintainer to publish.
             gh release create "$tag" --draft --verify-tag --title "Reoling ${tag#v}" --generate-notes
           fi
-          gh release upload "$tag" dist/reoling_*.deb dist/Reoling-*.AppImage --clobber
+          # The packages only: SHA256SUMS stays in the artifact, for the
+          # release notes (the files this run built are replaced by the
+          # tested ones before the release is published).
+          gh release upload "$tag" dist/reoling_*.deb "dist/$BUNDLED" "dist/$APP_ONLY" --clobber

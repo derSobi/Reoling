@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Starts the AppImage in containers that stand for the systems its two GTK
-# stacks are for (scripts/appimage-hook.sh chooses one at every start), as
+# Starts the embed AppImage (Reoling-<version>-embed-x86_64.AppImage,
+# scripts/build-appimage.sh) in containers that stand for the systems its two
+# GTK stacks are for (scripts/appimage-hook.sh chooses one at every start), as
 # the release workflow does after the smoke tests on its Ubuntu 24.04
 # runner, and scripts/validate-in-docker.sh before anything is pushed:
 #
@@ -25,13 +26,19 @@
 # configuration, as the smoke tests do: it must still be running when the
 # time is up (124 from timeout), print none of the loading failures they
 # look for, name the expected GTK stack in exactly one line and have
-# mapped libgtk-4 from where that stack keeps it.
+# mapped libgtk-4 from where that stack keeps it. Its requirements report
+# (scripts/assert-requirements.sh, `reoling --check-requirements`) must say
+# that nothing is missing (status 0), with the AppImage's own
+# gtk4paintablesink; the AppImage brings every plugin the app uses, so any
+# gap, and the app's line at start for one, is a packaging bug.
 #
 #   scripts/smoke-appimage-in-docker.sh <AppImage> [<scenario>...]   (default: all three)
 #
 # The images are built from ubuntu:26.04 and ubuntu:24.04 (apt, so with a
-# network) and tagged reoling-smoke:<scenario>, which a second run reuses;
-# the containers run without a network.
+# network) and tagged $SMOKE_IMAGE_PREFIX:<scenario> (default reoling-smoke),
+# which a second run reuses; the containers run without a network.
+# SINK_VERSION is gtk4paintablesink's version (default: the one
+# scripts/build-gst-gtk4-plugin.sh builds).
 set -euo pipefail
 export LC_ALL=C.UTF-8
 
@@ -43,9 +50,11 @@ resolute_base="libglib2.0-0t64 fonts-dejavu-core shared-mime-info libgl1 libegl1
 noble_base="libglib2.0-0t64 libharfbuzz0b libfribidi0 libfontconfig1 libfreetype6 fonts-dejavu-core libx11-6 libxcb1
     libwayland-client0 libgl1 libegl1 libgles2 libxfixes3 shared-mime-info xvfb xauth dbus procps libasound2t64"
 
-# The loading failures the smoke tests of the release workflow look for.
+# The loading failures the smoke tests of the release workflow look for,
+# and the app's line at start for a part this system lacks.
 failures='Unable to load image-loading module|Failed to load module|Failed to load plugin'
 failures+='|cannot open shared object file|symbol lookup error|undefined symbol|Missing decoder'
+failures+='|^reoling: missing on this system: '
 
 fail() { echo "FAIL $scenario: $*" >&2; exit 1; }
 
@@ -132,6 +141,9 @@ inside() {
         done
         echo "registry $(basename "$registry"): avdec_h264 and avdec_aac present"
     fi
+    bash /smoke/assert-requirements.sh /smoke/Reoling.AppImage 0 none \
+        '*/appimage_extracted_*/usr/lib/gstreamer-1.0/libgstgtk4.so' "Plugins: bundled with the AppImage" \
+        || fail "the requirements report (above)"
     echo "PASS $scenario"
 }
 
@@ -150,6 +162,10 @@ shift
 [ -f "$appimage" ] || { echo "$appimage is not a file" >&2; exit 1; }
 chmod +x "$appimage" 2>/dev/null || true
 self=$(realpath "$0")
+here=$(dirname "$self")
+sink_version=${SINK_VERSION:-$(sed -n 's/^default_version=//p' "$here/build-gst-gtk4-plugin.sh")}
+[ -n "$sink_version" ] || { echo "no gtk4paintablesink version (SINK_VERSION)" >&2; exit 1; }
+prefix=${SMOKE_IMAGE_PREFIX:-reoling-smoke}
 # shellcheck disable=SC2206
 scenarios=(${*:-$all_scenarios})
 
@@ -172,10 +188,11 @@ for scenario in "${scenarios[@]}"; do
     echo
     echo "=== Container smoke test: $scenario"
     dockerfile "$scenario" > /dev/null
-    dockerfile "$scenario" | docker build -t "reoling-smoke:$scenario" -
-    docker run --rm --network none \
+    dockerfile "$scenario" | docker build -t "$prefix:$scenario" -
+    docker run --rm --network none -e SINK_VERSION="$sink_version" \
         -v "$appimage:/smoke/Reoling.AppImage:ro" -v "$self:/smoke/smoke-appimage-in-docker.sh:ro" \
-        "reoling-smoke:$scenario" bash /smoke/smoke-appimage-in-docker.sh --inside "$scenario"
+        -v "$here/assert-requirements.sh:/smoke/assert-requirements.sh:ro" \
+        "$prefix:$scenario" bash /smoke/smoke-appimage-in-docker.sh --inside "$scenario"
 done
 echo
 echo "container smoke tests passed: ${scenarios[*]}"

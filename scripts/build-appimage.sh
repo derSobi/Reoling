@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Builds Reoling-<version>-x86_64.AppImage from a release binary, with
-# linuxdeploy, its gtk and gstreamer plugins, and appimagetool.
+# Builds the embed AppImage, Reoling-<version>-embed-x86_64.AppImage (the
+# name is scripts/appimage-common.sh's), from a release binary, with
+# linuxdeploy, its gtk and gstreamer plugins, and appimagetool. The system
+# AppImage, which takes GTK 4 and GStreamer from the system, is
+# scripts/build-appimage-app-only.sh's.
 #
 #   scripts/build-appimage.sh <release binary> <output directory>
 #
@@ -24,7 +27,9 @@
 #   APPIMAGE_TOOLS      directory holding linuxdeploy-x86_64.AppImage,
 #                       appimagetool-x86_64.AppImage, linuxdeploy-plugin-gtk.sh
 #                       and linuxdeploy-plugin-gstreamer.sh (see
-#                       scripts/fetch-appimage-tools.sh); default: found in PATH
+#                       scripts/fetch-appimage-tools.sh); default: found in PATH.
+#                       Its runtime-x86_64, the AppImage runtime, if there,
+#                       else the one appimagetool downloads
 #   GST_GTK4_PLUGIN     the libgstgtk4.so to bundle; default: target/gst-gtk4/
 #                       libgstgtk4.so (scripts/build-gst-gtk4-plugin.sh), else
 #                       the system's
@@ -42,6 +47,7 @@ fi
 binary=$(realpath "$1")
 out=$2
 repo=$(cd "$(dirname "$0")/.." && pwd)
+. "$repo/scripts/appimage-common.sh"
 
 [ -x "$binary" ] || { echo "$binary is not an executable" >&2; exit 1; }
 version=$("$binary" --version | awk '$1 == "reoling" { print $2 }')
@@ -188,20 +194,8 @@ for loader in "${svg_loaders[@]}"; do
 done
 
 # The symbolic icons the UI asks for, as a fallback for a desktop whose
-# icon theme lacks some of them: GTK tries the theme first and these last
-# (the app adds REOLING_ICON_PATH to its icon search path).
-fallback_icons="$appdir/usr/share/reoling/icons"
-mkdir -p "$fallback_icons"
-missing=()
-for name in $(grep -rhoE '"[a-z0-9-]+-symbolic"' "$repo/src/ui" | tr -d '"' | sort -u); do
-    svg=$(find /usr/share/icons/Adwaita -name "$name.svg" -print -quit 2>/dev/null || true)
-    if [ -n "$svg" ]; then
-        cp "$svg" "$fallback_icons/"
-    else
-        missing+=("$name")
-    fi
-done
-[ ${#missing[@]} -eq 0 ] || echo "note: not in this machine's Adwaita icon theme, not bundled: ${missing[*]}"
+# icon theme lacks some of them (scripts/appimage-common.sh).
+appimage_fallback_icons "$repo" "$appdir"
 
 # The gtk plugin's hook forces GDK_BACKEND=x11 (a GTK 3 workaround); GTK 4
 # runs natively on Wayland, so the choice is left to GTK and to the user.
@@ -348,58 +342,15 @@ if grep -q '@BUNDLED_' "$appdir/apprun-hooks/zz-reoling.sh"; then
 fi
 echo "bundled GTK $bundled_gtk, GStreamer $bundled_gst"
 
-# linuxdeploy's AppRun names the hooks it knows; this one sources every hook
-# present (the two plugins' and ours, in name order) and runs the app. APPDIR
-# is set first, to the directory AppRun is in: the AppImage runtime sets it
-# to just that, but an extracted AppRun (--appimage-extract) gets no APPDIR,
-# or one inherited from another AppImage (a runtime's APPDIR and APPIMAGE
-# reach every process its app starts), and the gstreamer hook, sourced
-# before the gtk one, would otherwise point the bundled GStreamer at the
-# host's plugins, or at the other image's. An APPIMAGE that did not come
-# with this directory names another AppImage's file and is dropped: the app
-# gives the file named by APPIMAGE its icon.
-cat > "$appdir/AppRun" <<'APPRUN'
-#! /usr/bin/env bash
-# Reoling's AppRun: environment from apprun-hooks/*.sh, then the app.
-set -e
-this_dir="$(readlink -f "$(dirname "$0")")"
-if [ -z "${APPDIR:-}" ] || [ "$(readlink -f "$APPDIR" || true)" != "$this_dir" ]; then
-    unset APPIMAGE
-fi
-export APPDIR="$this_dir"
-for hook in "$this_dir"/apprun-hooks/*.sh; do
-    source "$hook"
-done
-exec "$this_dir"/usr/bin/reoling "$@"
-APPRUN
-chmod +x "$appdir/AppRun"
+# AppRun, the same in both AppImages (scripts/appimage-common.sh), in place
+# of linuxdeploy's, which names the hooks it knows; it sources every hook
+# present, the two plugins' and ours, in name order.
+appimage_write_apprun "$appdir"
 rm -f "$appdir/AppRun.wrapped"
 
-# The icon the file manager shows for the .AppImage file: at start the app
-# copies the hicolor icons out of the mounted image into the user's icon
-# theme (the file's custom icon, which GNOME Files shows, points at one of
-# them) and reads .DirIcon and the 512 px hicolor icon to write its own
-# file's thumbnail-cache entries (src/ui/icon.rs,
-# install_appimage_integration), and AppImage tools read .DirIcon (some
-# the <Icon>.png next to the desktop entry) as well, so both are real PNG
-# files, not the symlinks linuxdeploy leaves (a symlink extracted on its
-# own points nowhere). 256 px, as AppImage recommends, or the largest size
-# the repository has.
-icon_name=$(sed -n 's/^Icon=//p' "$repo/data/de.dersobi.reoling.desktop")
-[ -n "$icon_name" ] || { echo "the desktop entry has no Icon= key" >&2; exit 1; }
-icon_src=""
-for size in 256x256 512x512 128x128 64x64 48x48; do
-    if [ -f "$repo/data/icons/hicolor/$size/apps/$icon_name.png" ]; then
-        icon_src="$repo/data/icons/hicolor/$size/apps/$icon_name.png"
-        break
-    fi
-done
-[ -n "$icon_src" ] || { echo "no $icon_name.png icon found under data/icons" >&2; exit 1; }
-rm -f "$appdir/.DirIcon" "$appdir/$icon_name.png"
-cp "$icon_src" "$appdir/.DirIcon"
-cp "$icon_src" "$appdir/$icon_name.png"
-file -b "$appdir/.DirIcon" | grep -q '^PNG image data' || { echo "$icon_src is not a PNG" >&2; exit 1; }
-echo "AppImage icon: $(file -b "$appdir/.DirIcon" | cut -d, -f1,2) from $icon_src"
+# .DirIcon and the <Icon>.png next to the desktop entry, real PNG files in
+# place of the symlinks linuxdeploy leaves (scripts/appimage-common.sh).
+appimage_root_icon "$repo" "$appdir"
 # Where no package installed Reoling's desktop entry, the app writes a
 # per-user one for the AppImage file from the bundled one, which it reads
 # from usr/share/applications (the copy at the root is a link to it).
@@ -545,8 +496,4 @@ else
 fi
 
 # --- AppImage ------------------------------------------------------------------
-appimage="$out/Reoling-$version-x86_64.AppImage"
-rm -f "$appimage"
-ARCH=x86_64 "$appimagetool" --comp zstd "$appdir" "$appimage"
-chmod +x "$appimage"
-echo "Wrote $appimage ($(du -h "$appimage" | cut -f1))"
+appimage_pack "$appimagetool" "$appdir" "$out/$(appimage_file_name bundled "$version")"
