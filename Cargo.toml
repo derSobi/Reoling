@@ -52,8 +52,8 @@ tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
 # `cargo deb` (cargo-deb 3.x). Build scripts/build-gst-gtk4-plugin.sh
 # target/gst-gtk4 first: Ubuntu 24.04 has no gstreamer1.0-gtk4, so the
 # package carries the GTK 4 paintable sink in /usr/lib/reoling/gstreamer-1.0,
-# a directory the binary adds to its plugin registry at start (see
-# `scan_private_plugins` in src/main.rs). The package is built on Ubuntu 24.04
+# a directory the binary puts first on GStreamer's plugin path at start (see
+# `init_gstreamer` in src/main.rs). The package is built on Ubuntu 24.04
 # (GTK 4.14, GStreamer 1.24) and installs on 24.04 and later.
 [package.metadata.deb]
 maintainer = "derSobi <14218571+derSobi@users.noreply.github.com>"
