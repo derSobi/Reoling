@@ -3,8 +3,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("could not resolve UID {uid} against any P2P relay")]
-    UidResolutionFailed { uid: String },
+    #[error("could not resolve the device's UID against any P2P relay")]
+    UidResolutionFailed,
 
     #[error("P2P negotiation with the device timed out")]
     P2pNegotiationTimeout,

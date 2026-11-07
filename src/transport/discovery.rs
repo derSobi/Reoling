@@ -112,7 +112,7 @@ pub async fn resolve_uid(
         }))
     })
     .await
-    .map_err(|_| Error::UidResolutionFailed { uid: uid.to_string() })
+    .map_err(|_| Error::UidResolutionFailed)
 }
 
 /// Queries every address in `relay_addrs` for `uid` concurrently, each on
@@ -156,7 +156,7 @@ async fn resolve_uid_broadcast(
             return Ok(result);
         }
     }
-    Err(Error::UidResolutionFailed { uid: uid.to_string() })
+    Err(Error::UidResolutionFailed)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -618,7 +618,7 @@ async fn resolve_and_register(
     relay_addrs.sort();
     relay_addrs.dedup();
     if relay_addrs.is_empty() {
-        return Err(Error::UidResolutionFailed { uid: uid.to_string() });
+        return Err(Error::UidResolutionFailed);
     }
 
     // Query every resolved relay concurrently, each on its own socket — see

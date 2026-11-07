@@ -567,6 +567,24 @@ fn login_refused(code: u16) -> DeviceEvent {
     }
 }
 
+/// What stderr says of a failed connect or login: a fixed text per kind, as
+/// some texts quote the device's XML or its address.
+fn error_kind(e: &reoling::Error) -> &'static str {
+    use reoling::Error;
+    match e {
+        Error::UidResolutionFailed => "could not resolve the device's UID against any P2P relay",
+        Error::P2pNegotiationTimeout => "P2P negotiation timed out",
+        Error::LoginFailed { .. } => "login refused",
+        Error::ProtocolError(_) => "protocol error",
+        Error::StreamRefused { .. } => "stream refused",
+        Error::ReplyTimeout => "no reply in time",
+        Error::ConnectionLost => "connection lost",
+        Error::Io(_) => "network or socket error",
+        Error::Xml(_) => "unreadable XML reply",
+        Error::AddrParse(_) => "invalid IP address",
+    }
+}
+
 /// Connects and logs in to a device on a dedicated thread with its own
 /// tokio runtime, and keeps the connection up: it listens for pushes (the
 /// channel list) and streams a channel on request. GTK is never touched from
@@ -615,6 +633,7 @@ pub fn spawn_device(
             let mut client = match connect_result {
                 Ok(c) => c,
                 Err(e) => {
+                    eprintln!("connecting to the device failed: {}", error_kind(&e));
                     let _ = tx.send(DeviceEvent::Lost(e.to_string())).await;
                     return;
                 }
@@ -627,6 +646,7 @@ pub fn spawn_device(
                     return;
                 }
                 Err(e) => {
+                    eprintln!("logging in to the device failed: {}", error_kind(&e));
                     let _ = tx.send(DeviceEvent::Lost(e.to_string())).await;
                     return;
                 }

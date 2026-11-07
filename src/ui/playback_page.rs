@@ -403,7 +403,8 @@ impl PlaybackPage {
         let timeline_row = GtkBox::new(Orientation::Horizontal, 8);
         timeline_row.set_margin_top(6);
         timeline_row.set_margin_bottom(6);
-        timeline_row.set_margin_start(8);
+        // The device list's divider takes presses up to about 15 px into the page.
+        timeline_row.set_margin_start(16);
         timeline_row.set_margin_end(8);
         timeline_row.append(timeline.widget());
         timeline_row.append(&whole_day);
@@ -1064,8 +1065,13 @@ impl PlaybackPage {
         self.timeline.set_position(Some(seconds));
         self.time.set_text(&time_text(at));
         self.playing.set(true);
-        // Plays: a picture that failed is tried again (see `toggle_play`).
-        self.video.retry_picture();
+        // Plays: a picture that failed is tried again (see `toggle_play`), unless the listed
+        // files of this stream show the device thread will refuse the seek and open nothing.
+        let refused = self.files_stream.get() == self.want_stream.get()
+            && matches!(&*self.files.borrow(), Some(Ok(files)) if all_end_by(files, at));
+        if !refused {
+            self.video.retry_picture();
+        }
         self.send_player(|link| link.playback_seek(at));
         self.refresh();
     }
@@ -1848,6 +1854,12 @@ fn spans_of(files: &[FileSpan], day: CivilTime) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// Whether every recording ends by `at` (its end is exclusive): a seek there
+/// finds nothing to open (the device thread's `file_for_time`).
+fn all_end_by(files: &[FileSpan], at: CivilTime) -> bool {
+    files.iter().all(|f| f.end <= at)
+}
+
 /// The events the filter admits, as the timeline marks them: seconds of
 /// `day`, named by their kinds.
 fn timeline_events(events: &[RecordedEvent], filter: EventFilter, day: CivilTime) -> Vec<TimelineEvent> {
@@ -2109,6 +2121,17 @@ mod tests {
         // Any time of the day stands for that day.
         assert_eq!(spans_of(&files, t(19, 14, 0, 0)), spans_of(&files, day));
         assert!(spans_of(&[], day).is_empty());
+    }
+
+    #[test]
+    fn a_seek_opens_nothing_only_once_every_recording_has_ended() {
+        let files = [span(t(19, 10, 0, 0), t(19, 10, 5, 0)), span(t(19, 11, 0, 0), t(19, 11, 5, 0))];
+        assert!(all_end_by(&files, t(19, 11, 5, 0)));
+        assert!(all_end_by(&files, t(19, 12, 0, 0)));
+        assert!(!all_end_by(&files, t(19, 11, 4, 59)));
+        // In a gap or before the first file, the next file opens.
+        assert!(!all_end_by(&files, t(19, 10, 30, 0)));
+        assert!(!all_end_by(&files, t(19, 9, 0, 0)));
     }
 
     #[test]
