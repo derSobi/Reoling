@@ -2,6 +2,127 @@
 
 All notable changes of Reoling, newest first.
 
+## 1.0.5 — 2026-11-07
+
+`reoling_1.0.5-1_amd64.deb` and two AppImages, all built on Ubuntu
+24.04 by the release workflow: `Reoling-1.0.5-embed-x86_64.AppImage`,
+built as 1.0.4's AppImage was, under a new name, and the new
+`Reoling-1.0.5-system-x86_64.AppImage`, which takes GTK 4, GStreamer and
+the decoders from the distribution. The .deb is built as 1.0.4's was,
+and now draws the picture with its own GTK 4 sink also where the
+distribution has one. Where a part a feature needs is missing, Reoling
+says what and how to install it, instead of a panic or a black picture.
+Beside that, Playback's timeline takes clicks right from its left edge,
+and a device's error text no longer contains its UID.
+
+- Two AppImages. The embed one carries GTK 4, GStreamer, its plugins and
+  the decoders, as 1.0.4's did, and runs on any distribution with glibc
+  2.39 and GLib 2.80 or newer; it is packed as 1.0.4's was, and its hook
+  also tells the app that its plugins are its own. The system one, about
+  6 MB, carries the app, its GTK 4 sink (with the sink's licence,
+  MPL-2.0), the icons and the desktop entry; it needs GTK 4.14 and
+  GStreamer 1.24 or newer with the base, good and bad plugins and a
+  decoder for H.264 and H.265, and is tested in containers of Ubuntu
+  24.04 and 26.04, Debian 13, Fedora 44, openSUSE Tumbleweed and Arch
+  Linux. Both give the file its icon and, where the .deb is not
+  installed, a menu entry that starts the copy started last; with the
+  .deb installed, its entry takes over, and the one Reoling wrote is
+  removed. The tag sits between the version and the architecture, so
+  both names end in `-x86_64.AppImage`; the version itself has no tag.
+- The system AppImage checks the system before the app starts: the
+  libraries the app and its sink need, GTK 4.14 and GStreamer 1.24.
+  Where that fails, it does not start the app (status 127) and says
+  why, with the embed AppImage as the other way: on stderr and, started
+  from the desktop, in a dialog or a desktop notification that needs no
+  GTK. Where libraries are missing, it names them and the command that
+  installs them on this distribution (apt, dnf, zypper or pacman, read
+  from `/etc/os-release`); where GTK or GStreamer is only too old, it
+  says which, with no command. `REOLING_SKIP_SYSTEM_CHECK=1` starts it
+  all the same.
+- Every package checks at start the GStreamer parts each feature is
+  built from (the picture, H.264 and H.265 video, sound, talk, recording,
+  downloads). Where one is missing, a window "Missing parts" names them,
+  with the command that installs them and the steps for the codecs
+  (OpenH264 or RPM Fusion's FFmpeg on Fedora, Packman on openSUSE); it
+  names no decoder package whose GStreamer plugin is there already, so
+  on a Fedora desktop H.265 gets the swap to RPM Fusion's FFmpeg and no
+  package. "Don't show this again" keeps it away until the missing
+  parts change. One line on stderr says the same. Before, a missing
+  element panicked, and a missing decoder left the picture black.
+- A stream that cannot be shown says why over the picture, with what
+  installs the missing part. A live stream whose pipeline cannot be
+  built ("Cannot show this stream: h265parse is missing.") stops, and
+  the device stays connected; one that no decoder takes ("No H.265
+  decoder on this system.") runs on without its picture, its sound and
+  a recording going on. Playback pauses, and Play tries again with a
+  new pipeline; picking the other stream there takes the text away, as
+  a stream switch does in live view, and Play then tries that stream.
+  A seek after the end of the last recording, where nothing opens,
+  keeps the text. On a system with every part nothing of this shows,
+  and live video, PTZ, pushes, Playback and downloads run as before.
+- System Status says where the GStreamer plugins come from ("Plugins:
+  the system's", "the system's, under the AppImage" or "bundled with the
+  AppImage"), names the GTK 4 sink that draws the picture ("Display:
+  gtk4paintablesink", its version and file) and what is missing, or
+  "Missing: nothing".
+- `reoling --check-requirements` prints that report without a window or
+  a display and exits with 0 (nothing missing), 1 (H.264 or H.265 video,
+  or any video, cannot be shown) or 2 (only sound, talk, recording or
+  downloads miss something). The release's smoke tests run it for every
+  package.
+- On Fedora, OpenH264 on noopenh264, the stand-in a Fedora desktop has,
+  decodes nothing; Reoling tries the decoder once and does not count it
+  then.
+- Decoding set to Software, for a codec with no software decoder
+  installed, decodes that codec as Auto does, and System Status says
+  so, instead of showing no picture.
+- The .deb draws the picture with its own GTK 4 sink, the one Reoling
+  is built and tested with (0.15.2, in
+  `/usr/lib/reoling/gstreamer-1.0`), also where the distribution has
+  one (`gstreamer1.0-gtk4` on Debian 13 and Ubuntu 26.04: 0.13.5 and
+  0.14.4) or `GST_PLUGIN_PATH` names one. In 1.0.4, the distribution's
+  was used instead. Only Reoling changes: while GStreamer starts, it
+  puts its sink's directory first on the plugin path and uses a plugin
+  registry of its own,
+  `~/.cache/reoling/gstreamer-registry-deb-<GStreamer version>.bin`, as
+  the AppImages do, then puts the environment back, so the programs it
+  starts get yours. The registry other GStreamer programs share is not
+  written, and they go on using the distribution's sink. Should the
+  .deb's file fail to load, GStreamer says why on stderr, and the
+  distribution's sink, where there is one, is used. System Status names
+  the sink in use ("Display:").
+- Playback's day timeline takes a click or a drag right from its left
+  edge, where the day starts, while the device list is shown. Before,
+  the device list's divider took presses up to about 15 px into the
+  page, over the timeline's first pixels.
+- When a device cannot be found through any P2P relay, the reason
+  Reoling gives, such as the tooltip of its card's "Not connected",
+  reads "could not resolve the device's UID against any P2P relay".
+  Before, that text contained the UID itself.
+- A connect that fails, and a login that fails other than by the
+  device's refusal (which had its line already), print one line on
+  stderr, such as "connecting to the device failed: P2P negotiation
+  timed out", with the kind of failure only: no UID, address or text
+  from the device.
+- The release tests the system AppImage in containers of six
+  distributions, each from its bare image: it must refuse with exactly
+  that distribution's install command, then start once that command
+  ran; on Fedora and openSUSE, its report must also not name the
+  package of a plugin that is loaded there. The release also installs
+  the .deb in containers of Debian 13 and Ubuntu 26.04 beside their
+  `gstreamer1.0-gtk4`, where it must start with its own sink. A
+  critical warning from GTK, GLib or GStreamer fails a smoke test. The
+  release notes carry the SHA-256 of all three files.
+- README: Installation names the three packages, each with what it
+  needs, and links one guide for both AppImages. Docs: running the
+  AppImages (INSTALL-APPIMAGE.md) explains which file to take, the
+  install command per distribution and the codec notes for Fedora and
+  openSUSE, what the warnings look like, and the two libraries the
+  embed AppImage needs on a minimal Debian 13 install; installing the
+  .deb says which GTK 4 sink it uses; building the packages and
+  hardware decoding cover the system AppImage, and building the
+  packages the new container tests.
+
 ## 1.0.4 — 2026-11-05
 
 `reoling_1.0.4-1_amd64.deb` and `Reoling-1.0.4-x86_64.AppImage`,
