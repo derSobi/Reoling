@@ -22,7 +22,7 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 
 ## Status
 
-Version **1.0.4**, with installable packages since 1.0.0 (see
+Version **1.0.5**, with installable packages since 1.0.0 (see
 [Installation](#installation)). Login, live video, PTZ, the camera and
 device settings pages, and playback with sound, events and downloads
 work end to end on a real Home Hub, NVR and their cameras, over UDP/P2P
@@ -74,16 +74,18 @@ Each of these in full: [docs/FEATURES.md](docs/FEATURES.md).
 
 **Version history**
 
-- 1.0.4 — the .deb and the AppImage, built as 1.0.3's were; the .deb
-  also installs the new guides. Live video no longer stays black after a
-  switch from the main to the sub stream, and a push that comes before a
-  login reply no longer breaks the login. Run at Startup from the
-  AppImage starts the AppImage file. After a live stream failed, the
-  stream selector stays usable and a refused stream's message names the
-  one to try ([issue #3](https://github.com/derSobi/Reoling/issues/3)).
-  More `REOLING_DEBUG_NEGOTIATION` output, and `REOLING_PROBE_PUSH` hides
-  more. The README's Installation is short, with a guide per package in
-  docs/, and a new section lists the tested devices.
+- 1.0.5 — the .deb and two AppImages: the embed one, built as 1.0.4's
+  AppImage was, under a new name, and a system one of about 6 MB that
+  takes GTK 4, GStreamer and the decoders from the distribution. Where
+  the system lacks a part a feature needs, Reoling says so, with the
+  command that installs it: at start, in System Status and over the
+  picture, instead of a black picture; `--check-requirements` prints
+  the same report. The .deb draws the picture with its own GTK 4
+  sink, also where the distribution has one. In Playback, picking the
+  other stream takes a missing decoder's text away, and the timeline
+  takes clicks right from its left edge. A device's error text no
+  longer contains its UID, and a failed connect or login prints one
+  line on stderr.
 
 The full history, with the date of every version, is in
 [CHANGELOG.md](CHANGELOG.md).
@@ -174,8 +176,9 @@ data/            Icons and the desktop entry.
 docs/            FEATURES.md (every feature), the installation, hardware
                  decoding and package-building guides, and the README's
                  screenshots.
-scripts/         Packaging: the GTK 4 sink build, the AppImage tools and
-                 build, and a rehearsal of the release in a container.
+scripts/         Packaging: the GTK 4 sink build, the AppImages' tools,
+                 builds and container smoke tests, and a rehearsal of
+                 the release in a container.
 ```
 
 Reoling is a Linux-only desktop application.
@@ -183,23 +186,33 @@ Reoling is a Linux-only desktop application.
 ## Installation
 
 Download a package from the
-[latest release](https://github.com/derSobi/Reoling/releases/latest). Both
-are for x86_64 Linux, built on Ubuntu 24.04 LTS so that they run on 24.04
-and everything newer.
+[latest release](https://github.com/derSobi/Reoling/releases/latest). All
+three are for x86_64 Linux, built on Ubuntu 24.04 LTS so that they run on
+24.04 and everything newer.
 
 - **.deb**, for Ubuntu 24.04 LTS or newer, Debian 13 or newer and their
   derivatives. apt installs it with everything it needs:
   `sudo apt install ./reoling_*_amd64.deb` (with several in the folder,
   type the full name). Guide: [docs/INSTALL-DEB.md](docs/INSTALL-DEB.md).
-- **AppImage**, for any other distribution with glibc 2.39 and GLib 2.80
-  or newer. Make it executable, then start it by its full name
-  (`<version>` as in the file's name): `chmod +x Reoling-*-x86_64.AppImage`,
-  then `./Reoling-<version>-x86_64.AppImage`.
-  Guide: [docs/INSTALL-APPIMAGE.md](docs/INSTALL-APPIMAGE.md).
+- **AppImage, embed** (`Reoling-<version>-embed-x86_64.AppImage`, about
+  100 MB), for any other distribution with glibc 2.39 and GLib 2.80 or
+  newer: GTK 4, GStreamer and the decoders are inside. Make it
+  executable, then start it by its full name (`<version>` as in the
+  file's name): `chmod +x Reoling-*-x86_64.AppImage`, then
+  `./Reoling-<version>-embed-x86_64.AppImage`.
+- **AppImage, system** (`Reoling-<version>-system-x86_64.AppImage`, about
+  6 MB), for distributions with GTK 4.14 and GStreamer 1.24 or newer: it
+  takes GTK 4, GStreamer, its plugins and the decoders from the
+  distribution, and where something is missing it says what, and the
+  command that installs it. Started the same way, with `system` in place
+  of `embed`.
 
-Both decode video in hardware where a driver allows it, and in software
-otherwise: [docs/HARDWARE-DECODING.md](docs/HARDWARE-DECODING.md). To build
-the packages yourself, and for how the release tests them:
+Guide for both AppImages, with the install command for each
+distribution: [docs/INSTALL-APPIMAGE.md](docs/INSTALL-APPIMAGE.md).
+
+All three decode video in hardware where a driver allows it, and in
+software otherwise: [docs/HARDWARE-DECODING.md](docs/HARDWARE-DECODING.md).
+To build the packages yourself, and for how the release tests them:
 [docs/BUILDING-PACKAGES.md](docs/BUILDING-PACKAGES.md).
 
 ## Building from source
@@ -240,7 +253,7 @@ release workflow and Docker validation run it under Xvfb:
 cargo test --bin reoling ui::zoom_picture::tests::widget_renders_and_resets -- --ignored --exact
 ```
 
-To build the .deb and the AppImage, see
+To build the .deb and the AppImages, see
 [docs/BUILDING-PACKAGES.md](docs/BUILDING-PACKAGES.md).
 
 ## License

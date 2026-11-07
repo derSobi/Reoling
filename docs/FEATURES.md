@@ -21,7 +21,11 @@ The full list behind the [README's Status](../README.md#status).
   over a poor connection. Another stream can be picked in the stream
   selector while the picture plays, and also after a start failed or the
   stream broke off (not while a stream starts or waits for a download); a
-  refused stream's message names the stream and the one to try.
+  refused stream's message names the stream and the one to try. A stream
+  that cannot be shown says why over the picture, with what installs the
+  missing part: one whose pipeline cannot be built stops, and the device
+  stays connected; one that no decoder takes runs on without its picture,
+  its sound and a recording going on.
 - Digital video zoom in live view and playback: scroll up over the picture
   to zoom in at the pointer, and down to zoom out, up to 16×. Left-click and
   drag to pan while zoomed in; middle-click restores the whole picture.
@@ -57,6 +61,10 @@ The full list behind the [README's Status](../README.md#status).
   on the timeline, and progress shows under the controls with Cancel and
   "Open folder"; the download runs on if the page moves to another day or
   device. While a device downloads, its playback and live video wait.
+  The timeline takes presses right from its left edge. A stream no
+  decoder takes pauses with the reason over the picture; Play tries
+  again, and picking the other stream takes the text away (a seek after
+  the last recording, where nothing opens, keeps it).
 - Camera controls, shown per channel from what the camera reports: siren,
   spotlight, and — in a separate "Camera control" window, independent of the
   main window — pan/tilt (hold a direction to move) and zoom/focus on its
@@ -149,10 +157,29 @@ The full list behind the [README's Status](../README.md#status).
   download holds the connection it says so and reads once that is over.
 - Snapshot (PNG in `~/Pictures/Reoling`) and recording (MKV in
   `~/Videos/Reoling`, where Playback's downloads go too).
+- Requirements check: at every start Reoling checks the GStreamer parts
+  each feature is built from (the picture, H.264 and H.265 video, sound,
+  talk, recording, downloads). Where one is missing, a window "Missing
+  parts" names it, with the command that installs it on this
+  distribution and the steps for the codecs (OpenH264 or RPM Fusion's
+  FFmpeg on Fedora, Packman on openSUSE), but no decoder package whose
+  plugin is there already; "Don't show this again" keeps it away until
+  the missing parts change, and one line on stderr says the same.
+  `reoling --check-requirements` prints the report without a window and
+  exits with 0 (nothing missing), 1 (some video cannot be shown) or 2
+  (only another feature misses something).
+- Packages: a .deb for Ubuntu 24.04 LTS or newer and Debian 13 or newer,
+  which draws the picture with its own GTK 4 sink also where the
+  distribution has one, and two AppImages: the embed one, with GTK 4,
+  GStreamer and the decoders inside, and the system one, which takes
+  them from the distribution; where the system lacks a library it needs,
+  or its GTK is older than 4.14 or its GStreamer older than 1.24, it
+  does not start and says why, with the command that installs missing
+  libraries (see [Running the AppImages](INSTALL-APPIMAGE.md)).
 - Settings (the "Client Settings" window):
   System Settings (General, Live View & Playback, Alarm), Download Settings,
   Local Record and About. Working: Run at Startup (an XDG autostart entry;
-  run from the AppImage, it starts the AppImage file), Theme, System
+  run from an AppImage, it starts the AppImage file), Theme, System
   Status (versions, the hardware decoders and the decoders in use), Auto
   Live View, Stretch Mode, decoding (Auto with the integrated or the
   dedicated GPU first / Hardware — with the decoder to use if there are
@@ -161,7 +188,9 @@ The full list behind the [README's Status](../README.md#status).
   rows Reoling cannot act on yet (client update, add devices automatically,
   lockscreen password, date format, language, detection overlays,
   scrollview time, alarm beep, temporary and download folders, local
-  record) are shown greyed out. Colours are the active theme's.
+  record) are shown greyed out. Colours are the active theme's. System
+  Status also says where the GStreamer plugins come from, names the GTK 4
+  sink that draws the picture and lists what is missing.
 
 ## Not done yet
 
