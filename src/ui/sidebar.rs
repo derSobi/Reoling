@@ -37,6 +37,8 @@ pub struct Handlers {
     pub on_settings: Box<dyn Fn(&str)>,
     pub on_relogin: Box<dyn Fn(&str)>,
     pub on_remove: Box<dyn Fn(&str)>,
+    /// "Try other live view requests…" in the card's menu.
+    pub on_trial: Box<dyn Fn(&str)>,
 }
 
 struct Card {
@@ -47,6 +49,9 @@ struct Card {
     /// The menu's "Device settings…" entry, sensitive only while the
     /// device is a connected NVR or Home Hub.
     settings: Button,
+    /// The menu's "Try other live view requests…" entry: shown while the
+    /// diagnostic log is on, sensitive after the device refused live view.
+    trial: Button,
     unfold: ToggleButton,
     channel_list: GtkBox,
     /// The channel buttons, in list order, with their channel numbers.
@@ -79,6 +84,8 @@ pub struct Sidebar {
     list: ListBox,
     cards: RefCell<HashMap<String, Card>>,
     handlers: Handlers,
+    /// Whether the cards' menus show the trial entry (see `set_trials_shown`).
+    trials_shown: Cell<bool>,
 }
 
 /// The connected dot in the theme's accent colour. The colour is the
@@ -122,7 +129,8 @@ impl Sidebar {
         scroller.set_hscrollbar_policy(gtk4::PolicyType::Never);
         root.append(&scroller);
 
-        let this = Rc::new(Self { root, list, cards: RefCell::new(HashMap::new()), handlers });
+        let cards = RefCell::new(HashMap::new());
+        let this = Rc::new(Self { root, list, cards, handlers, trials_shown: Cell::new(false) });
 
         let weak = Rc::downgrade(&this);
         add.connect_clicked(move |_| {
@@ -170,6 +178,14 @@ impl Sidebar {
         let settings = Button::with_label("Device settings…");
         let relogin = Button::with_label("Change login…");
         let remove = Button::with_label("Remove device");
+        let trial = Button::with_label("Try other live view requests…");
+        trial.add_css_class("flat");
+        trial.set_sensitive(false);
+        trial.set_visible(self.trials_shown.get());
+        trial.set_tooltip_text(Some(
+            "Asks the camera for live video in the other ways Reoling knows and writes the answers to the \
+             diagnostic log",
+        ));
         settings.add_css_class("flat");
         settings.set_sensitive(false);
         settings.set_tooltip_text(Some("The settings of a connected NVR or Home Hub"));
@@ -177,6 +193,7 @@ impl Sidebar {
         remove.add_css_class("flat");
         menu_box.append(&settings);
         menu_box.append(&relogin);
+        menu_box.append(&trial);
         menu_box.append(&remove);
         popover.set_child(Some(&menu_box));
         menu.set_popover(Some(&popover));
@@ -247,6 +264,15 @@ impl Sidebar {
         });
         let key = device.key.clone();
         let weak = Rc::downgrade(self);
+        let pop = popover.clone();
+        trial.connect_clicked(move |_| {
+            pop.popdown();
+            if let Some(s) = weak.upgrade() {
+                (s.handlers.on_trial)(&key);
+            }
+        });
+        let key = device.key.clone();
+        let weak = Rc::downgrade(self);
         remove.connect_clicked(move |_| {
             if let Some(s) = weak.upgrade() {
                 (s.handlers.on_remove)(&key);
@@ -261,6 +287,7 @@ impl Sidebar {
                 dot,
                 status,
                 settings,
+                trial,
                 unfold,
                 channel_list,
                 channel_buttons,
@@ -294,6 +321,23 @@ impl Sidebar {
     pub fn set_settings_available(&self, key: &str, available: bool) {
         if let Some(card) = self.cards.borrow().get(key) {
             card.settings.set_sensitive(available);
+        }
+    }
+
+    /// Whether the card's menu can start a trial now (the device refused
+    /// live view, and no trial runs).
+    pub fn set_trial_available(&self, key: &str, available: bool) {
+        if let Some(card) = self.cards.borrow().get(key) {
+            card.trial.set_sensitive(available);
+        }
+    }
+
+    /// Shows the trial entry in every card's menu while the diagnostic log
+    /// is on.
+    pub fn set_trials_shown(&self, shown: bool) {
+        self.trials_shown.set(shown);
+        for card in self.cards.borrow().values() {
+            card.trial.set_visible(shown);
         }
     }
 

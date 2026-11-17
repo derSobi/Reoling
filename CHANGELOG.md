@@ -2,6 +2,24 @@
 
 All notable changes of Reoling, newest first.
 
+## 1.0.6 — 2026-11-17
+
+`reoling_1.0.6-1_amd64.deb`, `Reoling-1.0.6-embed-x86_64.AppImage` and `Reoling-1.0.6-system-x86_64.AppImage`, built as 1.0.5's were. A device added by UID now also connects directly on the local network, as the official app does. Add device lists the devices it finds on the network, and a Diagnostic Log writes a file to attach to a report.
+
+- A device added by UID tries its paths together and the first login that completes wins: the P2P session (local, NAT-mapped or relay address) and, when the device answers a search on the local network, a direct UDP session and TCP to port 9000 at its address. Before, only the P2P session was tried. For my two test cameras the P2P servers named the relay only, so a camera on the same network sent its video through the internet; it now connects over TCP on the local network, within about a second in my tests.
+- A P2P registration that the servers refuse no longer ends the attempt: the paths on the local network still run (issue #4).
+- A P2P attempt that gets no answer is given up and made again with a new lookup and registration, up to three times, as the official app does in my captures.
+- TCP to the address the P2P servers name for a device is tried only after a host at that address has confirmed the P2P session over UDP.
+- The two paths on the local network go to the same device and send it the login one after the other. Once the first has its answer, the second sends nothing, so a wrong password costs the device one failed login from the local network; the cameras count failed logins. Only a refusal over the P2P session counts as a wrong password and makes Reoling forget the saved one, because on the local network the host that answers is not proven to be the device.
+- Add device lists the Reolink devices found on the local network, each with its model and UID. Choosing one fills in the UID; nothing is added by itself, and a device that is in Reoling already says so. Devices on another network do not answer the search. The answers come to UDP port 3000: while another program holds it, such as the Reolink app on the same computer, the dialog says that the search is not available.
+- A camera added on its own offers its third stream ("Extern stream") when it reports one, as the RLC-520A does. Before, a camera without a channel list was offered the main and the sub stream only.
+- Diagnostic Log, a switch in Settings (System Settings, General). While it is on, Reoling writes how each device connects and logs in, what it asks for live view and what the device answers. For video it writes what the system has (distribution, GTK, GStreamer, decoders), the decoder chosen, the picture's format and size, GStreamer's errors and warnings, and how many frames arrived, were decoded and reached the display. The file is `~/.local/state/reoling/reoling-diagnostic.log` (under `$XDG_STATE_HOME` where that is set); the row under the switch shows the path, opens its folder and saves a copy.
+- The log masks camera UIDs, MAC, IP and e-mail addresses and the names of devices and cameras. Text from a device enters a line only in forms known to be safe, and a line that cannot be made safe is replaced by a marker.
+- The switch lasts until Reoling is closed and is off at every start. `reoling --diagnostics` starts with it on, so the log also has how each device connects.
+- While the Diagnostic Log is on, a device that refuses live view offers "Try other live view requests…" in its menu. Reoling then tries the other forms of the request it knows, one after the other, and the log says which one the device accepted (issue #3). The trial only reads, ends by itself, and stops when the stream is stopped or another device is chosen.
+- Tested on two more devices that I had for testing, an RLC-520A and an RLC-1224A as cameras on their own: by UID on the local network, by address, and by UID from another network, through the relay.
+- README: Tested devices names the two cameras, and the device names link to their product pages. New: HARDWARE.md, the hardware of my setup, the test cameras and what users have confirmed.
+
 ## 1.0.5 — 2026-11-07
 
 `reoling_1.0.5-1_amd64.deb` and two AppImages, all built on Ubuntu 24.04 by the release workflow: `Reoling-1.0.5-embed-x86_64.AppImage`, built as 1.0.4's AppImage was, under a new name, and the new `Reoling-1.0.5-system-x86_64.AppImage`, which takes GTK 4, GStreamer and the decoders from the distribution. The .deb is built as 1.0.4's was, and now draws the picture with its own GTK 4 sink also where the distribution has one. Where a part a feature needs is missing, Reoling says what and how to install it, instead of a panic or a black picture. Beside that, Playback's timeline takes clicks right from its left edge, and a device's error text no longer contains its UID.

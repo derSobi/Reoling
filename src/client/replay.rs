@@ -1429,7 +1429,7 @@ impl ReolinkClient {
     /// handling (channel lists, alarms and the like keep arriving); anything
     /// else, such as data trailing in from a closed playback, is dropped.
     fn forward_push(&self, bc: &Bc, image_chunks: &mut HashMap<u16, Vec<u8>>) {
-        if let Some(update) = pushed_update(bc, image_chunks, &self.pending_images, &self.channel_uids) {
+        if let Some(update) = pushed_update(bc, image_chunks, &self.pending_images, &self.channel_uids, self.debug_id) {
             let _ = self.channel_updates_tx.send(update);
         }
     }
@@ -1979,6 +1979,7 @@ impl ReolinkClient {
         let channel_updates = self.channel_updates_tx.clone();
         let pending_images = Arc::clone(&self.pending_images);
         let channel_uids = Arc::clone(&self.channel_uids);
+        let debug_id = self.debug_id;
         let mut reader = ReplayReader::new(opened.seq, opened.open_msg_num, skip_through, probe.map(str::to_string));
         let mut early = opened.early.into_iter();
         self.replay_task = Some(tokio::spawn(async move {
@@ -2007,7 +2008,7 @@ impl ReolinkClient {
                         }
                     }
                 };
-                if let Some(update) = pushed_update(&bc, &mut image_chunks, &pending_images, &channel_uids) {
+                if let Some(update) = pushed_update(&bc, &mut image_chunks, &pending_images, &channel_uids, debug_id) {
                     let _ = channel_updates.send(update);
                     continue;
                 }
@@ -2692,6 +2693,7 @@ async fn run_download(
     channel_updates: tokio::sync::mpsc::UnboundedSender<DeviceUpdate>,
     pending_images: Arc<std::sync::Mutex<HashMap<u16, ImageKind>>>,
     channel_uids: Arc<std::sync::Mutex<HashMap<u8, CameraUid>>>,
+    debug_id: u32,
     early: Vec<Bc>,
 ) -> DownloadSummary {
     let mut image_chunks = HashMap::new();
@@ -2737,7 +2739,7 @@ async fn run_download(
                 }
             }
         };
-        if let Some(update) = pushed_update(&bc, &mut image_chunks, &pending_images, &channel_uids) {
+        if let Some(update) = pushed_update(&bc, &mut image_chunks, &pending_images, &channel_uids, debug_id) {
             let _ = channel_updates.send(update);
             continue;
         }
@@ -2989,6 +2991,7 @@ impl ReolinkClient {
         let channel_updates = self.channel_updates_tx.clone();
         let pending_images = Arc::clone(&self.pending_images);
         let channel_uids = Arc::clone(&self.channel_uids);
+        let debug_id = self.debug_id;
         let end_request = Bc {
             meta: BcMeta {
                 msg_id: MSG_ID_DOWNLOAD_END,
@@ -3014,9 +3017,10 @@ impl ReolinkClient {
             probe: probe.map(str::to_string),
         };
         self.download_task = Some(tokio::spawn(async move {
+            let shared = Arc::clone(&connection);
+            let updates = channel_updates;
             let summary =
-                run_download(run, Arc::clone(&connection), encryption, channel_updates, pending_images, channel_uids, early)
-                    .await;
+                run_download(run, shared, encryption, updates, pending_images, channel_uids, debug_id, early).await;
             connection.lock().await.set_replay_buffering(false);
             summary
         }));

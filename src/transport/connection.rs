@@ -247,6 +247,17 @@ impl RateMeter {
 struct UdpSendState {
     send_packet_id: u32,
     sent: BTreeMap<u32, UdpData>,
+    counts: SentData,
+}
+
+/// The BC data a UDP connection sent its peer, as `C2R_DISC`'s `send` reports it: data packets and their payload
+/// bytes, retransmissions included, and the retransmitted part of each.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SentData {
+    pub copies: i64,
+    pub resent: i64,
+    pub bytes: i64,
+    pub resent_bytes: i64,
 }
 
 /// The two ways a `BcConnection` can actually be talking to a device.
@@ -304,6 +315,7 @@ impl BcConnection {
         let send_state = Arc::new(tokio::sync::Mutex::new(UdpSendState {
             send_packet_id: 0,
             sent: BTreeMap::new(),
+            counts: SentData::default(),
         }));
         let (tx, rx) = tokio::sync::mpsc::channel(RX_CHANNEL_CAPACITY);
         let replay_buffering = Arc::new(std::sync::atomic::AtomicU8::new(Buffering::Live as u8));
@@ -382,6 +394,14 @@ impl BcConnection {
                 ),
             });
             let _ = socket.send_to(&write_bcudp(&msg), peer.addr).await;
+        }
+    }
+
+    /// What this connection has sent its peer so far (`SentData`); nothing on TCP.
+    pub async fn sent_data(&self) -> SentData {
+        match &self.socket {
+            Socket::Udp { send_state, .. } => send_state.lock().await.counts,
+            Socket::Tcp { .. } => SentData::default(),
         }
     }
 
@@ -487,6 +507,8 @@ impl BcConnection {
                     // Kept until acked (see `udp_rx_task`'s handling of
                     // incoming `BcUdp::Ack`) so its `resend_tick` can
                     // retransmit it if the camera never confirms receipt.
+                    state.counts.copies += 1;
+                    state.counts.bytes += packet.payload.len() as i64;
                     state.sent.insert(packet.packet_id, packet);
                     state.send_packet_id += 1;
                 }
@@ -819,7 +841,17 @@ async fn udp_rx_task(
                 // Snapshot-then-send rather than holding the lock across
                 // every send_to: resending is best-effort and shouldn't
                 // block send_bc's own lock acquisition for the whole batch.
-                let packets: Vec<UdpData> = send_state.lock().await.sent.values().cloned().collect();
+                let packets: Vec<UdpData> = {
+                    let mut state = send_state.lock().await;
+                    let packets: Vec<UdpData> = state.sent.values().cloned().collect();
+                    let copies = packets.len() as i64;
+                    let bytes: i64 = packets.iter().map(|p| p.payload.len() as i64).sum();
+                    state.counts.copies += copies;
+                    state.counts.resent += copies;
+                    state.counts.bytes += bytes;
+                    state.counts.resent_bytes += bytes;
+                    packets
+                };
                 for packet in packets {
                     if socket.send_to(&write_bcudp(&BcUdp::Data(packet)), peer.addr).await.is_err() {
                         return;

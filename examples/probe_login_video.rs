@@ -22,7 +22,6 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let empty_nonce_probe = args.iter().any(|a| a == "--empty-nonce");
     let prefer_direct = args.iter().any(|a| a == "--prefer-direct");
-    let prefer_tcp = args.iter().any(|a| a == "--prefer-tcp");
     let quality = if args.iter().any(|a| a == "--sub-stream") { StreamProfile::Sub } else { StreamProfile::Main };
     let channel_id: u8 = args
         .iter()
@@ -73,17 +72,16 @@ async fn main() {
     } else {
         let uid = args
             .get(1)
-            .expect("usage: probe_login_video <UID> [--empty-nonce] [--prefer-direct] [--prefer-tcp] [--channel N] [--dump-file PATH] [--sub-stream]\n   or: probe_login_video --tcp <IP:PORT> [same flags]")
+            .expect(
+                "usage: probe_login_video <UID> [--empty-nonce] [--prefer-direct] [--channel N] [--dump-file PATH] \
+                 [--sub-stream]\n   or: probe_login_video --tcp <IP:PORT> [same flags]",
+            )
             .clone();
         println!(
             "Connecting to UID {uid} over P2P{}...",
-            if prefer_tcp { " (preferring direct, upgrading to TCP:9000 if reachable)" }
-            else if prefer_direct { " (preferring direct)" }
-            else { "" }
+            if prefer_direct { " (preferring direct)" } else { "" }
         );
-        let connect_result = if prefer_tcp {
-            ReolinkClient::connect_by_uid_prefer_tcp(&uid).await
-        } else if prefer_direct {
+        let connect_result = if prefer_direct {
             ReolinkClient::connect_by_uid_prefer_direct(&uid).await
         } else {
             ReolinkClient::connect_by_uid(&uid).await

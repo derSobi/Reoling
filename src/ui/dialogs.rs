@@ -7,9 +7,10 @@
 use crate::ui::bridge::ConnectTarget;
 use gtk4::prelude::*;
 use gtk4::{
-    Box as GtkBox, Button, CheckButton, Entry, Grid, Label, Notebook, Orientation,
-    PasswordEntry, Window,
+    Box as GtkBox, Button, CheckButton, Entry, Grid, Label, ListBox, ListBoxRow, Notebook, Orientation,
+    PasswordEntry, ScrolledWindow, Window,
 };
+use reoling::transport::lan_search::{self, Found};
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -81,6 +82,32 @@ pub(crate) fn choose_folder(parent: &Window, current: &Path, on_pick: impl Fn(Pa
     chooser.show();
 }
 
+/// Opens the system's file chooser over `parent` to save a file named
+/// `name` in `folder`; `on_pick` gets the path chosen (nothing on Cancel).
+/// Kept alive the way `choose_folder` keeps its chooser.
+pub(crate) fn save_file(parent: &Window, title: &str, name: &str, folder: &Path, on_pick: impl Fn(PathBuf) + 'static) {
+    let chooser = gtk4::FileChooserNative::new(
+        Some(title),
+        Some(parent),
+        gtk4::FileChooserAction::Save,
+        Some("Save"),
+        Some("Cancel"),
+    );
+    let _ = chooser.set_current_folder(Some(&gtk4::gio::File::for_path(folder)));
+    chooser.set_current_name(name);
+    let slot: Rc<RefCell<Option<gtk4::FileChooserNative>>> = Rc::new(RefCell::new(Some(chooser.clone())));
+    let held = Rc::clone(&slot);
+    chooser.connect_response(move |chooser, response| {
+        if response == gtk4::ResponseType::Accept {
+            if let Some(path) = chooser.file().and_then(|f| f.path()) {
+                on_pick(path);
+            }
+        }
+        held.borrow_mut().take();
+    });
+    chooser.show();
+}
+
 /// Opens `uri` (a folder, a web page) in the desktop's default application
 /// for it. In the AppImage on its own GTK and GStreamer core (the "bundled"
 /// stack, see scripts/appimage-hook.sh) LD_LIBRARY_PATH names their
@@ -145,9 +172,132 @@ pub(crate) fn button_row(cancel: &Button, accept: &Button) -> GtkBox {
     buttons
 }
 
-/// "Add device": a UID tab and an IP tab. The device's name is read from the
-/// device itself once connected.
-pub fn add_device(parent: &Window, on_add: impl Fn(ConnectTarget) + 'static) {
+/// What the list shows while no device has answered.
+const SEARCHING: &str = "Looking for devices on this network…";
+/// What it shows when the search cannot run because the port the devices answer to is taken.
+const SEARCH_PORT_TAKEN: &str = "The search is not available: another program, such as the Reolink app, is using \
+                                 the port the devices answer to (UDP 3000). Close it and open this dialog again.";
+const SEARCH_FAILED: &str = "The search is not available on this network.";
+
+/// The first line of a found device's row: its model, and that it is in the list already.
+fn found_title(model: Option<&str>, added: bool) -> String {
+    let model = model.unwrap_or("Reolink device");
+    if added {
+        format!("{model} (already added)")
+    } else {
+        model.to_string()
+    }
+}
+
+/// A found device's row: the model at the start, the UID at the end. One that is added already says so and
+/// cannot be chosen.
+fn found_row(found: &Found, added: bool) -> ListBoxRow {
+    let line = GtkBox::new(Orientation::Horizontal, 12);
+    line.set_margin_top(6);
+    line.set_margin_bottom(6);
+    line.set_margin_start(8);
+    line.set_margin_end(8);
+    let title = Label::new(Some(&found_title(found.model.as_deref(), added)));
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    let uid = Label::new(Some(&found.uid));
+    uid.add_css_class("monospace");
+    if added {
+        title.add_css_class("dim-label");
+        uid.add_css_class("dim-label");
+    }
+    line.append(&title);
+    line.append(&uid);
+    let row = ListBoxRow::new();
+    row.set_child(Some(&line));
+    row.set_activatable(!added);
+    row
+}
+
+/// The "Found on the network" part of the UID tab: the devices that answer `lan_search` while `window` is open.
+/// Choosing one writes its UID into `uid`; nothing is added by itself. `added` are the UIDs in the app already.
+fn found_on_the_network(window: &Window, uid: &Entry, added: Vec<String>) -> GtkBox {
+    let section = GtkBox::new(Orientation::Vertical, 6);
+    let heading = Label::new(Some("Found on the network"));
+    heading.set_halign(gtk4::Align::Start);
+    section.append(&heading);
+
+    let list = ListBox::new();
+    list.set_selection_mode(gtk4::SelectionMode::None);
+    list.update_property(&[gtk4::accessible::Property::Label("Found on the network")]);
+    let status = Label::new(Some(SEARCHING));
+    status.add_css_class("dim-label");
+    status.set_wrap(true);
+    status.set_xalign(0.0);
+    status.set_margin_top(8);
+    status.set_margin_bottom(8);
+    status.set_margin_start(8);
+    status.set_margin_end(8);
+    list.set_placeholder(Some(&status));
+    // Room for three rows from the start, so the dialog keeps its size while the devices answer.
+    let scroller = ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .min_content_height(108)
+        .max_content_height(180)
+        .propagate_natural_height(true)
+        .has_frame(true)
+        .child(&list)
+        .build();
+    section.append(&scroller);
+
+    // The UIDs of the rows, in the rows' order.
+    let uids: Rc<RefCell<Vec<String>>> = Rc::default();
+    let (entry, row_uids) = (uid.clone(), Rc::clone(&uids));
+    list.connect_row_activated(move |_, row| {
+        let Some(uid) = usize::try_from(row.index()).ok().and_then(|i| row_uids.borrow().get(i).cloned()) else {
+            return;
+        };
+        entry.set_text(&uid);
+        // The next Enter adds it.
+        entry.grab_focus();
+        entry.set_position(-1);
+    });
+
+    let (found_tx, found_rx) = async_channel::unbounded::<std::io::Result<Found>>();
+    std::thread::spawn(move || {
+        // Ends within a moment of the dialog's closing, which closes the channel.
+        let searched = lan_search::search(|device| match device {
+            Some(device) => found_tx.try_send(Ok(device)).is_ok(),
+            None => !found_tx.is_closed(),
+        });
+        if let Err(e) = searched {
+            let _ = found_tx.try_send(Err(e));
+        }
+    });
+    // Ends the search with the dialog, however it goes: closed by the user, or destroyed with its parent.
+    let (closing, destroyed) = (found_rx.clone(), found_rx.clone());
+    window.connect_close_request(move |_| {
+        closing.close();
+        gtk4::glib::Propagation::Proceed
+    });
+    window.connect_destroy(move |_| {
+        destroyed.close();
+    });
+    gtk4::glib::spawn_future_local(async move {
+        while let Ok(message) = found_rx.recv().await {
+            match message {
+                Ok(found) => {
+                    let known = added.iter().any(|uid| uid.trim().eq_ignore_ascii_case(&found.uid));
+                    list.append(&found_row(&found, known));
+                    uids.borrow_mut().push(found.uid);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => status.set_text(SEARCH_PORT_TAKEN),
+                Err(_) => status.set_text(SEARCH_FAILED),
+            }
+        }
+    });
+    section
+}
+
+/// "Add device": a UID tab, with the devices found on the network to choose from, and an IP tab. The device's
+/// name is read from the device itself once connected. `added` are the UIDs of the devices in the app already.
+pub fn add_device(parent: &Window, added: Vec<String>, on_add: impl Fn(ConnectTarget) + 'static) {
     let (window, content) = dialog(Some(parent), "Add device", DIALOG_WIDTH);
 
     let notebook = Notebook::new();
@@ -161,6 +311,7 @@ pub fn add_device(parent: &Window, on_add: impl Fn(ConnectTarget) + 'static) {
         .margin_end(12)
         .build();
     row(&uid_grid, 0, "UID", &uid);
+    uid_grid.attach(&found_on_the_network(&window, &uid, added), 0, 1, 2, 1);
     notebook.append_page(&uid_grid, Some(&Label::new(Some("UID"))));
 
     let ip = Entry::builder().placeholder_text("192.168.1.50").build();
@@ -274,6 +425,14 @@ pub fn login(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_found_device_is_titled_by_its_model_and_says_when_it_is_added_already() {
+        assert_eq!(found_title(Some("RLC-520A"), false), "RLC-520A");
+        assert_eq!(found_title(Some("RLC-520A"), true), "RLC-520A (already added)");
+        assert_eq!(found_title(None, false), "Reolink device");
+        assert_eq!(found_title(None, true), "Reolink device (already added)");
+    }
 
     #[test]
     fn applications_started_from_the_bundled_stack_do_not_get_its_gtk() {

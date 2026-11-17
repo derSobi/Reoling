@@ -109,6 +109,21 @@ pub struct Settings {
     /// The missing parts the user asked not to hear about again at start
     /// (see `requirements::Report::dismiss_key`).
     pub requirements_dismissed: Option<String>,
+    /// The Diagnostic Log switch: the diagnostic lines, masked, into
+    /// `log_path()`. It lasts until Reoling is closed and is never saved:
+    /// every start has it off, unless Reoling was started with
+    /// `--diagnostics` (`start_with_diagnostics`).
+    pub diagnostics: bool,
+}
+
+/// The Diagnostic Log switch as it stands in this run (`Settings::diagnostics`): what `load` gives and `apply`
+/// keeps.
+static DIAGNOSTICS: AtomicBool = AtomicBool::new(false);
+
+/// Turns the Diagnostic Log on from the start of this run, for `--diagnostics`: the log then has how each
+/// device connects. Called before the settings are first loaded.
+pub fn start_with_diagnostics() {
+    DIAGNOSTICS.store(true, Ordering::Relaxed);
 }
 
 fn path() -> PathBuf {
@@ -128,15 +143,31 @@ impl Default for Settings {
             screenshot_dir: None,
             recording_dir: None,
             requirements_dismissed: None,
+            diagnostics: false,
         }
     }
 }
 
+/// The diagnostic log file (see `reoling::diag::log_path`).
+pub fn log_path() -> PathBuf {
+    reoling::diag::log_path(std::env::var_os("XDG_STATE_HOME").as_deref(), &glib::home_dir())
+}
+
 impl Settings {
     pub fn load() -> Self {
+        Self::load_from(&path())
+    }
+
+    fn load_from(path: &Path) -> Self {
+        Self::load_with(path, DIAGNOSTICS.load(Ordering::Relaxed))
+    }
+
+    /// `load_from` with the Diagnostic Log switch as it stands in this run: the file never says.
+    fn load_with(path: &Path, diagnostics: bool) -> Self {
         let file = KeyFile::new();
-        if file.load_from_file(path(), KeyFileFlags::NONE).is_err() {
-            return Self::default();
+        if file.load_from_file(path, KeyFileFlags::NONE).is_err() {
+            // A first start has no settings file yet, and `--diagnostics` must hold there too.
+            return Self { diagnostics, ..Self::default() };
         }
         let get = |k: &str| file.string("settings", k).ok().map(|s| s.to_string());
         Self {
@@ -158,10 +189,16 @@ impl Settings {
             recording_dir: get("recording_dir").filter(|s| !s.is_empty()),
             volume: get("volume").and_then(|v| v.parse().ok()).map_or(0.5, |v: f64| v.clamp(0.0, 1.0)),
             requirements_dismissed: get("requirements_dismissed").filter(|s| !s.is_empty()),
+            // Not read from the file (earlier test builds wrote it there).
+            diagnostics,
         }
     }
 
     pub fn save(&self) {
+        self.save_to(&path())
+    }
+
+    fn save_to(&self, path: &Path) {
         let file = KeyFile::new();
         file.set_string(
             "settings",
@@ -189,11 +226,10 @@ impl Settings {
         file.set_string("settings", "recording_dir", self.recording_dir.as_deref().unwrap_or(""));
         file.set_string("settings", "hardware_decoder", self.hardware_decoder.as_deref().unwrap_or(""));
         file.set_string("settings", "requirements_dismissed", self.requirements_dismissed.as_deref().unwrap_or(""));
-        let path = path();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        if let Err(e) = file.save_to_file(&path) {
+        if let Err(e) = file.save_to_file(path) {
             eprintln!("could not save the settings: {e}");
         }
     }
@@ -204,6 +240,8 @@ impl Settings {
         apply_theme(self.theme);
         apply_decoding(self);
         LATENCY_MS.store(self.latency.millis(), Ordering::Relaxed);
+        DIAGNOSTICS.store(self.diagnostics, Ordering::Relaxed);
+        reoling::diag::set_file(self.diagnostics.then(log_path));
     }
 }
 
@@ -1216,5 +1254,37 @@ mod tests {
             theme_changes(Theme::Light, Some("Adwaita"), true, "Adwaita", false),
             (Some("Adwaita"), Some(false))
         );
+    }
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::Settings;
+    use std::path::Path;
+
+    /// The Diagnostic Log switch lasts for one run: it is not written to the settings file, and a file that has
+    /// it on, as earlier test builds wrote it, reads as off. Under `target/`, never the user's own settings.
+    #[test]
+    fn the_diagnostic_log_switch_is_not_saved() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("diag-tests").join("settings");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.ini");
+        assert!(!Settings::load_from(&path).diagnostics);
+        let mut on = Settings::default();
+        on.diagnostics = true;
+        on.stretch = true;
+        on.save_to(&path);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("diagnostics"));
+        let read = Settings::load_from(&path);
+        assert!(!read.diagnostics && read.stretch);
+        std::fs::write(&path, "[settings]\ntheme=dark\nstretch=true\ndiagnostics=true\n").unwrap();
+        let earlier = Settings::load_from(&path);
+        assert!(!earlier.diagnostics && earlier.stretch);
+        // Started with `--diagnostics`: on whatever the file is, also with none or one that cannot be read.
+        assert!(Settings::load_with(&path, true).diagnostics);
+        assert!(Settings::load_with(&dir.join("none.ini"), true).diagnostics);
+        std::fs::write(&path, "not a settings file").unwrap();
+        assert!(Settings::load_with(&path, true).diagnostics);
+        assert!(!Settings::load_with(&path, false).diagnostics);
     }
 }

@@ -15,6 +15,10 @@ pub enum Error {
     #[error("protocol error: {0}")]
     ProtocolError(String),
 
+    /// The P2P register server refused the UID (`R2C_C_R` with this `rsp`).
+    #[error("protocol error: register rejected with rsp={rsp}")]
+    RegisterRejected { rsp: i32 },
+
     /// The device answered a live stream's request with another code than
     /// 200. Its text is what the UI shows.
     #[error("{}", stream_refused(.stream, .code))]

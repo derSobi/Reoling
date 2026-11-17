@@ -236,6 +236,17 @@ fn os_release() -> String {
         .unwrap_or_default()
 }
 
+/// The distribution's name and version as it gives them (`PRETTY_NAME`), for the diagnostic log.
+pub(crate) fn distribution() -> Option<String> {
+    pretty_name(&os_release())
+}
+
+fn pretty_name(os_release: &str) -> Option<String> {
+    let value = os_release.lines().find_map(|line| line.trim().strip_prefix("PRETTY_NAME="))?;
+    let name = value.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// Every element name in `NEEDS`, sorted, each once.
 fn element_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = NEEDS
@@ -970,6 +981,15 @@ mod tests {
 
     fn gaps(report: &Report) -> Vec<(Feature, Vec<Need>)> {
         report.gaps.iter().map(|gap| (gap.feature, gap.missing.clone())).collect()
+    }
+
+    #[test]
+    fn the_distribution_is_named_as_it_names_itself() {
+        let text = "NAME=\"Linux Mint\"\nPRETTY_NAME=\"Linux Mint 22.3\"\nID=linuxmint\n";
+        assert_eq!(pretty_name(text).as_deref(), Some("Linux Mint 22.3"));
+        assert_eq!(pretty_name("PRETTY_NAME=CachyOS\n").as_deref(), Some("CachyOS"));
+        assert_eq!(pretty_name("ID=arch\nPRETTY_NAME=\"\"\n"), None);
+        assert_eq!(pretty_name(""), None);
     }
 
     #[test]

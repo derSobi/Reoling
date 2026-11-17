@@ -2,6 +2,7 @@
 
 pub mod discovery;
 pub mod connection;
+pub mod lan_search;
 
 /// A live P2P session's video stream can burst well above 1MB/s (the
 /// main/4K stream's actual configured bitrate — confirmed against real

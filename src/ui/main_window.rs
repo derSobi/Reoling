@@ -3,7 +3,7 @@
 //! video is suspended and the sidebar picks the device to play back from;
 //! leaving the page brings live video back as it was.
 
-use crate::ui::bridge::{spawn_device, ConnectTarget, DeviceEvent, DeviceLink, ReplaySinkRequest, SinkRequest, UidTransport};
+use crate::ui::bridge::{spawn_device, Carried, ConnectTarget, DeviceEvent, DeviceLink, ReplaySinkRequest, SinkRequest};
 use crate::ui::device_settings::{self, DeviceSettings};
 use crate::ui::device_store::{self, Device};
 use crate::ui::settings_pages;
@@ -106,6 +106,569 @@ struct Link {
     link: DeviceLink,
 }
 
+/// Where a trial stands (see `Trials`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Its forms go out on the device's link, which also writes how it ends.
+    OnLink,
+    /// That link has closed for the legacy cipher step: the next connection arms it.
+    Reconnecting,
+    /// The connection with the step armed is being made: once logged in, it sends the last forms.
+    Armed,
+}
+
+/// A trial on one device (see `MainWindow::start_trial`): the channel and the stream the device refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Trial {
+    channel: u8,
+    refused: StreamProfile,
+    phase: Phase,
+}
+
+/// What `Trials::on_connected` asks the window to do.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterLogin {
+    Nothing,
+    /// Send the trial's last forms on the new connection, under the trial's number `gen`.
+    Continue { channel: u8, refused: StreamProfile, gen: u64 },
+    /// The user no longer watches that channel: the trial is over, and the window writes so.
+    Cancelled,
+}
+
+/// The one owner of the trials: what each device's trial has reached across its connections, and the refusal that
+/// offers one. The window asks it and does what it answers; nothing else keeps trial state.
+#[derive(Debug, Default)]
+struct Trials {
+    running: HashMap<String, Trial>,
+    /// The device whose live view the device itself refused last: the channel and the stream it refused.
+    refusal: Option<(String, u8, StreamProfile)>,
+    /// Each device's trial number, shared with its connections (see `DeviceLink::try_live`): a trial's form is admitted
+    /// for sending only while it still equals the number the trial started under, and `cancel` moves it on before it
+    /// returns.
+    epochs: HashMap<String, reoling::TrialGate>,
+}
+
+impl Trials {
+    /// `key`'s trial number, for its connections to read.
+    fn epoch(&mut self, key: &str) -> reoling::TrialGate {
+        self.epochs.entry(key.to_string()).or_default().clone()
+    }
+
+    /// No new form of `key`'s current trial is admitted once this has returned (see `TrialGate`).
+    fn move_on(&mut self, key: &str) {
+        self.epoch(key).cancel();
+    }
+
+    /// The device refused `stream` of `channel`: a trial can be offered for it.
+    fn refused(&mut self, key: &str, channel: u8, stream: StreamProfile) {
+        self.refusal = Some((key.to_string(), channel, stream));
+    }
+
+    /// Another stream of `key` starts, or one plays: its refusal no longer stands.
+    fn clear_refusal(&mut self, key: &str) {
+        if self.refusal.as_ref().is_some_and(|r| r.0 == key) {
+            self.refusal = None;
+        }
+    }
+
+    /// Whether the device's menu offers a trial: the diagnostic log is being written (`recording`), the device
+    /// refused the stream being watched, and no trial runs on it.
+    fn offer(&self, key: &str, recording: bool) -> bool {
+        recording && self.refusal.as_ref().is_some_and(|r| r.0 == key) && !self.running.contains_key(key)
+    }
+
+    /// Starts the trial `offer` offers: the channel and the stream to try on the link, and the trial's number.
+    fn start(&mut self, key: &str, recording: bool) -> Option<(u8, StreamProfile, u64)> {
+        if !self.offer(key, recording) {
+            return None;
+        }
+        let (_, channel, refused) = self.refusal.take()?;
+        self.running.insert(key.to_string(), Trial { channel, refused, phase: Phase::OnLink });
+        Some((channel, refused, self.epoch(key).number()))
+    }
+
+    /// The user ended `key`'s trial (Stop, another device or channel, closing, the log turned off): the phase it
+    /// was in, `None` when none ran. No new form of it is admitted once this has returned (`move_on`); the window then
+    /// wakes the link (`Phase::OnLink`, `Phase::Armed`) and writes the end line.
+    fn cancel(&mut self, key: &str) -> Option<Phase> {
+        let phase = self.running.remove(key).map(|t| t.phase)?;
+        self.move_on(key);
+        Some(phase)
+    }
+
+    /// The devices whose trial runs.
+    fn running(&self) -> Vec<String> {
+        self.running.keys().cloned().collect()
+    }
+
+    /// The trial ended by itself (a stream plays, every form was refused, the connection went) or the device left:
+    /// the phase it was in, `None` when none ran.
+    fn end(&mut self, key: &str) -> Option<Phase> {
+        self.running.remove(key).map(|t| t.phase)
+    }
+
+    /// The trial's link has closed for the device to connect again: `Some(true)` when the next connection arms the
+    /// legacy cipher step, `Some(false)` when the trial is over, `None` when none runs (it was cancelled: the
+    /// device connects as always).
+    fn on_reconnect(&mut self, key: &str, legacy: bool) -> Option<bool> {
+        let trial = self.running.get_mut(key)?;
+        if legacy && trial.phase == Phase::OnLink {
+            trial.phase = Phase::Reconnecting;
+            return Some(true);
+        }
+        self.running.remove(key);
+        Some(false)
+    }
+
+    /// A connection to `key` is made now: whether it arms the legacy cipher step (for this connection only).
+    fn arm(&mut self, key: &str) -> bool {
+        match self.running.get_mut(key) {
+            Some(trial) if trial.phase == Phase::Reconnecting => {
+                trial.phase = Phase::Armed;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `key` has logged in; `watching`: the channel of it the user watches, if any.
+    fn on_connected(&mut self, key: &str, watching: Option<u8>) -> AfterLogin {
+        let Some(trial) = self.running.get_mut(key).filter(|t| t.phase == Phase::Armed) else {
+            return AfterLogin::Nothing;
+        };
+        if watching != Some(trial.channel) {
+            self.cancel(key);
+            return AfterLogin::Cancelled;
+        }
+        trial.phase = Phase::OnLink;
+        let (channel, refused) = (trial.channel, trial.refused);
+        AfterLogin::Continue { channel, refused, gen: self.epoch(key).number() }
+    }
+}
+
+/// Ends `key`'s trial for the user, as the window does (see `Paths::cancel_trial`): `Trials::cancel`, after
+/// which no new form of it is admitted, then `link`, the device's current one, is woken while it runs the trial or is
+/// armed for its last step, so that it stops waiting for a form under way. The phase the trial was in.
+fn end_trial(trials: &mut Trials, link: Option<&DeviceLink>, key: &str) -> Option<Phase> {
+    let phase = trials.cancel(key)?;
+    wake(link, phase);
+    Some(phase)
+}
+
+/// Wakes `link` for a trial cancelled in `phase` (see `end_trial`). A link armed for the cipher step then makes way
+/// for an ordinary one.
+fn wake(link: Option<&DeviceLink>, phase: Phase) {
+    if let (Some(link), Phase::OnLink | Phase::Armed) = (link, phase) {
+        link.cancel_trial();
+    }
+}
+
+/// What the window's actions do to the devices' links, trials and carried commands, without a widget: the window's
+/// paths (`Paths`) call these through `wired`, and the tests call the same functions.
+struct Wiring<'a> {
+    trials: &'a mut Trials,
+    links: &'a mut HashMap<String, Link>,
+    carried: &'a mut HashMap<String, Carried>,
+    /// The devices whose trial was cancelled here, in order: the window writes each one's end line once the call
+    /// returns (`wire`).
+    ended: Vec<String>,
+}
+
+impl Wiring<'_> {
+    /// Ends `key`'s trial (see `end_trial`): the phase it was in, `None` when none ran.
+    fn cancel_trial(&mut self, key: &str) -> Option<Phase> {
+        let phase = end_trial(self.trials, self.links.get(key).map(|l| &l.link), key);
+        if phase.is_some() {
+            self.ended.push(key.to_string());
+        }
+        phase
+    }
+
+    /// Ends every trial (the log turned off or the window closing).
+    fn cancel_all_trials(&mut self) {
+        for key in self.trials.running() {
+            self.cancel_trial(&key);
+        }
+    }
+
+    /// `key`'s live view stops (Stop, the Playback page, another device watched): its trial ends, and its link
+    /// stops the stream; with no link, no carried command starts one. Whether a trial was cancelled.
+    fn stop(&mut self, key: &str) -> bool {
+        let cancelled = self.cancel_trial(key).is_some();
+        match self.links.get(key) {
+            Some(l) => l.link.stop(),
+            None => self.carried.get_mut(key).into_iter().for_each(|carried| carried.set_live(None)),
+        }
+        cancelled
+    }
+
+    /// Stop and the Playback page: the live view of `watched`, the device watched, stops (`stop`). The device, or
+    /// `None` when nothing was watched and nothing was done.
+    fn stop_watched(&mut self, watched: Option<String>) -> Option<String> {
+        let key = watched?;
+        self.stop(&key);
+        Some(key)
+    }
+
+    /// The diagnostic log is turned on or off in the settings, or the recording check finds it so: off, every
+    /// trial ends.
+    fn log_switched(&mut self, on: bool) {
+        if !on {
+            self.cancel_all_trials();
+        }
+    }
+
+    /// `key` is to be watched instead of `previous`, the device watched so far: a trial on `previous` ends, and
+    /// when it is another device its live view stops (`stop`). Whether a trial was cancelled.
+    fn leave(&mut self, previous: &str, key: &str) -> bool {
+        if previous == key {
+            self.cancel_trial(previous).is_some()
+        } else {
+            self.stop(previous)
+        }
+    }
+
+    /// `key`'s `channel` streams in `profile`: on its link or, with no link, in place of the live view carried for
+    /// it.
+    fn play(&mut self, key: &str, channel: u8, profile: StreamProfile) {
+        match self.links.get(key) {
+            Some(l) => l.link.play(channel, profile),
+            None => {
+                self.carried.get_mut(key).into_iter().for_each(|carried| carried.set_live(Some((channel, profile))))
+            }
+        }
+    }
+
+    /// The window closes: every trial ends and every link logs out. Whether any link was told.
+    fn shutdown(&mut self) -> bool {
+        self.cancel_all_trials();
+        for l in self.links.values() {
+            l.link.shutdown();
+        }
+        !self.links.is_empty()
+    }
+
+    /// A trial's connection has closed (`DeviceEvent::TrialReconnect`): its link goes, and what it left unserved
+    /// waits for the device's next connection (`take_carried`). The trial's next step (`Trials::on_reconnect`).
+    fn trial_reconnected(&mut self, key: &str, legacy: bool, carried: Carried) -> Option<bool> {
+        let step = self.trials.on_reconnect(key, legacy);
+        // Dropped first: the link's queue is then complete when the window changes what is carried.
+        self.links.remove(key);
+        self.carried.insert(key.to_string(), carried);
+        step
+    }
+
+    /// What `key`'s next connection serves first.
+    fn take_carried(&mut self, key: &str) -> Carried {
+        self.carried.remove(key).unwrap_or_default()
+    }
+}
+
+/// Runs `act` on the links, trials and carried commands (see `Wiring`), then `ended` for each trial it cancelled,
+/// in order, once the borrows are gone: an end line reads the trials again.
+fn wire<R>(
+    trials: &RefCell<Trials>,
+    links: &RefCell<HashMap<String, Link>>,
+    carried: &RefCell<HashMap<String, Carried>>,
+    act: impl FnOnce(&mut Wiring) -> R,
+    ended: impl Fn(&str),
+) -> R {
+    let (out, keys) = {
+        let (mut trials, mut links, mut carried) = (trials.borrow_mut(), links.borrow_mut(), carried.borrow_mut());
+        let mut wiring = Wiring { trials: &mut trials, links: &mut links, carried: &mut carried, ended: Vec::new() };
+        let out = act(&mut wiring);
+        (out, wiring.ended)
+    };
+    for key in keys {
+        ended(&key);
+    }
+    out
+}
+
+/// The window's paths that end trials, start or stop streams or close links, each one whole: the provided methods
+/// hold the sequence, and the tests run them without a display. A path changes links, trials and carried commands
+/// only through `wired`. The required methods are the window's own steps, which change its widgets and its own
+/// state. Two of those send a command, because what they need lives only in the window: `end_talk` (TalkStop, when
+/// a talk is on, as the microphone and the talk button say) and `reconnect` (the next connection, on the GTK main
+/// loop).
+trait Paths {
+    /// `act` on the links, trials and carried commands, then the end line of each trial it cancelled (`wire`).
+    fn wired<R>(&self, act: impl FnOnce(&mut Wiring) -> R) -> R;
+    fn playing_key(&self) -> Option<String>;
+    /// Whether the diagnostic log is being written (`diag::recording`).
+    fn recording(&self) -> bool;
+    fn refresh_trial_entries(&self);
+    fn set_trials_shown(&self, shown: bool);
+    /// Ends any talk; the camera is told on the watched device's link.
+    fn end_talk(&self);
+    fn show_message(&self, text: &str);
+    /// Stop's widget work once the live view of `key` has stopped.
+    fn stopped(&self, key: &str);
+    /// The Playback page's widget work once the live view of `key` has stopped; it starts again when the page is
+    /// left.
+    fn suspended(&self, key: &str);
+    /// While the Playback page is shown, `play` only notes `key` for when the page is left: true then.
+    fn noted_for_playback(&self, key: &str) -> bool;
+    /// The channel of `key` to watch; `None` once the device is no longer listed.
+    fn channel_of(&self, key: &str) -> Option<u8>;
+    /// The picture goes before another stream starts.
+    fn clear_picture(&self);
+    /// The widget work before `channel` of `key` is asked for; the stream to ask for.
+    fn starting(&self, key: &str, channel: u8) -> StreamProfile;
+    /// The widget work once it was asked for; `switched`: another device than the one watched before.
+    fn started(&self, channel: u8, switched: bool);
+    /// A trial's connection to `key` has closed: what the window had from it goes.
+    fn reconnecting(&self, key: &str);
+    /// Opens the device's next connection.
+    fn reconnect(self: &Rc<Self>, key: &str);
+    /// Gives the device threads time to send their logouts before the process exits.
+    fn grace(&self);
+
+    /// The user ended `key`'s trial, if one runs: no new form of it is admitted once this has returned, the link
+    /// stops waiting for the one under way, and the log says so.
+    fn cancel_trial(&self, key: &str) {
+        self.wired(|w| w.cancel_trial(key));
+    }
+
+    /// The stop button: the stream stops, its last picture stays and the button becomes Play. The stream is no
+    /// longer the one to restore on the next start.
+    fn stop(&self) {
+        let watched = self.playing_key();
+        let Some(key) = self.wired(|w| w.stop_watched(watched)) else { return };
+        self.end_talk();
+        self.stopped(&key);
+    }
+
+    /// Live video makes way for the Playback page: the stream stops but nothing is forgotten (unlike the Stop
+    /// button), and it starts again when the page is left.
+    fn suspend_live(&self) {
+        let watched = self.playing_key();
+        let Some(key) = self.wired(|w| w.stop_watched(watched)) else { return };
+        self.end_talk();
+        self.suspended(&key);
+    }
+
+    /// Streams the device's current channel, stopping whatever else was on. While the Playback page is shown, it
+    /// only notes the device for when the page is left.
+    fn play(&self, key: &str) {
+        if self.noted_for_playback(key) {
+            return;
+        }
+        let Some(channel) = self.channel_of(key) else { return };
+        // Another stream starts: a trial on the one watched so far ends, and one is offered only after a refusal
+        // of the stream being started now.
+        let previous = self.playing_key();
+        if let Some(previous) = &previous {
+            self.wired(|w| w.leave(previous, key));
+            self.wired(|w| w.trials.clear_refusal(previous));
+            self.refresh_trial_entries();
+        }
+        self.clear_picture();
+        self.end_talk();
+        let profile = self.starting(key, channel);
+        self.wired(|w| w.play(key, channel, profile));
+        self.started(channel, previous.as_deref() != Some(key));
+    }
+
+    /// The diagnostic log was switched in the settings to `on`; `apply` puts the new settings in force. Turned off,
+    /// the trials end while the log can still say so. The trial entries follow the file actually written.
+    fn diagnostics_set(&self, on: bool, apply: impl FnOnce()) {
+        self.wired(|w| w.log_switched(on));
+        apply();
+        self.recording_found(self.recording());
+    }
+
+    /// The diagnostic log is found written (`now`) or not: not written, every trial ends; the trial entries are
+    /// offered only while it is.
+    fn recording_found(&self, now: bool) {
+        self.wired(|w| w.log_switched(now));
+        self.set_trials_shown(now);
+        self.refresh_trial_entries();
+    }
+
+    /// The trial's connection has closed (`DeviceEvent::TrialReconnect`): the device connects again, for the
+    /// legacy cipher step or as it always does (always, for a trial the user cancelled meanwhile). No Auto Live
+    /// View: the trial sends the next Preview itself, and a stream the user asked for meanwhile is among the
+    /// commands the new connection serves first.
+    fn trial_reconnect(self: &Rc<Self>, key: &str, legacy: bool, message: Option<&str>, carried: Carried) {
+        let step = self.wired(|w| w.trial_reconnected(key, legacy, carried));
+        if step == Some(false) && self.playing_key().as_deref() == Some(key) {
+            self.show_message(message.unwrap_or(crate::ui::bridge::NO_FORM_ACCEPTED));
+        }
+        self.reconnecting(key);
+        self.refresh_trial_entries();
+        self.reconnect(key);
+    }
+
+    /// Tells every device we are leaving; the threads need a moment to get the packets out before the process
+    /// exits.
+    fn shutdown_all(&self) {
+        if self.wired(|w| w.shutdown()) {
+            self.grace();
+        }
+    }
+}
+
+impl Paths for MainWindow {
+    fn wired<R>(&self, act: impl FnOnce(&mut Wiring) -> R) -> R {
+        wire(&self.trials, &self.links, &self.carried, act, |key| self.trial_cancelled(key))
+    }
+
+    fn playing_key(&self) -> Option<String> {
+        MainWindow::playing_key(self)
+    }
+
+    fn recording(&self) -> bool {
+        recording()
+    }
+
+    fn refresh_trial_entries(&self) {
+        MainWindow::refresh_trial_entries(self);
+    }
+
+    fn set_trials_shown(&self, shown: bool) {
+        self.sidebar.set_trials_shown(shown);
+    }
+
+    fn end_talk(&self) {
+        MainWindow::end_talk(self);
+    }
+
+    fn show_message(&self, text: &str) {
+        MainWindow::show_message(self, text);
+    }
+
+    fn stopped(&self, key: &str) {
+        self.video.freeze();
+        if let Some(sink) = self.video.current_sink() {
+            sink.stop_recording();
+        }
+        self.set_record_button(false);
+        self.audio.reset();
+        *self.playing.borrow_mut() = None;
+        *self.last_played.borrow_mut() = None;
+        *self.stopped.borrow_mut() = Some(key.to_string());
+        self.streaming.set(false);
+        self.persist();
+        self.update_controls();
+        // As in `suspended`: the camera window has no watched channel to
+        // read now, while the device stays connected.
+        if self.camera_settings.is_visible() {
+            self.camera_settings.live_stopped();
+        } else {
+            self.camera_settings.stopped_while_closed(key);
+        }
+    }
+
+    fn suspended(&self, key: &str) {
+        *self.resume_live.borrow_mut() = Some(key.to_string());
+        // Ends a recording too.
+        self.reset_video();
+        *self.playing.borrow_mut() = None;
+        self.streaming.set(false);
+        self.update_controls();
+        // The camera window reads over the watched channel's connection:
+        // none is watched now (the device itself stays connected). Closed,
+        // it gives up a save under way, whose answers are no longer taken.
+        if self.camera_settings.is_visible() {
+            self.camera_settings.live_stopped();
+        } else {
+            self.camera_settings.stopped_while_closed(key);
+        }
+    }
+
+    fn noted_for_playback(&self, key: &str) -> bool {
+        if !self.playback.is_shown() {
+            return false;
+        }
+        *self.resume_live.borrow_mut() = Some(key.to_string());
+        if self.playback.device_key().as_deref() == Some(key) {
+            self.sidebar.select(key);
+        }
+        true
+    }
+
+    fn channel_of(&self, key: &str) -> Option<u8> {
+        self.device(key).map(|d| d.channel)
+    }
+
+    fn clear_picture(&self) {
+        // A stream asked for anew: the selector offers what the channel advertises.
+        self.trial_stream.borrow_mut().take();
+        self.reset_video();
+        self.set_spotlight_button(false);
+    }
+
+    fn starting(&self, key: &str, channel: u8) -> StreamProfile {
+        *self.stopped.borrow_mut() = None;
+        *self.playing.borrow_mut() = Some(key.to_string());
+        *self.last_played.borrow_mut() = Some(key.to_string());
+        self.streaming.set(false);
+        self.refused.set(false);
+        self.refresh_streams();
+        self.persist();
+        self.sidebar.select(key);
+        self.sidebar.mark_channel(key, channel);
+        self.show_message("Starting…");
+        self.profile.get()
+    }
+
+    fn started(&self, channel: u8, switched: bool) {
+        self.update_controls();
+        // The camera window shows the watched channel: when that is another
+        // one now (or the same one after a stop or a lost connection), it is
+        // opened again for it, where it is; its old tabs would never fill.
+        if self.camera_settings.is_visible() && (switched || !self.camera_settings.is_open_for(channel)) {
+            self.open_camera_settings(false);
+        }
+    }
+
+    fn reconnecting(&self, key: &str) {
+        self.connected.borrow_mut().remove(key);
+        self.channel_lists.borrow_mut().remove(key);
+        // As for a new login: the Playback page waits for the new connection, the camera window gives up what it
+        // had out on the old one.
+        self.playback.device_reconnecting(key);
+        self.camera_settings.reconnecting(key);
+    }
+
+    fn reconnect(self: &Rc<Self>, key: &str) {
+        self.connect(key, false);
+    }
+
+    fn grace(&self) {
+        std::thread::sleep(DISCONNECT_GRACE);
+    }
+}
+
+/// The streams a channel advertises: what the device's channel list says (`listed`), and for a device without
+/// one, a standalone camera, main and sub, with the third stream between them when its support table tells of
+/// one (`ChannelAbilities::extern_stream`).
+fn advertised_streams(
+    listed: Option<Vec<StreamProfile>>,
+    abilities: Option<reoling::ChannelAbilities>,
+) -> Vec<StreamProfile> {
+    listed.unwrap_or_else(|| {
+        if abilities.is_some_and(|a| a.extern_stream) {
+            vec![StreamProfile::Main, StreamProfile::Extern, StreamProfile::Sub]
+        } else {
+            vec![StreamProfile::Main, StreamProfile::Sub]
+        }
+    })
+}
+
+/// The streams the selector offers: what the channel advertises, and the stream a trial got the device to play
+/// (`accepted`) when the channel does not advertise it, so the selector shows what plays.
+fn offered_streams(mut advertised: Vec<StreamProfile>, accepted: Option<StreamProfile>) -> Vec<StreamProfile> {
+    if let Some(stream) = accepted.filter(|s| !advertised.contains(s)) {
+        advertised.insert(0, stream);
+    }
+    advertised
+}
+
+/// The line added under a refusal while the diagnostic log is on.
+const TRIAL_HINT: &str = "To try other request forms, choose “Try other live view requests…” in the device's menu.";
+
 pub struct MainWindow {
     window: ApplicationWindow,
     header: HeaderBar,
@@ -173,6 +736,13 @@ pub struct MainWindow {
     snap_purpose: RefCell<Option<SnapPurpose>>,
     /// The devices that have logged in on their current link.
     connected: RefCell<HashSet<String>>,
+    /// The trials, and the refusal that offers one (see `Trials`).
+    trials: RefCell<Trials>,
+    /// The stream a trial got the watched device to play on a channel: (device, channel, stream). Kept until another
+    /// stream is asked for (see `offered_streams`).
+    trial_stream: RefCell<Option<(String, u8, StreamProfile)>>,
+    /// What a connection a trial ended left unserved, for the device's next connection (see `connect`).
+    carried: RefCell<HashMap<String, Carried>>,
     next_link_id: Cell<u64>,
     /// The device being watched, and the one to watch as soon as it is
     /// connected.
@@ -182,7 +752,6 @@ pub struct MainWindow {
     last_played: RefCell<Option<String>>,
     settings: RefCell<Settings>,
     audio: Arc<AudioOutput>,
-    uid_transport: UidTransport,
     sink_request_tx: tokio::sync::mpsc::Sender<SinkRequest>,
     /// The Playback page's picture: recorded footage only, fed by the device
     /// threads through `replay_sink_request_tx`.
@@ -197,7 +766,7 @@ pub struct MainWindow {
     channel_lists: RefCell<HashSet<String>>,
 }
 
-pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
+pub fn build(app: &Application) -> Rc<MainWindow> {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Reoling")
@@ -206,6 +775,11 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         .build();
 
     let settings = Settings::load();
+    // The configured names are masked before the diagnostic log's first line.
+    let (devices, last) = device_store::load();
+    for device in &devices {
+        conceal_device(device);
+    }
     settings.apply();
     // One line on stderr when this system lacks something (see
     // `requirements`); nothing otherwise. Here, not in main(): only the
@@ -263,6 +837,7 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             on_settings: Box::new(with_key(MainWindow::open_device_settings)),
             on_relogin: Box::new(with_key(MainWindow::relogin)),
             on_remove: Box::new(with_key(MainWindow::remove)),
+            on_trial: Box::new(with_key(MainWindow::start_trial)),
         });
 
         let header = HeaderBar::new();
@@ -902,13 +1477,15 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
             preset_queue_generation: Cell::new(0),
             snap_purpose: RefCell::new(None),
             connected: RefCell::new(HashSet::new()),
+            trials: RefCell::new(Trials::default()),
+            trial_stream: RefCell::new(None),
+            carried: RefCell::new(HashMap::new()),
             next_link_id: Cell::new(1),
             playing: RefCell::new(None),
             autoplay: RefCell::new(None),
             last_played: RefCell::new(None),
             settings: RefCell::new(settings),
             audio: Arc::clone(&audio),
-            uid_transport,
             sink_request_tx,
             replay_video: Rc::clone(&replay_video),
             replay_sink_request_tx,
@@ -951,13 +1528,24 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
         }
     });
 
-    let (devices, last) = device_store::load();
     *main.last_played.borrow_mut() = last.clone();
     if main.settings.borrow().auto_live_view {
         *main.autoplay.borrow_mut() = last;
     }
     main.video.widget().set_keep_aspect_ratio(!main.settings.borrow().stretch);
     main.replay_video.widget().set_keep_aspect_ratio(!main.settings.borrow().stretch);
+    main.sidebar.set_trials_shown(recording());
+    // The trial entries follow the file actually written: a write error stops it on a device's thread.
+    let weak = Rc::downgrade(&main);
+    let was_recording = Cell::new(recording());
+    glib::timeout_add_local(crate::ui::settings_window::RECORDING_CHECK, move || {
+        let Some(main) = weak.upgrade() else { return glib::ControlFlow::Break };
+        let now = recording();
+        if was_recording.replace(now) != now {
+            main.recording_found(now);
+        }
+        glib::ControlFlow::Continue
+    });
     for device in devices {
         main.sidebar.add_device(&device);
         main.devices.borrow_mut().push(device);
@@ -986,6 +1574,21 @@ pub fn build(app: &Application, uid_transport: UidTransport) -> Rc<MainWindow> {
     window.present();
     main.warn_about_requirements();
     main
+}
+
+/// Whether the diagnostic log is being written now (the switch on and the file open).
+fn recording() -> bool {
+    matches!(reoling::diag::recording(), reoling::diag::Recording::On(_))
+}
+
+/// Masks the device's name, key (UID or address), user name and channel names in the diagnostic log.
+fn conceal_device(device: &Device) {
+    for text in [&device.name, &device.key, &device.username] {
+        reoling::diag::conceal(text);
+    }
+    for channel in &device.channels {
+        reoling::diag::conceal(&channel.name);
+    }
 }
 
 /// The first of these icons the theme has (the last if none).
@@ -1701,12 +2304,17 @@ impl MainWindow {
     /// Keeps the preferred stream if it is offered, else falls back to the
     /// lightest one. Returns whether the stream in use changed.
     fn refresh_streams(&self) -> bool {
-        let offered = self
-            .playing_key()
-            .and_then(|k| self.device(&k))
-            .and_then(|d| d.channels.into_iter().find(|c| c.channel_id == d.channel))
-            .map(|c| c.streams)
-            .unwrap_or_else(|| vec![StreamProfile::Main, StreamProfile::Sub]);
+        let device = self.playing_key().and_then(|k| self.device(&k));
+        let accepted = self.trial_stream.borrow().as_ref().and_then(|(key, channel, stream)| {
+            device.as_ref().filter(|d| &d.key == key && d.channel == *channel).map(|_| *stream)
+        });
+        // A device that sent a channel list (an NVR or Hub) names each channel's streams there.
+        let abilities = device
+            .as_ref()
+            .filter(|d| !self.channel_lists.borrow().contains(&d.key))
+            .and_then(|d| d.abilities.get(&d.channel).copied());
+        let listed = device.and_then(|d| d.channels.into_iter().find(|c| c.channel_id == d.channel)).map(|c| c.streams);
+        let offered = offered_streams(advertised_streams(listed, abilities), accepted);
         let before = self.profile.get();
         let chosen = if offered.contains(&before) {
             before
@@ -1812,8 +2420,10 @@ impl MainWindow {
                     || old.hardware_decoder != new.hardware_decoder
                     || old.latency != new.latency
             };
-            new.apply();
-            new.save();
+            this.diagnostics_set(new.diagnostics, || {
+                new.apply();
+                new.save();
+            });
             *this.settings.borrow_mut() = new;
             // A running stream keeps its decoder; restart it to use the new one.
             if decoding_changed {
@@ -1826,8 +2436,18 @@ impl MainWindow {
 
     fn add_device_dialog(self: &Rc<Self>) {
         let this = Rc::clone(self);
-        dialogs::add_device(self.window.upcast_ref(), move |target| {
+        let added: Vec<String> = self
+            .devices
+            .borrow()
+            .iter()
+            .filter_map(|d| match &d.target {
+                ConnectTarget::Uid(uid) => Some(uid.clone()),
+                ConnectTarget::Ip { .. } => None,
+            })
+            .collect();
+        dialogs::add_device(self.window.upcast_ref(), added, move |target| {
             let device = Device::new(target);
+            conceal_device(&device);
             this.sidebar.add_device(&device);
             this.devices.borrow_mut().push(device.clone());
             this.persist();
@@ -1850,6 +2470,7 @@ impl MainWindow {
                 this.passwords.borrow_mut().insert(key.clone(), password);
                 let remember = if keep { Remember::Store } else { Remember::Forget };
                 this.typed_logins.borrow_mut().insert(key.clone(), TypedLogin { username, remember });
+                this.cancel_trial(&key);
                 this.links.borrow_mut().remove(&key);
                 this.connected.borrow_mut().remove(&key);
                 this.channel_lists.borrow_mut().remove(&key);
@@ -1862,6 +2483,42 @@ impl MainWindow {
                 this.connect(&key, true);
             },
         );
+    }
+
+    /// "Try other live view requests…": only while the diagnostic log is on, for the watched device after it
+    /// refused live view, and one trial per device at a time.
+    fn start_trial(self: &Rc<Self>, key: &str) {
+        let watching = self.playing_key().as_deref() == Some(key);
+        if !watching || !self.links.borrow().contains_key(key) {
+            return;
+        }
+        let Some((channel, refused, gen)) = self.trials.borrow_mut().start(key, recording()) else { return };
+        if let Some(l) = self.links.borrow().get(key) {
+            l.link.try_live(channel, refused, gen);
+        }
+        self.refresh_trial_entries();
+        self.show_message("Trying other live view requests…");
+    }
+
+    fn trial_cancelled(&self, key: &str) {
+        // Written here, at once: the link's own lines may come later, after the log was turned off.
+        self.trial_line(key, "TRIAL ended: cancelled");
+        self.refresh_trial_entries();
+    }
+
+    /// A trial line the window writes for `key`, under the device's place in the list.
+    fn trial_line(&self, key: &str, text: &str) {
+        let place = self.devices.borrow().iter().position(|d| d.key == key).map_or(0, |at| at + 1);
+        reoling::diag::masked(format_args!("[dev {place}] {text}"));
+    }
+
+    /// Each device menu's trial entry, as `Trials::offer` says.
+    fn refresh_trial_entries(&self) {
+        let recording = recording();
+        let trials = self.trials.borrow();
+        for device in self.devices.borrow().iter() {
+            self.sidebar.set_trial_available(&device.key, trials.offer(&device.key, recording));
+        }
     }
 
     fn relogin(self: &Rc<Self>, key: &str) {
@@ -1900,14 +2557,24 @@ impl MainWindow {
             this.passwords.borrow_mut().insert(key.clone(), password.clone());
             // A typed login goes with its own user name, the saved one with the device's.
             let typed_username = this.typed_logins.borrow().get(&key).map(|t| t.username.clone());
+            let username = typed_username.unwrap_or_else(|| device.username.clone());
+            reoling::diag::conceal(&username);
+            // The device's place in the list names it in the diagnostic log.
+            let place = this.devices.borrow().iter().position(|d| d.key == key).map_or(0, |at| at as u32 + 1);
+            let legacy_cipher = this.trials.borrow_mut().arm(&key);
+            let trial_epoch = this.trials.borrow_mut().epoch(&key);
+            let carried = this.wired(|w| w.take_carried(&key));
             let link = spawn_device(
                 device.target.clone(),
-                typed_username.unwrap_or_else(|| device.username.clone()),
+                username,
                 password,
-                this.uid_transport,
                 this.sink_request_tx.clone(),
                 this.replay_sink_request_tx.clone(),
                 Arc::clone(&this.audio),
+                place,
+                legacy_cipher,
+                trial_epoch,
+                carried,
             );
             let events = link.events.clone();
             let id = this.next_link_id.get();
@@ -1957,12 +2624,32 @@ impl MainWindow {
                 }
                 self.update_keyring(key, keyring_step(true, typed.map(|t| t.remember)));
                 self.playback.set_readiness(key, self.playback_readiness(key));
+                // Connected again for a trial's legacy cipher step: its last forms go out now, if the user still
+                // watches that channel.
+                let watched = self.playing_key().as_deref() == Some(key);
+                let watching = self.device(key).filter(|_| watched).map(|d| d.channel);
+                let after = self.trials.borrow_mut().on_connected(key, watching);
+                match after {
+                    AfterLogin::Continue { channel, refused, gen } => {
+                        if let Some(l) = self.links.borrow().get(key) {
+                            l.link.try_live_after_cipher(channel, refused, gen);
+                        }
+                    }
+                    AfterLogin::Cancelled => {
+                        wake(self.links.borrow().get(key).map(|l| &l.link), Phase::Armed);
+                        self.trial_cancelled(key);
+                    }
+                    AfterLogin::Nothing => {}
+                }
                 if self.autoplay.borrow().as_deref() == Some(key) {
                     self.autoplay.borrow_mut().take();
                     self.play(key);
                 }
             }
             DeviceEvent::Channels(channels) => {
+                for channel in &channels {
+                    reoling::diag::conceal(&channel.name);
+                }
                 self.channel_lists.borrow_mut().insert(key.to_string());
                 self.apply_channels(key, channels);
                 self.playback.set_readiness(key, self.playback_readiness(key));
@@ -1974,6 +2661,7 @@ impl MainWindow {
                 if name.is_empty() {
                     return;
                 }
+                reoling::diag::conceal(&name);
                 if let Some(d) = self.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
                     if let Some(c) = d.channels.iter_mut().find(|c| c.channel_id == channel_id) {
                         c.name = name;
@@ -2079,6 +2767,10 @@ impl MainWindow {
                 if let Some(d) = self.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
                     d.abilities.extend(abilities);
                 }
+                // A standalone camera's support table also tells of its third stream.
+                if self.playing_key().as_deref() == Some(key) && self.refresh_streams() {
+                    self.play(key); // the stream we started is not on offer
+                }
                 self.update_controls();
                 // The camera window's gated rows follow the abilities.
                 if self.playing_key().as_deref() == Some(key) {
@@ -2158,19 +2850,48 @@ impl MainWindow {
                     }
                     self.streaming.set(true);
                     self.refused.set(false);
+                    self.trials.borrow_mut().end(key);
+                    self.trials.borrow_mut().clear_refusal(key);
+                    self.refresh_trial_entries();
                     self.update_controls();
                     self.query_zoom();
                     self.query_monitor_point();
                 }
             }
-            DeviceEvent::PlayFailed { channel, reason } => {
+            DeviceEvent::PlayFailed { channel, reason, refused } => {
+                // A trial ends with a stream, or with this.
+                self.trials.borrow_mut().end(key);
                 if self.playing_key().as_deref() == Some(key) {
                     self.streaming.set(false);
-                    if self.device(key).is_some_and(|d| d.channel == channel) {
+                    let watched = self.device(key).is_some_and(|d| d.channel == channel);
+                    if watched {
                         self.refused.set(true);
                     }
-                    self.show_message(&reason);
+                    // Kept with the log off too: turning it on afterwards offers the trial (see `settings_dialog`).
+                    if refused && watched {
+                        self.trials.borrow_mut().refused(key, channel, self.profile.get());
+                    } else {
+                        self.trials.borrow_mut().clear_refusal(key);
+                    }
+                    self.refresh_trial_entries();
+                    if self.trials.borrow().offer(key, recording()) {
+                        self.show_message(&format!("{reason}\n{TRIAL_HINT}"));
+                    } else {
+                        self.show_message(&reason);
+                    }
                     self.update_controls();
+                }
+            }
+            DeviceEvent::TrialReconnect { legacy, message, carried } => {
+                self.trial_reconnect(key, legacy, message, carried);
+            }
+            DeviceEvent::TrialAccepted { channel, stream } => {
+                // The selector shows the stream that plays.
+                let watched = self.device(key).is_some_and(|d| d.channel == channel);
+                if self.playing_key().as_deref() == Some(key) && watched {
+                    *self.trial_stream.borrow_mut() = Some((key.to_string(), channel, stream));
+                    self.profile.set(stream);
+                    self.refresh_streams();
                 }
             }
             DeviceEvent::PlayDeferred(reason) => {
@@ -2181,6 +2902,8 @@ impl MainWindow {
                 }
             }
             DeviceEvent::LoginRejected => {
+                // A trial's connection made again and refused: the trial is over, the next connection is normal.
+                self.trials.borrow_mut().end(key);
                 self.links.borrow_mut().remove(key);
                 self.connected.borrow_mut().remove(key);
                 self.channel_lists.borrow_mut().remove(key);
@@ -2196,6 +2919,10 @@ impl MainWindow {
                 }
             }
             DeviceEvent::Lost(reason) => {
+                // A trial on this link (one whose last forms were queued too) ends here; its link said nothing.
+                if self.trials.borrow_mut().end(key) == Some(Phase::OnLink) {
+                    self.trial_line(key, "TRIAL ended: the connection was lost");
+                }
                 self.links.borrow_mut().remove(key);
                 self.connected.borrow_mut().remove(key);
                 self.channel_lists.borrow_mut().remove(key);
@@ -2233,7 +2960,7 @@ impl MainWindow {
             // the save when it is opened anew; on another channel of the
             // device the read goes out but not the write, see
             // `write_camera_page`). Stop, the Playback page and a lost
-            // connection give it up (see `stop`, `suspend_live` and
+            // connection give it up (see `stopped`, `suspended` and
             // `lost_playing`): its answers would no longer come here.
             DeviceEvent::SettingsWritten { target, group, results } => {
                 if let SettingsTarget::Camera { channel, .. } = target {
@@ -2268,31 +2995,6 @@ impl MainWindow {
             return Readiness::Channels;
         }
         Readiness::Ready
-    }
-
-    /// Live video makes way for the Playback page: the stream stops, but
-    /// nothing is forgotten (unlike the Stop button), and it is started
-    /// again when the page is left.
-    fn suspend_live(&self) {
-        let Some(key) = self.playing_key() else { return };
-        *self.resume_live.borrow_mut() = Some(key.clone());
-        if let Some(l) = self.links.borrow().get(&key) {
-            l.link.stop();
-        }
-        self.end_talk();
-        // Ends a recording too.
-        self.reset_video();
-        *self.playing.borrow_mut() = None;
-        self.streaming.set(false);
-        self.update_controls();
-        // The camera window reads over the watched channel's connection:
-        // none is watched now (the device itself stays connected). Closed,
-        // it gives up a save under way, whose answers are no longer taken.
-        if self.camera_settings.is_visible() {
-            self.camera_settings.live_stopped();
-        } else {
-            self.camera_settings.stopped_while_closed(&key);
-        }
     }
 
     fn enter_playback(self: &Rc<Self>) {
@@ -2359,6 +3061,7 @@ impl MainWindow {
     fn apply_identity(&self, key: &str, identity: &reoling::DeviceIdentity) {
         let text = |s: &Option<String>| s.clone().unwrap_or_default().trim().to_string();
         let (name, model) = (text(&identity.name), text(&identity.model));
+        reoling::diag::conceal(&name);
         let multi = looks_multi_channel(&name, &model);
         if let Some(d) = self.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
             if !model.is_empty() {
@@ -2438,81 +3141,6 @@ impl MainWindow {
         self.activate(key);
     }
 
-    /// Streams the device's current channel, stopping whatever else was on.
-    /// While the Playback page is shown, only notes the device for when the
-    /// page is left.
-    fn play(self: &Rc<Self>, key: &str) {
-        if self.playback.is_shown() {
-            *self.resume_live.borrow_mut() = Some(key.to_string());
-            if self.playback.device_key().as_deref() == Some(key) {
-                self.sidebar.select(key);
-            }
-            return;
-        }
-        let Some(device) = self.device(key) else { return };
-        let switched = self.playing_key().as_deref() != Some(key);
-        let other = self.playing_key().filter(|k| k != key);
-        if let Some(other) = other {
-            if let Some(l) = self.links.borrow().get(&other) {
-                l.link.stop();
-            }
-        }
-        self.reset_video();
-        self.set_spotlight_button(false);
-        self.end_talk();
-        *self.stopped.borrow_mut() = None;
-        *self.playing.borrow_mut() = Some(key.to_string());
-        *self.last_played.borrow_mut() = Some(key.to_string());
-        self.streaming.set(false);
-        self.refused.set(false);
-        self.refresh_streams();
-        self.persist();
-        self.sidebar.select(key);
-        self.sidebar.mark_channel(key, device.channel);
-        self.show_message("Starting…");
-        if let Some(l) = self.links.borrow().get(key) {
-            l.link.play(device.channel, self.profile.get());
-        }
-        self.update_controls();
-        // The camera window shows the watched channel: when that is another
-        // one now (or the same one after a stop or a lost connection), it is
-        // opened again for it, where it is; its old tabs would never fill.
-        if self.camera_settings.is_visible() && (switched || !self.camera_settings.is_open_for(device.channel)) {
-            self.open_camera_settings(false);
-        }
-    }
-
-    /// The stop button: stops the stream and forgets it as the one to
-    /// restore on the next start.
-    /// The stop button: stops the stream and leaves the last picture on
-    /// screen; the button becomes Play. Also forgets the stream as the one to
-    /// restore on the next start.
-    fn stop(&self) {
-        let Some(key) = self.playing_key() else { return };
-        if let Some(l) = self.links.borrow().get(&key) {
-            l.link.stop();
-        }
-        self.end_talk();
-        self.video.freeze();
-        if let Some(sink) = self.video.current_sink() {
-            sink.stop_recording();
-        }
-        self.set_record_button(false);
-        self.audio.reset();
-        *self.playing.borrow_mut() = None;
-        *self.last_played.borrow_mut() = None;
-        *self.stopped.borrow_mut() = Some(key.clone());
-        self.streaming.set(false);
-        self.persist();
-        self.update_controls();
-        // As in `suspend_live`: the camera window has no watched channel to
-        // read now, while the device stays connected.
-        if self.camera_settings.is_visible() {
-            self.camera_settings.live_stopped();
-        } else {
-            self.camera_settings.stopped_while_closed(&key);
-        }
-    }
 
     /// The button beside the picture: Stop while streaming, Play after.
     fn stop_or_play(self: &Rc<Self>) {
@@ -2538,6 +3166,9 @@ impl MainWindow {
     }
 
     fn remove(self: &Rc<Self>, key: &str) {
+        self.cancel_trial(key);
+        self.trials.borrow_mut().clear_refusal(key);
+        self.carried.borrow_mut().remove(key);
         if self.playing_key().as_deref() == Some(key) {
             *self.playing.borrow_mut() = None;
             self.streaming.set(false);
@@ -2569,23 +3200,579 @@ impl MainWindow {
         self.typed_logins.borrow_mut().remove(key);
         glib::spawn_future_local(secrets::forget(key.to_string()));
     }
-
-    /// Tells every device we are leaving; the threads need a moment to get
-    /// the packets out before the process exits.
-    fn shutdown_all(&self) {
-        let links = self.links.borrow();
-        for l in links.values() {
-            l.link.shutdown();
-        }
-        if !links.is_empty() {
-            std::thread::sleep(DISCONNECT_GRACE);
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{bar_span, keyring_step, place_bar_under_picture, stream_selectable, KeyringStep, Remember};
+    use super::{end_trial, wire, AfterLogin, Link, Paths, Phase, Trials, Wiring};
+    use crate::ui::bridge::tests::{listened, Bench, Commands};
+    use crate::ui::bridge::{Carried, DeviceEvent};
+    use reoling::protocol::bc::model::{MSG_ID_LOGOUT, MSG_ID_VIDEO};
+    use reoling::StreamProfile;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    /// A refusal while the log is off offers a trial once it is written; one trial per device.
+    #[test]
+    fn a_refusal_offers_a_trial_once_the_log_is_written() {
+        let mut trials = Trials::default();
+        trials.refused("hub", 2, StreamProfile::Main);
+        assert!(!trials.offer("hub", false));
+        assert!(trials.offer("hub", true));
+        assert!(!trials.offer("nvr", true));
+        assert_eq!(trials.start("hub", false), None);
+        assert_eq!(trials.start("hub", true), Some((2, StreamProfile::Main, 0)));
+        assert!(!trials.offer("hub", true), "it runs");
+        assert_eq!(trials.start("hub", true), None);
+        trials.end("hub");
+        assert!(!trials.offer("hub", true), "a new refusal offers the next one");
+    }
+
+    /// Stop before the cipher step's reconnection: the trial is over, the device connects as always and the new
+    /// connection sends no form.
+    #[test]
+    fn stop_before_the_reconnect_step_leaves_a_plain_reconnection() {
+        let mut trials = Trials::default();
+        trials.refused("hub", 0, StreamProfile::Sub);
+        trials.start("hub", true);
+        assert_eq!(trials.cancel("hub"), Some(Phase::OnLink));
+        assert_eq!(trials.on_reconnect("hub", true), None, "not made again");
+        assert!(!trials.arm("hub"));
+        assert_eq!(trials.on_connected("hub", Some(0)), AfterLogin::Nothing);
+        assert_eq!(trials.cancel("hub"), None, "said once");
+    }
+
+    /// Stop after the reconnect step (the armed connection is being made): no form goes out on it.
+    #[test]
+    fn stop_after_the_reconnect_step_sends_no_form() {
+        let mut trials = Trials::default();
+        trials.refused("hub", 0, StreamProfile::Sub);
+        trials.start("hub", true);
+        assert_eq!(trials.on_reconnect("hub", true), Some(true));
+        assert!(trials.arm("hub"));
+        assert!(!trials.arm("hub"), "one connection only");
+        assert_eq!(trials.cancel("hub"), Some(Phase::Armed));
+        assert_eq!(trials.on_connected("hub", Some(0)), AfterLogin::Nothing);
+    }
+
+    /// Another device or channel watched once the armed connection is up: the trial ends there.
+    #[test]
+    fn the_last_forms_go_out_only_while_the_channel_is_watched() {
+        let mut trials = Trials::default();
+        for watching in [Some(0), Some(1), None] {
+            trials.refused("hub", 0, StreamProfile::Main);
+            trials.start("hub", true);
+            trials.on_reconnect("hub", true);
+            trials.arm("hub");
+            let after = trials.on_connected("hub", watching);
+            let wanted = if watching == Some(0) {
+                AfterLogin::Continue { channel: 0, refused: StreamProfile::Main, gen: 0 }
+            } else {
+                AfterLogin::Cancelled
+            };
+            assert_eq!(after, wanted, "{watching:?}");
+            trials.end("hub");
+        }
+        // A timeout or a lost connection: over, and the next connection is made as always.
+        trials.refused("hub", 0, StreamProfile::Main);
+        trials.start("hub", true);
+        assert_eq!(trials.on_reconnect("hub", false), Some(false));
+        assert!(!trials.arm("hub"));
+    }
+
+    /// The window's links, trials and carried commands for one device's `Bench`, as `wire` lends them.
+    struct Panel {
+        trials: Trials,
+        links: HashMap<String, Link>,
+        carried: HashMap<String, Carried>,
+    }
+
+    impl Panel {
+        fn new(bench: &Bench, trials: Trials) -> Self {
+            let links = HashMap::from([("hub".to_string(), Link { id: 0, link: bench.window_link() })]);
+            Self { trials, links, carried: HashMap::new() }
+        }
+
+        fn wiring(&mut self) -> Wiring<'_> {
+            Wiring { trials: &mut self.trials, links: &mut self.links, carried: &mut self.carried, ended: Vec::new() }
+        }
+    }
+
+    /// The window as its paths see it (`Paths`), without a display: "hub" (channel 5) has a link whose commands
+    /// the test reads, "nvr" (channel 0) has none, and each step of the window's own is said by name. `heard` gives
+    /// the commands and the steps in the order they came.
+    struct Shell {
+        trials: RefCell<Trials>,
+        links: RefCell<HashMap<String, Link>>,
+        carried: RefCell<HashMap<String, Carried>>,
+        commands: RefCell<Commands>,
+        said: RefCell<Vec<String>>,
+        playing: RefCell<Option<String>>,
+        recording: Cell<bool>,
+        playback_shown: Cell<bool>,
+    }
+
+    impl Shell {
+        /// Watching "hub", the log written, and a trial running on "hub" unless `trial` is false.
+        fn new(trial: bool) -> Rc<Self> {
+            let mut trials = Trials::default();
+            trials.refused("hub", 5, StreamProfile::Main);
+            if trial {
+                trials.start("hub", true).expect("offered");
+            }
+            let (link, commands) = listened();
+            Rc::new(Self {
+                trials: RefCell::new(trials),
+                links: RefCell::new(HashMap::from([("hub".to_string(), Link { id: 0, link })])),
+                carried: RefCell::new(HashMap::new()),
+                commands: RefCell::new(commands),
+                said: RefCell::new(Vec::new()),
+                playing: RefCell::new(Some("hub".to_string())),
+                recording: Cell::new(true),
+                playback_shown: Cell::new(false),
+            })
+        }
+
+        fn say(&self, step: String) {
+            let mut said = self.said.borrow_mut();
+            said.extend(self.commands.borrow_mut().said());
+            said.push(step);
+        }
+
+        /// What came since last asked.
+        fn heard(&self) -> Vec<String> {
+            let mut said = self.said.take();
+            said.extend(self.commands.borrow_mut().said());
+            said
+        }
+    }
+
+    impl Paths for Shell {
+        fn wired<R>(&self, act: impl FnOnce(&mut Wiring) -> R) -> R {
+            wire(&self.trials, &self.links, &self.carried, act, |key| self.say(format!("ended {key}")))
+        }
+        fn playing_key(&self) -> Option<String> {
+            self.playing.borrow().clone()
+        }
+        fn recording(&self) -> bool {
+            self.recording.get()
+        }
+        fn refresh_trial_entries(&self) {
+            self.say("entries".into());
+        }
+        fn set_trials_shown(&self, shown: bool) {
+            self.say(format!("trials shown {shown}"));
+        }
+        fn end_talk(&self) {
+            self.say("talk ended".into());
+        }
+        fn show_message(&self, text: &str) {
+            self.say(format!("message {text}"));
+        }
+        fn stopped(&self, key: &str) {
+            *self.playing.borrow_mut() = None;
+            self.say(format!("stopped {key}"));
+        }
+        fn suspended(&self, key: &str) {
+            *self.playing.borrow_mut() = None;
+            self.say(format!("suspended {key}"));
+        }
+        fn noted_for_playback(&self, key: &str) -> bool {
+            let shown = self.playback_shown.get();
+            if shown {
+                self.say(format!("noted {key}"));
+            }
+            shown
+        }
+        fn channel_of(&self, key: &str) -> Option<u8> {
+            [("hub", 5), ("nvr", 0)].into_iter().find(|d| d.0 == key).map(|d| d.1)
+        }
+        fn clear_picture(&self) {
+            self.say("picture cleared".into());
+        }
+        fn starting(&self, key: &str, channel: u8) -> StreamProfile {
+            *self.playing.borrow_mut() = Some(key.to_string());
+            self.say(format!("starting {key} {channel}"));
+            StreamProfile::Sub
+        }
+        fn started(&self, channel: u8, switched: bool) {
+            self.say(format!("started {channel} switched {switched}"));
+        }
+        fn reconnecting(&self, key: &str) {
+            self.say(format!("reconnecting {key}"));
+        }
+        fn reconnect(self: &Rc<Self>, key: &str) {
+            self.say(format!("reconnect {key}"));
+        }
+        fn grace(&self) {
+            self.say("grace".into());
+        }
+    }
+
+    /// Each of the window's paths, run whole as the window runs it: the commands its links get and the window's
+    /// own steps, in order, with "hub" watched and its trial running. Every path that ends the trial cancels it
+    /// first (CancelTrial wakes the link) and writes its end line before the window's widget work.
+    #[test]
+    fn the_window_paths_send_the_same_commands_in_the_same_order() {
+        type Path = fn(&Rc<Shell>);
+        fn log(shell: &Rc<Shell>, on: bool) {
+            shell.diagnostics_set(on, || {
+                shell.recording.set(on);
+                shell.say("applied".into());
+            })
+        }
+        let rows: [(&str, Path, &[&str]); 9] = [
+            ("stop", |s| s.stop(), &["CancelTrial", "Stop", "ended hub", "talk ended", "stopped hub"]),
+            ("playback page", |s| s.suspend_live(), &[
+                "CancelTrial", "Stop", "ended hub", "talk ended", "suspended hub",
+            ]),
+            ("another channel", |s| s.play("hub"), &[
+                "CancelTrial", "ended hub", "entries", "picture cleared", "talk ended", "starting hub 5", "Play 5 Sub",
+                "started 5 switched false",
+            ]),
+            ("another device", |s| s.play("nvr"), &[
+                "CancelTrial", "Stop", "ended hub", "entries", "picture cleared", "talk ended", "starting nvr 0",
+                "started 0 switched true",
+            ]),
+            ("cancel", |s| s.cancel_trial("hub"), &["CancelTrial", "ended hub"]),
+            ("log off in the settings", |s| log(s, false), &[
+                "CancelTrial", "ended hub", "applied", "trials shown false", "entries",
+            ]),
+            ("log found off", |s| s.recording_found(false), &[
+                "CancelTrial", "ended hub", "trials shown false", "entries",
+            ]),
+            ("shutdown", |s| s.shutdown_all(), &["CancelTrial", "Shutdown", "ended hub", "grace"]),
+            ("log on in the settings", |s| log(s, true), &["applied", "trials shown true", "entries"]),
+        ];
+        for (path, run, expected) in rows {
+            let shell = Shell::new(true);
+            let gate = shell.trials.borrow_mut().epoch("hub");
+            let gen = gate.number();
+            run(&shell);
+            assert_eq!(shell.heard(), expected, "{path}");
+            let ends = expected.contains(&"ended hub");
+            assert_eq!(gate.cancelled(gen), ends, "{path}: no further form of the trial is admitted");
+            assert_eq!(shell.trials.borrow().running().is_empty(), ends, "{path}");
+        }
+    }
+
+    /// With nothing watched Stop and the Playback page do nothing and `play` only starts; with the Playback page
+    /// shown `play` only notes the device; with no trial running nothing is cancelled, and leaving a device drops
+    /// its refusal. A file that cannot be written once the log is turned on ends the trial after the new settings
+    /// are in force.
+    #[test]
+    fn the_window_paths_end_no_trial_they_do_not_have_to() {
+        let shell = Shell::new(true);
+        *shell.playing.borrow_mut() = None;
+        shell.stop();
+        shell.suspend_live();
+        assert_eq!(shell.heard(), [] as [&str; 0]);
+        shell.play("hub");
+        let started = ["picture cleared", "talk ended", "starting hub 5", "Play 5 Sub", "started 5 switched true"];
+        assert_eq!(shell.heard(), started);
+        let shell = Shell::new(true);
+        shell.playback_shown.set(true);
+        shell.play("nvr");
+        assert_eq!(shell.heard(), ["noted nvr"]);
+        let shell = Shell::new(false);
+        shell.stop();
+        assert_eq!(shell.heard(), ["Stop", "talk ended", "stopped hub"]);
+        let shell = Shell::new(false);
+        assert!(shell.trials.borrow().offer("hub", true));
+        shell.play("nvr");
+        let started = ["Stop", "entries", "picture cleared", "talk ended", "starting nvr 0", "started 0 switched true"];
+        assert_eq!(shell.heard(), started);
+        assert!(!shell.trials.borrow().offer("hub", true), "the refusal of the stream left no longer stands");
+        let shell = Shell::new(true);
+        shell.diagnostics_set(true, || {
+            shell.recording.set(false);
+            shell.say("applied".into());
+        });
+        assert_eq!(shell.heard(), ["applied", "CancelTrial", "ended hub", "trials shown false", "entries"]);
+    }
+
+    /// A trial's connection closes (`TrialReconnect`): the link goes (dropped, it shuts its connection down) and
+    /// the device connects again. A running trial goes on to its cipher step (the next connection is armed for it)
+    /// or is over, which the watched device's view says; a cancelled one says nothing and arms nothing.
+    #[test]
+    fn a_trial_reconnection_goes_on_ends_or_says_nothing() {
+        let over = format!("message {}", crate::ui::bridge::NO_FORM_ACCEPTED);
+        let quiet: &[&str] = &["Shutdown", "reconnecting hub", "entries", "reconnect hub"];
+        let rows: [(&str, bool, bool, bool, Option<&'static str>, &[&str]); 5] = [
+            ("cipher step", true, true, true, None, quiet),
+            ("over, watched", true, false, true, None, &[
+                "Shutdown", &over, "reconnecting hub", "entries", "reconnect hub",
+            ]),
+            ("over, its message", true, false, true, Some("gone"), &[
+                "Shutdown", "message gone", "reconnecting hub", "entries", "reconnect hub",
+            ]),
+            ("over, not watched", true, false, false, None, quiet),
+            ("cancelled", false, false, true, None, quiet),
+        ];
+        for (case, running, legacy, watched, message, expected) in rows {
+            let shell = Shell::new(true);
+            if !running {
+                shell.cancel_trial("hub");
+                shell.heard();
+            }
+            if !watched {
+                *shell.playing.borrow_mut() = None;
+            }
+            shell.trial_reconnect("hub", legacy, message, Carried::default());
+            assert_eq!(shell.heard(), expected, "{case}");
+            assert!(!shell.links.borrow().contains_key("hub"), "{case}");
+            let armed = shell.trials.borrow_mut().arm("hub");
+            assert_eq!(armed, running && legacy, "{case}: the next connection arms the cipher step");
+            assert!(shell.trials.borrow().running().len() == usize::from(armed), "{case}");
+        }
+    }
+
+    /// What the user does to end a trial while the device leaves its first form unanswered, through the functions
+    /// the window calls (`Wiring`): Stop and the Playback page (`stop_watched`), another channel or device (`leave`,
+    /// then `play`), the log turned off in the settings or found off by the recording check (`log_switched`), closing
+    /// (`shutdown`). Each cancels the trial, so no further Preview of it is admitted, and names it for its end line
+    /// (`ended`); the connection logs out within 2 s, and the cancelled trial's reconnection (`trial_reconnected`)
+    /// starts nothing by itself: only a stream the user asked for, carried over, plays on the next connection.
+    #[tokio::test]
+    async fn every_way_of_ending_a_trial_ends_it_at_once() {
+        for action in ["stop", "another channel", "another device", "diagnostics off", "shutdown"] {
+            let mut trials = Trials::default();
+            let epoch = trials.epoch("hub");
+            let mut bench = Bench::new(epoch.clone(), false, false, Carried::default()).await;
+            let mut window = Panel::new(&bench, trials);
+            let mut w = window.wiring();
+            w.trials.refused("hub", 2, StreamProfile::Main);
+            let (channel, refused, gen) = w.trials.start("hub", true).expect("offered");
+            bench.link.try_live(channel, refused, gen);
+            assert_eq!(bench.next_request().await.msg_id, MSG_ID_VIDEO, "{action}: the first form");
+            match action {
+                "stop" => assert_eq!(w.stop_watched(Some("hub".into())).as_deref(), Some("hub"), "{action}"),
+                "another channel" | "another device" => {
+                    let (key, channel) = if action == "another channel" { ("hub", 5) } else { ("nvr", 0) };
+                    w.leave("hub", key);
+                    w.play(key, channel, StreamProfile::Sub);
+                }
+                "diagnostics off" => w.log_switched(false),
+                "shutdown" => assert!(w.shutdown(), "{action}: a link is told"),
+                _ => unreachable!(),
+            }
+            assert_eq!(w.ended, ["hub"], "{action}: the trial is cancelled and its end line is due");
+            assert!(epoch.cancelled(gen), "{action}: no further form of it is admitted");
+            assert_eq!(bench.end_within(Duration::from_secs(2)).await, [MSG_ID_LOGOUT], "{action}");
+            let event = bench.link.events.try_recv().ok();
+            if action == "shutdown" {
+                assert!(event.is_none(), "{action}: nothing after the window closed");
+                continue;
+            }
+            let Some(DeviceEvent::TrialReconnect { legacy: false, message: None, carried }) = event else {
+                panic!("{action}: the window hears the connection make way");
+            };
+            assert_eq!(w.trial_reconnected("hub", false, carried), None, "{action}: the trial is over");
+            assert!(!w.trials.arm("hub"), "{action}: the next connection is an ordinary one");
+            assert!(!w.links.contains_key("hub"), "{action}: the old link is gone");
+            drop(bench.link);
+            let mut next = Bench::new(epoch, true, false, w.take_carried("hub")).await;
+            if action == "another channel" {
+                let preview = next.next_request().await;
+                assert_eq!((preview.msg_id, preview.channel_id), (MSG_ID_VIDEO, 5), "{action}: the user's stream");
+            }
+            next.link.shutdown();
+            let rest = next.end_within(Duration::from_secs(2)).await;
+            assert_eq!(rest, [MSG_ID_LOGOUT], "{action}: nothing else on the next connection");
+        }
+    }
+
+    /// With nothing watched, Stop and the Playback page do nothing, and the log turned on or found on ends no trial.
+    #[tokio::test]
+    async fn with_nothing_watched_or_the_log_on_no_trial_ends() {
+        let mut trials = Trials::default();
+        let epoch = trials.epoch("hub");
+        let mut bench = Bench::new(epoch.clone(), false, false, Carried::default()).await;
+        let mut window = Panel::new(&bench, trials);
+        let mut w = window.wiring();
+        w.trials.refused("hub", 2, StreamProfile::Main);
+        let (channel, refused, gen) = w.trials.start("hub", true).expect("offered");
+        bench.link.try_live(channel, refused, gen);
+        assert_eq!(bench.next_request().await.msg_id, MSG_ID_VIDEO);
+        assert_eq!(w.stop_watched(None), None);
+        w.log_switched(true);
+        assert!(w.ended.is_empty(), "{:?}", w.ended);
+        assert!(!epoch.cancelled(gen));
+        assert_eq!(w.trials.running(), ["hub"]);
+        bench.link.shutdown();
+        assert_eq!(bench.end_within(Duration::from_secs(2)).await, [MSG_ID_LOGOUT]);
+    }
+
+    /// The user changes what to watch while the device has no link (after `TrialReconnect`, before the next
+    /// connection): the newest wish replaces the Play carried from the trial's connection. Stop and another device
+    /// leave no stream to start; another channel starts that one only.
+    #[tokio::test]
+    async fn live_view_asked_for_without_a_link_replaces_the_carried_play() {
+        for (action, wanted) in [("stop", None), ("another device", None), ("another channel", Some(7))] {
+            let mut trials = Trials::default();
+            let epoch = trials.epoch("hub");
+            let mut bench = Bench::new(epoch.clone(), false, false, Carried::default()).await;
+            let mut window = Panel::new(&bench, trials);
+            let mut w = window.wiring();
+            w.trials.refused("hub", 2, StreamProfile::Main);
+            let (channel, refused, gen) = w.trials.start("hub", true).expect("offered");
+            bench.link.try_live(channel, refused, gen);
+            assert_eq!(bench.next_request().await.msg_id, MSG_ID_VIDEO);
+            // Channel 5 asked for during the trial: carried.
+            assert!(w.leave("hub", "hub"));
+            w.play("hub", 5, StreamProfile::Sub);
+            assert_eq!(bench.end_within(Duration::from_secs(2)).await, [MSG_ID_LOGOUT]);
+            let Ok(DeviceEvent::TrialReconnect { carried, .. }) = bench.link.events.try_recv() else {
+                panic!("{action}: the connection makes way");
+            };
+            w.trial_reconnected("hub", false, carried);
+            drop(bench.link);
+            match action {
+                "stop" => assert!(!w.stop("hub")),
+                "another device" => {
+                    assert!(!w.leave("hub", "nvr"));
+                    w.play("nvr", 0, StreamProfile::Sub);
+                }
+                "another channel" => {
+                    assert!(!w.leave("hub", "hub"));
+                    w.play("hub", 7, StreamProfile::Sub);
+                }
+                _ => unreachable!(),
+            }
+            let mut next = Bench::new(epoch, true, false, w.take_carried("hub")).await;
+            if let Some(channel) = wanted {
+                let preview = next.next_request().await;
+                assert_eq!((preview.msg_id, preview.channel_id), (MSG_ID_VIDEO, channel), "{action}");
+            }
+            next.link.shutdown();
+            assert_eq!(next.end_within(Duration::from_secs(2)).await, [MSG_ID_LOGOUT], "{action}: no other stream");
+        }
+    }
+
+    /// Channel 5 is asked for during a trial, so a Play for it is carried. Then Stop, another channel (7), another
+    /// device, or two of them in either order, given while the trial's link is still stored, while the device has no
+    /// link, or once the next link exists but has not begun to serve (as during its login). The next connection
+    /// starts only the stream the user asked for last, and nothing when that was Stop or another device.
+    #[tokio::test]
+    async fn the_next_connection_starts_only_the_live_view_asked_for_last() {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum At {
+            OldLink,
+            NoLink,
+            NewLink,
+        }
+        let orders: [&[&str]; 7] =
+            [&[], &["stop"], &["play 7"], &["stop", "play 7"], &["play 7", "stop"], &["nvr"], &["nvr", "play 7"]];
+        for at in [At::OldLink, At::NoLink, At::NewLink] {
+            for actions in orders {
+                let wanted = match actions.last() {
+                    None => Some(5),
+                    Some(&"play 7") => Some(7),
+                    Some(_) => None,
+                };
+                let act = |w: &mut Wiring| {
+                    for action in actions {
+                        match *action {
+                            "stop" => {
+                                w.stop("hub");
+                            }
+                            "nvr" => {
+                                w.leave("hub", "nvr");
+                                w.play("nvr", 0, StreamProfile::Sub);
+                            }
+                            _ => {
+                                w.leave("hub", "hub");
+                                w.play("hub", 7, StreamProfile::Sub);
+                            }
+                        }
+                    }
+                };
+                let mut trials = Trials::default();
+                let epoch = trials.epoch("hub");
+                let mut bench = Bench::new(epoch.clone(), false, false, Carried::default()).await;
+                let mut window = Panel::new(&bench, trials);
+                let mut w = window.wiring();
+                w.trials.refused("hub", 2, StreamProfile::Main);
+                let (channel, refused, gen) = w.trials.start("hub", true).expect("offered");
+                bench.link.try_live(channel, refused, gen);
+                assert_eq!(bench.next_request().await.msg_id, MSG_ID_VIDEO);
+                assert!(w.leave("hub", "hub"));
+                w.play("hub", 5, StreamProfile::Sub);
+                if at == At::OldLink {
+                    act(&mut w);
+                }
+                assert_eq!(bench.end_within(Duration::from_secs(2)).await, [MSG_ID_LOGOUT], "{at:?} {actions:?}");
+                let Ok(DeviceEvent::TrialReconnect { carried, .. }) = bench.link.events.try_recv() else {
+                    panic!("{at:?} {actions:?}: the connection makes way");
+                };
+                w.trial_reconnected("hub", false, carried);
+                drop(bench.link);
+                if at == At::NoLink {
+                    act(&mut w);
+                }
+                let mut next = Bench::new(epoch, true, false, w.take_carried("hub")).await;
+                if at == At::NewLink {
+                    w.links.insert("hub".into(), Link { id: 1, link: next.window_link() });
+                    act(&mut w);
+                }
+                if let Some(channel) = wanted {
+                    let preview = next.next_request().await;
+                    assert_eq!((preview.msg_id, preview.channel_id), (MSG_ID_VIDEO, channel), "{at:?} {actions:?}");
+                }
+                next.link.shutdown();
+                let rest = next.end_within(Duration::from_secs(2)).await;
+                assert_eq!(rest, [MSG_ID_LOGOUT], "{at:?} {actions:?}: no other Preview");
+            }
+        }
+    }
+
+    /// A channel list's word on a channel's streams stands. A device without one, a standalone camera, has main
+    /// and sub, and the third stream when its support table says so.
+    #[test]
+    fn a_camera_without_a_channel_list_offers_the_streams_its_support_table_tells() {
+        use super::advertised_streams;
+        use reoling::ChannelAbilities;
+        let third = ChannelAbilities { extern_stream: true, ..Default::default() };
+        let all = [StreamProfile::Main, StreamProfile::Extern, StreamProfile::Sub];
+        let two = [StreamProfile::Main, StreamProfile::Sub];
+        assert_eq!(advertised_streams(None, Some(third)), all);
+        assert_eq!(advertised_streams(None, Some(ChannelAbilities::default())), two);
+        assert_eq!(advertised_streams(None, None), two);
+        assert_eq!(advertised_streams(Some(vec![StreamProfile::Sub]), Some(third)), [StreamProfile::Sub]);
+    }
+
+    /// A stream a trial got the device to play is offered even when the channel does not advertise it.
+    #[test]
+    fn the_selector_offers_the_stream_a_trial_plays() {
+        use super::offered_streams;
+        let sub = vec![StreamProfile::Sub];
+        assert_eq!(offered_streams(sub.clone(), Some(StreamProfile::Main)), [StreamProfile::Main, StreamProfile::Sub]);
+        assert_eq!(offered_streams(sub.clone(), Some(StreamProfile::Sub)), [StreamProfile::Sub]);
+        assert_eq!(offered_streams(sub, None), [StreamProfile::Sub]);
+    }
+
+    /// A trial cancelled before its link read it, or before the reconnection for its cipher step, sends nothing:
+    /// its number has moved on, also for the last forms a later login would ask for.
+    #[test]
+    fn a_cancelled_trial_number_has_moved_on() {
+        let mut trials = Trials::default();
+        let epoch = trials.epoch("hub");
+        trials.refused("hub", 0, StreamProfile::Sub);
+        let (.., gen) = trials.start("hub", true).expect("offered");
+        assert_eq!(end_trial(&mut trials, None, "hub"), Some(Phase::OnLink));
+        assert_ne!(epoch.number(), gen, "no further form of it is admitted");
+        assert_eq!(end_trial(&mut trials, None, "hub"), None, "said once");
+        // Armed, then another channel watched once logged in: cancelled the same way.
+        trials.refused("hub", 0, StreamProfile::Sub);
+        let (.., gen) = trials.start("hub", true).expect("offered");
+        trials.on_reconnect("hub", true);
+        trials.arm("hub");
+        assert_eq!(trials.on_connected("hub", Some(1)), AfterLogin::Cancelled);
+        assert_ne!(epoch.number(), gen);
+    }
     use crate::ui::zoom_picture::ZoomPicture;
     use gtk4::prelude::*;
     use gtk4::{gdk, Box as GtkBox, Label, Orientation, Overlay, Revealer, RevealerTransitionType, Window};
