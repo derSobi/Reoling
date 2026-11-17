@@ -3,9 +3,10 @@
 //!
 //! - [`protocol`]: the wire format (binary framing, XML payloads,
 //!   BCEncrypt/AES, BCUDP), with no transport or session logic.
-//! - [`transport`]: UDP/P2P discovery and the reliable BCUDP connection.
-//! - [`client`]: resolve a UID, connect (direct or via relay), log in, and
-//!   stream video, with no GUI-toolkit dependency.
+//! - [`transport`]: UDP/P2P and LAN discovery and the reliable BCUDP
+//!   connection.
+//! - [`client`]: resolve a UID, connect (P2P direct or via relay, or TCP),
+//!   log in, and stream video, with no GUI-toolkit dependency.
 //!
 //! The GTK4 desktop app itself lives in the `reoling` binary (`src/main.rs`).
 
@@ -16,9 +17,11 @@ pub mod media_trace;
 pub mod media_guard;
 pub mod talk;
 pub mod encoding;
+pub mod diag;
 
 pub use protocol::{Error, LoginRefusal, Result};
 pub use client::{looks_multi_channel, ChannelAbilities, ChannelInfo, DeviceIdentity, DeviceUpdate, DeviceInfoSummary, MonitorPoint, PtzPreset, ReolinkClient, StreamProfile, VideoFrame, VideoType};
+pub use client::{PreviewForm, TrialEnd, TrialForm, TrialGate};
 pub use client::{
     file_for_time, next_file, sort_and_dedup_files, DownloadCancel, DownloadProgress, DownloadStream, DownloadSummary,
     DownloadUnit, FootageAnchor, RecordedEvent, RecordingFile, ReplayKeyframe, ReplayProgress, ReplayResume,

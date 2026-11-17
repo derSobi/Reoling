@@ -1699,6 +1699,12 @@ impl P2pMsg {
                 ids.did = Some(x.did);
             }
             UdpXml::R2cDisc(x) => ids.sid = Some(x.sid),
+            UdpXml::C2rDisc(x) => {
+                ids.sid = Some(x.sid);
+                ids.conn = Some(x.conn.clone());
+                ids.rsp = Some(x.rsp);
+                ids.cid = Some(x.cid);
+            }
             UdpXml::C2dDisc(x) => {
                 ids.cid = Some(x.cid);
                 ids.did = Some(x.did);

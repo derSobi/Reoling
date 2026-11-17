@@ -41,6 +41,10 @@ pub enum UdpXml {
     /// it ever arrives back at us (it's a client->device message).
     #[serde(rename = "C2D_DISC")]
     C2dDisc(C2dDisc),
+    /// Client's notice to the register server that it abandons a registered session: the official app sends it
+    /// three times, 0.5 s apart, when an attempt goes silent before its login completes (our captures).
+    #[serde(rename = "C2R_DISC")]
+    C2rDisc(C2rDisc),
     /// Device's disconnect notice, symmetric to `C2dDisc` — observed in the
     /// real protocol (2026-09-13) both at ordinary end-of-session teardown
     /// and (in our own testing) right after we sent an extra legacy login
@@ -99,6 +103,10 @@ pub struct M2cQr {
     pub reg: Option<IpPort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay: Option<IpPort>,
+    /// A number the official app echoes in its `C2R_DISC` (our captures). Kept as text: refusing answers carry
+    /// an empty or non-numeric one, which must not fail the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -157,16 +165,22 @@ pub struct R2cT {
     pub sid: u32,
 }
 
-/// Client-to-device direct connect attempt (NAT traversal).
+/// Client's LAN discovery of a UID: broadcast to port 2018 alongside the
+/// server lookup (our captures), in the captured element order.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 pub struct C2dC {
     pub uid: String,
     pub cli: ClientList,
     pub cid: i32,
     pub mtu: u32,
-    pub debug: bool,
+    /// `0` on the wire: a `bool` would be written as "false".
+    pub debug: u32,
     #[serde(rename = "p")]
     pub os: String,
+    #[serde(default)]
+    pub pl: String,
+    #[serde(default)]
+    pub lver: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -174,20 +188,13 @@ pub struct ClientList {
     pub port: u32,
 }
 
-/// Device's reply confirming the direct connection and its own connection id.
+/// A device's answer to `C2D_C`: its connection id for a session-less
+/// direct session.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 pub struct D2cCr {
-    pub timer: Timer,
     pub rsp: i32,
     pub cid: i32,
     pub did: i32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
-pub struct Timer {
-    pub def: u32,
-    pub hb: u32,
-    pub hbt: u32,
 }
 
 /// Client-to-device (sent to the relay address) asking to use the relay as
@@ -275,6 +282,45 @@ pub struct C2dDisc {
     pub did: i32,
 }
 
+/// See [`UdpXml::C2rDisc`]. The fields in the order of our captures; `rsp` 0 and `conn` the path when a
+/// `D2C_CFM` confirmed the session, else -1 and "unknown".
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct C2rDisc {
+    pub uid: String,
+    pub sid: u32,
+    pub time: DiscTime,
+    pub conn: String,
+    pub rsp: i32,
+    pub cid: i32,
+    pub send: DiscCounters,
+    pub recv: DiscCounters,
+    /// The accepted lookup answer's `debug`.
+    pub debug: u32,
+}
+
+/// Milliseconds in a `C2R_DISC`: from the attempt's start to the accepted lookup answer and to the first
+/// `D2C_CFM` (0 without one), and from that `D2C_CFM` to the abandon.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct DiscTime {
+    pub query: i64,
+    pub setup: i64,
+    pub conn: i64,
+}
+
+/// One direction's counters in a `C2R_DISC`, in the captured order.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct DiscCounters {
+    pub spd: i64,
+    pub cnt: i64,
+    pub cntr: i64,
+    pub size: i64,
+    pub sizer: i64,
+    pub lc: i64,
+    pub rc: i64,
+    pub sizew: i64,
+    pub itvl: i64,
+}
+
 /// See [`UdpXml::D2cDisc`].
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 pub struct D2cDisc {
@@ -339,6 +385,7 @@ mod tests {
         let xml = UdpXml::M2cQr(M2cQr {
             reg: Some(IpPort { ip: "1.2.3.4".to_string(), port: 9999 }),
             relay: Some(IpPort { ip: "1.2.3.5".to_string(), port: 9998 }),
+            debug: Some("251658240".to_string()),
         });
         let bytes = xml.to_bytes();
         assert_eq!(UdpXml::from_bytes(&bytes).unwrap(), xml);
@@ -360,6 +407,7 @@ mod tests {
             UdpXml::M2cQr(M2cQr {
                 reg: Some(IpPort { ip: "172.239.26.97".to_string(), port: 58200 }),
                 relay: Some(IpPort { ip: "172.239.26.97".to_string(), port: 58100 }),
+                debug: Some("251658240".to_string()),
             })
         );
     }
@@ -493,18 +541,88 @@ mod tests {
         );
     }
 
-    #[test]
-    fn c2d_c_round_trips() {
-        let xml = UdpXml::C2dC(C2dC {
+    fn lan_discovery() -> UdpXml {
+        UdpXml::C2dC(C2dC {
             uid: "9527000EXAMPLE01".to_string(),
             cli: ClientList { port: 40000 },
             cid: 1,
             mtu: 1350,
-            debug: false,
-            os: "LINUX".to_string(),
+            debug: 0,
+            os: "WIN".to_string(),
+            pl: String::new(),
+            lver: 3,
+        })
+    }
+
+    #[test]
+    fn c2d_c_round_trips() {
+        let xml = lan_discovery();
+        assert_eq!(UdpXml::from_bytes(&xml.to_bytes()).unwrap(), xml);
+    }
+
+    /// The codec writes the empty `pl` as `<pl/>`, as it does in every `C2D_T`.
+    #[test]
+    fn c2d_c_serializes_in_the_captured_order() {
+        let body = "<uid>9527000EXAMPLE01</uid><cli><port>40000</port></cli><cid>1</cid><mtu>1350</mtu>\
+                    <debug>0</debug><p>WIN</p><pl/><lver>3</lver>";
+        assert_eq!(String::from_utf8(lan_discovery().to_bytes()).unwrap(), format!("<P2P><C2D_C>{body}</C2D_C></P2P>"));
+    }
+
+    #[test]
+    fn d2c_c_r_parses_with_and_without_timer() {
+        let expected = UdpXml::D2cCr(D2cCr { rsp: 0, cid: 1, did: 7 });
+        let with_timer = b"<P2P><D2C_C_R><timer><def>3000</def><hb>1000</hb><hbt>10000</hbt></timer>\
+                           <rsp>0</rsp><cid>1</cid><did>7</did></D2C_C_R></P2P>";
+        assert_eq!(UdpXml::from_bytes(with_timer).unwrap(), expected);
+        let without = b"<P2P><D2C_C_R><rsp>0</rsp><cid>1</cid><did>7</did></D2C_C_R></P2P>";
+        assert_eq!(UdpXml::from_bytes(without).unwrap(), expected);
+    }
+
+    /// The tree and element order of the `C2R_DISC` the official app sends when it abandons an attempt that got no
+    /// `D2C_CFM`, in our captures (its numbers here; identities replaced).
+    #[test]
+    fn c2r_disc_serializes_in_the_captured_order() {
+        let counters = |rc| DiscCounters { lc: -1, rc, ..Default::default() };
+        let xml = UdpXml::C2rDisc(C2rDisc {
+            uid: "9527000EXAMPLE01".to_string(),
+            sid: 555,
+            time: DiscTime { query: 172, setup: 0, conn: 11996 },
+            conn: "unknown".to_string(),
+            rsp: -1,
+            cid: 7,
+            send: DiscCounters { lc: 0, ..counters(-1) },
+            recv: counters(-1),
+            debug: 251658240,
         });
-        let bytes = xml.to_bytes();
-        assert_eq!(UdpXml::from_bytes(&bytes).unwrap(), xml);
+        let counters = |lc, rc| {
+            format!("<spd>0</spd><cnt>0</cnt><cntr>0</cntr><size>0</size><sizer>0</sizer><lc>{lc}</lc><rc>{rc}</rc>\
+                     <sizew>0</sizew><itvl>0</itvl>")
+        };
+        let body = format!(
+            "<uid>9527000EXAMPLE01</uid><sid>555</sid><time><query>172</query><setup>0</setup><conn>11996</conn></time>\
+             <conn>unknown</conn><rsp>-1</rsp><cid>7</cid><send>{}</send><recv>{}</recv><debug>251658240</debug>",
+            counters(0, -1),
+            counters(-1, -1)
+        );
+        assert_eq!(String::from_utf8(xml.to_bytes()).unwrap(), format!("<P2P><C2R_DISC>{body}</C2R_DISC></P2P>"));
+        assert_eq!(UdpXml::from_bytes(&xml.to_bytes()).unwrap(), xml);
+    }
+
+    /// A lookup answer's `debug` is kept when it is a number; 8 of the refusing answers in our captures carry an
+    /// empty or non-numeric one, which must not fail the answer.
+    #[test]
+    fn m2c_q_r_keeps_any_debug_text() {
+        let answer = |debug: &str| {
+            let xml = format!("<P2P><M2C_Q_R>{debug}<rsp>-3</rsp></M2C_Q_R></P2P>");
+            match UdpXml::from_bytes(xml.as_bytes()).unwrap() {
+                UdpXml::M2cQr(reply) => reply.debug,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(answer("<debug>251658240</debug>").as_deref(), Some("251658240"));
+        assert!(answer("<debug/>").is_none_or(|text| text.is_empty()));
+        assert_eq!(answer("<debug>x1</debug>").as_deref(), Some("x1"));
+        assert_eq!(answer(""), None);
     }
 
     #[test]

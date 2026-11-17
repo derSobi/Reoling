@@ -151,6 +151,11 @@ pub struct PositionRange {
 /// What the device supports; the per-channel part is what we read.
 #[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Support {
+    /// "0" when the device has a third stream (`externStream`): our RLC-520A sends 0 and plays it for the official
+    /// app, our RLC-1224A sends 1 and the app offers it two streams (our captures). Kept as text, so that a value
+    /// we cannot read does not cost the rest of the table.
+    #[serde(rename = "noExternStream")]
+    pub no_extern_stream: Option<String>,
     #[serde(rename = "item", default)]
     pub items: Vec<SupportItem>,
 }
@@ -194,6 +199,7 @@ pub struct SupportItem {
 impl Support {
     /// The channels' abilities.
     pub fn into_abilities(self) -> Vec<(u8, crate::client::ChannelAbilities)> {
+        let extern_stream = self.no_extern_stream.as_deref().map(str::trim) == Some("0");
         self.items
             .into_iter()
             .filter_map(|i| {
@@ -219,6 +225,7 @@ impl Support {
                         tracking: physical_ptz,
                         binning: i.new_isp_cfg == Some(219075),
                         pet_label: i.ai_animal_type == Some(0),
+                        extern_stream,
                     },
                 ))
             })
@@ -1297,6 +1304,25 @@ mod channel_info_tests {
             <enable>1</enable></OsdChannelName></body>"#;
         let name = BcXml::from_bytes(xml).unwrap().osd_channel_name.unwrap().name;
         assert_eq!(name.as_deref(), Some("Camera7"));
+    }
+
+    /// `noExternStream` 0, as our RLC-520A sends it, means the camera has a third stream; 1, as our RLC-1224A
+    /// sends it, means it has none. Without the element, or with a value we cannot read, we offer none, and the
+    /// rest of the table is still read.
+    #[test]
+    fn support_tells_whether_the_camera_has_a_third_stream() {
+        let abilities = |flag: &str| {
+            let xml = format!(
+                r#"<?xml version="1.0" encoding="UTF-8" ?><body><Support version="1.1">{flag}
+                <item><chnID>0</chnID></item></Support></body>"#
+            );
+            BcXml::from_bytes(xml.as_bytes()).unwrap().support.unwrap().into_abilities()[0].1
+        };
+        assert!(abilities("<noExternStream>0</noExternStream>").extern_stream);
+        assert!(!abilities("<noExternStream>1</noExternStream>").extern_stream);
+        assert!(!abilities("").extern_stream);
+        assert!(!abilities("<noExternStream></noExternStream>").extern_stream);
+        assert!(!abilities("<noExternStream>yes</noExternStream>").extern_stream);
     }
 
     #[test]

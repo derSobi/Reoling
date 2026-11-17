@@ -19,11 +19,12 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink. "Reolink" 
 
 ## Status
 
-Version **1.0.5**, with installable packages since 1.0.0 (see [Installation](#installation)). Login, live video, PTZ, the camera and device settings pages, and playback with sound, events and downloads work end to end on a real Home Hub, NVR and their cameras, over UDP/P2P only (local, NAT-mapped or relay address, whichever answers first).
+Version **1.0.6**, with installable packages since 1.0.0 (see [Installation](#installation)). Login, live video, PTZ, the camera and device settings pages, and playback with sound, events and downloads work end to end on a real Home Hub, two NVRs, their cameras and two cameras on their own. A device added by UID is reached over whichever path logs in first: directly on the local network (TCP or UDP), or over P2P (local, NAT-mapped or relay address).
 
 **What the app does today**
 
-- Devices: add by UID or IP; each connects at start, with its own name, channels and streams; one password per device, in the desktop keyring.
+- Devices: add by UID or IP, or pick one of the devices found on the local network; each connects at start, with its own name, channels and streams; one password per device, in the desktop keyring.
+- Diagnostic Log (Settings, or `reoling --diagnostics`): a connection and video log with UIDs, addresses and names masked, to attach to an issue.
 - Live view of a device or channel, the lightest stream first, Stop and Play, a latency setting; fullscreen controls hide after 2.5 s unused.
 - Digital zoom in live view and playback: the wheel zooms at the pointer up to 16×, a left drag pans, a middle click shows the whole picture.
 - Sound with a volume control, and Talk from the computer's microphone to the camera.
@@ -52,29 +53,31 @@ Each of these in full: [docs/FEATURES.md](docs/FEATURES.md).
 
 **Version history**
 
-- 1.0.5 — the .deb and two AppImages: the embed one, built as 1.0.4's AppImage was, under a new name, and a system one of about 6 MB that takes GTK 4, GStreamer and the decoders from the distribution. Where the system lacks a part a feature needs, Reoling says so, with the command that installs it: at start, in System Status and over the picture, instead of a black picture; `--check-requirements` prints the same report. The .deb draws the picture with its own GTK 4 sink, also where the distribution has one. In Playback, picking the other stream takes a missing decoder's text away, and the timeline takes clicks right from its left edge. A device's error text no longer contains its UID, and a failed connect or login prints one line on stderr.
+- 1.0.6 — a device added by UID also connects directly on the local network (TCP or UDP), whichever path logs in first, and a refused P2P registration no longer stops it. Add device lists the devices found on the network, and a camera on its own offers its third stream. A Diagnostic Log (Settings, or `--diagnostics`) writes a masked connection and video log to attach to an issue.
 
 The full history, with the date of every version, is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Tested devices
 
-Reoling is built and tested on a Home Hub Pro and two RLN36 NVRs and the cameras on them. All three are added by UID and reached over UDP/P2P: the Hub on its local network and through the relay, the two NVRs through the relay only.
+Reoling is built and tested on a Home Hub Pro, two RLN36 NVRs and the cameras on them, and on two test cameras on their own. The Hub and the NVRs are added by UID and reached over UDP/P2P: the Hub on its local network and through the relay, the two NVRs through the relay only. The two test cameras are added by UID or by address and reached directly on the local network, or through the relay from another network. [HARDWARE.md](HARDWARE.md) lists the hardware of my setup and what users have confirmed.
 
 | Device | What | Model | Hardware | Firmware |
 |---|---|---|---|---|
-| Home Hub Pro | the Hub itself | Reolink Home Hub Pro | BASE_WENNT3NA5 | v3.3.0.605 |
-| Home Hub Pro | 2 cameras | E1 Outdoor PoE | IPC_560SD88MP | v3.1.0.5223 |
-| Home Hub Pro | 1 camera | RLC-1224A | IPC_NT18NA612MP | v3.2.0.6011 |
-| RLN36 NVR (1) | the NVR itself | RLN36 | N5MB01 | v3.6.5.597 |
-| RLN36 NVR (1) | 9 cameras | RLC-1224A | IPC_523D8128M12MP | v3.1.0.2174 |
-| RLN36 NVR (1) | 3 cameras | RLC-820A | IPC_56064M8MP | v3.1.0.2368 |
-| RLN36 NVR (1) | 1 camera | E1 Outdoor PoE | IPC_560SD88MP | v3.1.0.2448 |
+| Home Hub Pro | the Hub itself | [Reolink Home Hub Pro](https://link.amazon/B0iggw0qc) | BASE_WENNT3NA5 | v3.3.0.605 |
+| Home Hub Pro | 2 cameras | [E1 Outdoor PoE](https://link.amazon/B0arDICa7) | IPC_560SD88MP | v3.1.0.5223 |
+| Home Hub Pro | 1 camera | [RLC-1224A](https://link.amazon/B058sZruw) | IPC_NT18NA612MP | v3.2.0.6011 |
+| RLN36 NVR (1) | the NVR itself | [RLN36](https://link.amazon/B0hJI7fXi) | N5MB01 | v3.6.5.597 |
+| RLN36 NVR (1) | 9 cameras | [RLC-1224A](https://link.amazon/B058sZruw) | IPC_523D8128M12MP | v3.1.0.2174 |
+| RLN36 NVR (1) | 3 cameras | [RLC-820A](https://link.amazon/B056vgdbJ) | IPC_56064M8MP | v3.1.0.2368 |
+| RLN36 NVR (1) | 1 camera | [E1 Outdoor PoE](https://link.amazon/B0arDICa7) | IPC_560SD88MP | v3.1.0.2448 |
 | RLN36 NVR (1) | 1 camera | P334 | IPC_NT2NA48MP | v3.1.0.4666 |
-| RLN36 NVR (2) | the NVR itself | RLN36 | N5MB01 | v3.5.0.329 |
-| RLN36 NVR (2) | 1 camera | Reolink Duo 2 PoE | IPC_529B17B8MP | v3.0.0.1889 |
-| RLN36 NVR (2) | 1 camera | RLC-1224A | IPC_523D8128M12MP | v3.1.0.2174 |
-| RLN36 NVR (2) | 5 cameras | RLC-820A | IPC_56064M8MP | v3.1.0.1782 |
+| RLN36 NVR (2) | the NVR itself | [RLN36](https://link.amazon/B0hJI7fXi) | N5MB01 | v3.5.0.329 |
+| RLN36 NVR (2) | 1 camera | [Reolink Duo 2 PoE](https://link.amazon/B05b3v0Hf) | IPC_529B17B8MP | v3.0.0.1889 |
+| RLN36 NVR (2) | 1 camera | [RLC-1224A](https://link.amazon/B058sZruw) | IPC_523D8128M12MP | v3.1.0.2174 |
+| RLN36 NVR (2) | 5 cameras | [RLC-820A](https://link.amazon/B056vgdbJ) | IPC_56064M8MP | v3.1.0.1782 |
 | RLN36 NVR (2) | 1 camera | P330 | IPC_NT2NA48MP | v3.1.0.4054 |
+| RLC-520A (test) | the camera itself | [RLC-520A](https://link.amazon/B0aMs3AqY) | IPC_MS4NA45MP | v3.2.0.5180 |
+| RLC-1224A (test) | the camera itself | [RLC-1224A](https://link.amazon/B058sZruw) | IPC_NT19NA412MP | v3.2.0.6389 |
 
 Live view is tested on all three of the Hub's cameras, on the first NVR's RLC-1224A, on the second NVR's Reolink Duo 2 PoE and P330 (main and sub stream, and the P330's extern stream) and on the main and sub stream of one of its RLC-820A, with a switch from the main stream back to the sub stream. Playback, downloads and the settings pages are tested on cameras of the Hub and the first NVR: the Hub's E1 Outdoor PoE and RLC-1224A, the first NVR's RLC-1224A and P334, and the encoding settings also on the first NVR's E1 Outdoor PoE. On the second NVR, the camera settings window was opened on all eight cameras without changing anything (the Info page on all of them, the Display page on the P330); Playback does not list its recordings yet, although the NVR answers the searches. PTZ is tested on the Hub's E1 Outdoor PoE cameras. The first NVR's RLC-820A cameras have no individual tests recorded. None of these cameras runs on a battery, so we have not tested battery or 4G cameras ourselves.
 
@@ -98,7 +101,8 @@ src/
 ├── protocol/    Wire protocol only: binary framing, XML, BCEncrypt/AES.
 │                No I/O, no async runtime — a pure, testable codec.
 ├── transport/   P2P/UDP: UID resolution, NAT traversal, relay fallback,
-│                and the reliable BCUDP connection.
+│                the reliable BCUDP connection, and the search for
+│                devices on the local network.
 ├── client.rs    Client/session API: login and live video;
 │                `client/replay.rs`: recordings, events, playback and
 │                downloads; `client/settings.rs`: the settings pages

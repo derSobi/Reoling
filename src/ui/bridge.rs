@@ -44,8 +44,19 @@ pub enum DeviceEvent {
     /// The requested stream's first frame reached GStreamer.
     Playing,
     /// The stream of `channel` could not be started or broke off. The
-    /// device itself is still connected.
-    PlayFailed { channel: u8, reason: String },
+    /// device itself is still connected. `refused`: the device refused the
+    /// stream (a trial may try other request forms).
+    PlayFailed { channel: u8, reason: String, refused: bool },
+    /// A trial (see `DeviceLink::try_live`) ended this connection, which
+    /// has been closed on the device: the device is to be connected again,
+    /// with the legacy cipher step armed when `legacy`, after which
+    /// `try_live_after_cipher` follows (the window keeps the trial's
+    /// channel and stream). `message`: how the trial ended, for
+    /// the user, when it is over. `carried`: the commands this connection
+    /// did not serve, for the next one (see `spawn_device`).
+    TrialReconnect { legacy: bool, message: Option<&'static str>, carried: Carried },
+    /// A trial's form was accepted: `stream` of `channel` plays now.
+    TrialAccepted { channel: u8, stream: StreamProfile },
     /// The requested stream waits for the device's download: no failure,
     /// it starts once the download is over.
     PlayDeferred(String),
@@ -80,6 +91,11 @@ pub enum DeviceEvent {
 
 enum Command {
     Play { channel: u8, profile: StreamProfile },
+    /// `gen`: the trial's number (see `DeviceLink::try_live`).
+    TryLive { channel: u8, refused: StreamProfile, gen: u64 },
+    TryLiveAfterCipher { channel: u8, refused: StreamProfile, gen: u64 },
+    /// Wakes a connection whose trial the window cancelled; nothing else.
+    CancelTrial,
     Siren { channel: u8 },
     Spotlight { channel: u8, on: bool },
     Ptz { channel: u8, command: &'static str, speed: u8 },
@@ -117,11 +133,140 @@ enum Command {
     Shutdown,
 }
 
+/// The commands a connection did not serve before a trial ended it (see `DeviceEvent::TrialReconnect`): the next
+/// connection to the device serves them first, in order, so that a command the user gave meanwhile is not lost.
+/// This is the one place that decides what is carried: never a settings page's write, which the camera window
+/// reports as dropped when the connection makes way (`CameraSettings::reconnecting`); for live view only what the
+/// user asked for last, from the trial on until the next connection begins to serve (`keep_last_live`); and nothing
+/// at all once `CARRY_LIMIT` has passed when that connection begins to serve them. An encoding save is carried: the
+/// window keeps waiting for its answer and is not told it was dropped.
+#[derive(Default)]
+pub struct Carried {
+    deferred: VecDeque<Command>,
+    /// The old link's queue: what the window sent it after the connection stopped reading.
+    rest: Option<tokio::sync::mpsc::UnboundedReceiver<Command>>,
+    /// When the connection that left them ended.
+    since: Option<std::time::Instant>,
+}
+
+/// How long carried commands wait for the next connection to serve them (see `Carried`). The window makes it at once,
+/// so this only cuts off commands that would run long after the user gave them.
+const CARRY_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl Carried {
+    /// What the next connection serves first, taken as it begins to serve (`serve`, after its login): every carried
+    /// command in order, none once `CARRY_LIMIT` has passed by `now`; then the commands the window sent the new link
+    /// meanwhile (`pending`), so that live view follows what the user asked for last across both. With them, the
+    /// carried ones at their head, which `serve` drops if they still wait when the limit passes (`LateCarried`).
+    /// Nothing is taken after an ordinary connection. The old link must be gone by then.
+    fn into_commands_at(
+        mut self,
+        pending: &mut tokio::sync::mpsc::UnboundedReceiver<Command>,
+        now: std::time::Instant,
+    ) -> (VecDeque<Command>, LateCarried) {
+        let Some(since) = self.since else { return (self.deferred, LateCarried { left: 0, since: None }) };
+        self.settle();
+        if now.saturating_duration_since(since) > CARRY_LIMIT {
+            self.deferred.clear();
+        }
+        let carried = self.deferred.len();
+        while let Ok(command) = pending.try_recv() {
+            self.deferred.push_back(command);
+        }
+        let left = keep_last_live(&mut self.deferred, carried);
+        (self.deferred, LateCarried { left, since: Some(since) })
+    }
+
+    /// Moves the old link's queue into `deferred` and leaves out what is never carried: a wake-up for the old
+    /// connection's trial, which has nothing left to wake, the `Shutdown` the old link sent as it was dropped, and
+    /// the settings pages' writes, which the window has reported as dropped.
+    fn settle(&mut self) {
+        if let Some(mut rest) = self.rest.take() {
+            while let Ok(command) = rest.try_recv() {
+                self.deferred.push_back(command);
+            }
+        }
+        self.deferred.retain(|c| {
+            !matches!(c, Command::CancelTrial | Command::Shutdown | Command::WriteSettings { .. })
+        });
+    }
+
+    /// What the user now wants to watch on the device while it has no connection: `Some` a channel's stream,
+    /// `None` nothing (Stop, the Playback page, another device). It replaces every carried Play, Stop and trial.
+    pub fn set_live(&mut self, play: Option<(u8, StreamProfile)>) {
+        self.settle();
+        self.deferred.push_back(play.map_or(Command::Stop, |(channel, profile)| Command::Play { channel, profile }));
+        keep_last_live(&mut self.deferred, 0);
+    }
+}
+
+/// The carried commands still at the head of a connection's `deferred` (`left`), and when the connection that left
+/// them ended: a carried command is served within `CARRY_LIMIT` or not at all, also when an earlier one (a carried
+/// download) keeps it waiting. `deferred` only grows at its back and is served from its front, so they stay at its
+/// head.
+struct LateCarried {
+    left: usize,
+    since: Option<std::time::Instant>,
+}
+
+impl LateCarried {
+    /// Drops the carried commands still waiting at the head of `deferred` once the limit has passed by `now`.
+    fn prune(&mut self, deferred: &mut VecDeque<Command>, now: std::time::Instant) {
+        if self.left > 0 && self.since.is_some_and(|since| now.saturating_duration_since(since) > CARRY_LIMIT) {
+            deferred.drain(..self.left.min(deferred.len()));
+            self.left = 0;
+        }
+    }
+
+    /// A command is about to be taken: one from the head of `deferred` is no longer waiting.
+    fn took(&mut self, incoming: &Incoming) {
+        if matches!(incoming, Incoming::Deferred) {
+            self.left = self.left.saturating_sub(1);
+        }
+    }
+}
+
+/// The one rule for carried live view: of the live view commands in `commands` (Play, a trial's, Stop) only the last
+/// stays, and none when that is a Stop, which has nothing to stop on a new connection. How many of the first
+/// `head` commands stay.
+fn keep_last_live(commands: &mut VecDeque<Command>, head: usize) -> usize {
+    let live = |c: &Command| {
+        matches!(c, Command::Play { .. } | Command::TryLive { .. } | Command::TryLiveAfterCipher { .. } | Command::Stop)
+    };
+    let last = commands.iter().rposition(live).filter(|&at| !matches!(commands[at], Command::Stop));
+    let (mut at, mut kept) = (0, 0);
+    commands.retain(|c| {
+        let keep = !live(c) || Some(at) == last;
+        kept += usize::from(keep && at < head);
+        at += 1;
+        keep
+    });
+    kept
+}
+
 /// What the command branch of the device loop got: a command whose turn
 /// has come after a download, or one from the link.
 enum Incoming {
     Deferred,
     Received(Option<Command>),
+}
+
+impl Command {
+    /// Whether the command ends a running trial: it needs the connection's
+    /// reader or ends the connection, or it asks for exactly that.
+    fn ends_trial(&self) -> bool {
+        matches!(
+            self,
+            Command::Play { .. }
+                | Command::TryLive { .. }
+                | Command::TryLiveAfterCipher { .. }
+                | Command::CancelTrial
+                | Command::Playback(_)
+                | Command::Download(_)
+                | Command::Stop
+                | Command::Shutdown
+        )
+    }
 }
 
 impl Incoming {
@@ -306,6 +451,30 @@ impl DeviceLink {
     /// Streams the channel (replacing whatever this device was streaming).
     pub fn play(&self, channel: u8, profile: StreamProfile) {
         let _ = self.commands.send(Command::Play { channel, profile });
+    }
+
+    /// After the device refused the `refused` stream of `channel`: asks for
+    /// live video in the other request forms Reoling knows, one after the
+    /// other, and plays the first one the device accepts (see
+    /// `ReolinkClient::try_live`). `gen`: the trial's number. A form of the
+    /// trial is admitted for sending only while the device's trial number
+    /// (`spawn_device`) still equals it, so the window cancels it by moving
+    /// that number on (see `TrialGate`).
+    pub fn try_live(&self, channel: u8, refused: StreamProfile, gen: u64) {
+        let _ = self.commands.send(Command::TryLive { channel, refused, gen });
+    }
+
+    /// The last step of a trial, once the device has connected again with
+    /// the legacy cipher step armed; `gen` as for `try_live`.
+    pub fn try_live_after_cipher(&self, channel: u8, refused: StreamProfile, gen: u64) {
+        let _ = self.commands.send(Command::TryLiveAfterCipher { channel, refused, gen });
+    }
+
+    /// Wakes the connection after the window moved the trial number on: a
+    /// form under way is no longer waited for. Stop, Play and Shutdown do
+    /// that too.
+    pub fn cancel_trial(&self) {
+        let _ = self.commands.send(Command::CancelTrial);
     }
 
     /// Plays the camera's siren once.
@@ -520,7 +689,7 @@ async fn on_live_frame<Frames, Stop: std::future::Future>(
             SinkAnswer::Refused(reason) => {
                 *live.frames = None;
                 let _ = stop_video().await;
-                let _ = tx.send(DeviceEvent::PlayFailed { channel, reason }).await;
+                let _ = tx.send(DeviceEvent::PlayFailed { channel, reason, refused: false }).await;
                 return AfterFrame::Stopped;
             }
             SinkAnswer::Gone => return AfterFrame::End, // GTK side gone
@@ -544,17 +713,6 @@ pub enum ConnectTarget {
     Ip { addr: IpAddr, port: u16 },
 }
 
-/// Which transport a UID connection should try. `Udp` (plain UDP/P2P, no
-/// TCP fallback or preference) is the default and the only path the real
-/// app targets — the official Reolink client never uses TCP for the BC
-/// protocol. `PreferTcp` is diagnostic-only, opt-in via `main.rs`'s
-/// `--prefer-tcp` flag; not exposed in the connect dialog.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UidTransport {
-    PreferTcp,
-    Udp,
-}
-
 /// What the UI hears of a refused login: `LoginRejected` (the saved password
 /// is forgotten) only for a wrong user name or password, `Lost` with the
 /// device's reason, the password kept, for every other code.
@@ -575,7 +733,7 @@ fn error_kind(e: &reoling::Error) -> &'static str {
         Error::UidResolutionFailed => "could not resolve the device's UID against any P2P relay",
         Error::P2pNegotiationTimeout => "P2P negotiation timed out",
         Error::LoginFailed { .. } => "login refused",
-        Error::ProtocolError(_) => "protocol error",
+        Error::ProtocolError(_) | Error::RegisterRejected { .. } => "protocol error",
         Error::StreamRefused { .. } => "stream refused",
         Error::ReplyTimeout => "no reply in time",
         Error::ConnectionLost => "connection lost",
@@ -584,6 +742,16 @@ fn error_kind(e: &reoling::Error) -> &'static str {
         Error::AddrParse(_) => "invalid IP address",
     }
 }
+
+/// What the user sees over the picture when a trial found no form the device accepts.
+pub const NO_FORM_ACCEPTED: &str =
+    "The camera refused every request form Reoling knows. The diagnostic log has the details.";
+/// The same when a form went unanswered.
+pub const TRIAL_TIMED_OUT: &str =
+    "The camera did not answer one of the request forms in time. The diagnostic log has the details.";
+/// The same when the connection broke during a form.
+pub const TRIAL_LOST: &str =
+    "The connection broke while Reoling tried another request form. The diagnostic log has the details.";
 
 /// Connects and logs in to a device on a dedicated thread with its own
 /// tokio runtime, and keeps the connection up: it listens for pushes (the
@@ -601,14 +769,25 @@ fn error_kind(e: &reoling::Error) -> &'static str {
 /// `replay_sink_request_tx`; the playback logic runs here too, in a
 /// `PlaybackDriver`, as the replay sink must be driven from the thread
 /// that pushes its frames.
+///
+/// `diag_device` is the device's 1-based place in the list, for the
+/// diagnostic log's `[dev D]`; `legacy_cipher` arms the legacy cipher step
+/// of a trial for this one connection (see `ReolinkClient::set_try_legacy`).
+/// `trial_epoch`: the device's trial number, which the window owns and moves
+/// on to cancel a trial (see `DeviceLink::try_live`). `carried`: what the
+/// connection a trial ended left unserved, served here first.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_device(
     target: ConnectTarget,
     username: String,
     password: String,
-    uid_transport: UidTransport,
     sink_request_tx: tokio::sync::mpsc::Sender<SinkRequest>,
     replay_sink_request_tx: tokio::sync::mpsc::Sender<ReplaySinkRequest>,
     audio_out: std::sync::Arc<crate::ui::audio::AudioOutput>,
+    diag_device: u32,
+    legacy_cipher: bool,
+    trial_epoch: reoling::TrialGate,
+    carried: Carried,
 ) -> DeviceLink {
     let (tx, rx) = async_channel::unbounded();
     let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
@@ -617,38 +796,74 @@ pub fn spawn_device(
 
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
-        runtime.block_on(async move {
+        runtime.block_on(reoling::diag::DEVICE.scope(diag_device, async move {
+            if reoling::diag::on() {
+                let how = if matches!(target, ConnectTarget::Uid(_)) { "UID" } else { "address" };
+                reoling::diag::masked(format_args!("NEGOTIATION device: added by {how}"));
+            }
+            // A device added by address has its connection number before it connects, so that a failed attempt's
+            // lines carry it; one added by UID is numbered in its race.
+            let attempt = matches!(target, ConnectTarget::Ip { .. }).then(ReolinkClient::reserve_debug_id);
+            let tag = attempt.map_or(String::new(), |id| format!("[conn {id}] "));
+            // A UID device races its paths and comes back logged in; one added by IP logs in below.
             let connect_result = match target {
-                // `Udp` is the plain UDP/P2P session, the only path the real
-                // app targets. `PreferTcp` is diagnostic-only
-                // (`--prefer-tcp`, see `main.rs`); the official Reolink app
-                // never uses TCP for the BC protocol.
-                ConnectTarget::Uid(uid) => match uid_transport {
-                    UidTransport::PreferTcp => ReolinkClient::connect_by_uid_prefer_tcp(&uid).await,
-                    UidTransport::Udp => ReolinkClient::connect_by_uid(&uid).await,
-                },
-                ConnectTarget::Ip { addr, port } => ReolinkClient::connect_by_ip(addr, port).await,
-            };
-            let mut client = match connect_result {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("connecting to the device failed: {}", error_kind(&e));
-                    let _ = tx.send(DeviceEvent::Lost(e.to_string())).await;
-                    return;
+                ConnectTarget::Uid(uid) => {
+                    ReolinkClient::connect_and_login_by_uid(&uid, &username, &password).await.map(|c| (c, true))
+                }
+                ConnectTarget::Ip { addr, port } => {
+                    let id = attempt.unwrap_or_else(ReolinkClient::reserve_debug_id);
+                    ReolinkClient::connect_by_ip_as(addr, port, id).await.map(|c| (c, false))
                 }
             };
-            match client.login(&username, &password).await {
-                Ok(_) => {}
+            // A connection made for a trial's legacy cipher step that fails ends the trial: the log says so.
+            let trial_failed = || {
+                if legacy_cipher {
+                    let ended = "TRIAL ended: the connection for the legacy cipher step failed";
+                    reoling::diag::masked(format_args!("{tag}{ended}"));
+                }
+            };
+            let (mut client, logged_in) = match connect_result {
+                Ok(connected) => connected,
                 Err(reoling::Error::LoginFailed { code }) => {
-                    eprintln!("login refused by the device: code {code}");
+                    reoling::diag::always_under(&tag, format_args!("login refused by the device: code {code}"));
+                    reoling::diag::masked(format_args!("{tag}NEGOTIATION device: login refused, code {code}"));
+                    trial_failed();
                     let _ = tx.send(login_refused(code)).await;
                     return;
                 }
                 Err(e) => {
-                    eprintln!("logging in to the device failed: {}", error_kind(&e));
+                    let failed = format_args!("connecting to the device failed: {}", error_kind(&e));
+                    reoling::diag::always_under(&tag, failed);
+                    reoling::diag::masked(format_args!("{tag}NEGOTIATION device: connect failed: {}", error_kind(&e)));
+                    trial_failed();
                     let _ = tx.send(DeviceEvent::Lost(e.to_string())).await;
                     return;
                 }
+            };
+            if !logged_in {
+                match client.login(&username, &password).await {
+                    Ok(_) => {}
+                    Err(reoling::Error::LoginFailed { code }) => {
+                        reoling::diag::always_under(&tag, format_args!("login refused by the device: code {code}"));
+                        reoling::diag::masked(format_args!("{tag}NEGOTIATION device: login refused, code {code}"));
+                        trial_failed();
+                        let _ = tx.send(login_refused(code)).await;
+                        return;
+                    }
+                    Err(e) => {
+                        let failed = format_args!("logging in to the device failed: {}", error_kind(&e));
+                        reoling::diag::always_under(&tag, failed);
+                        let kind = error_kind(&e);
+                        reoling::diag::masked(format_args!("{tag}NEGOTIATION device: connect failed: {kind}"));
+                        trial_failed();
+                        let _ = tx.send(DeviceEvent::Lost(e.to_string())).await;
+                        return;
+                    }
+                }
+            }
+            reoling::diag::masked(format_args!("NEGOTIATION device: logged in on [conn {}]", client.debug_id()));
+            if legacy_cipher {
+                client.set_try_legacy();
             }
             let channel_updates =
                 client.take_channel_updates().expect("taken once per client");
@@ -680,17 +895,106 @@ pub fn spawn_device(
                 sink_request_tx,
                 replay_sink_request_tx,
                 audio_out,
+                legacy_cipher,
+                trial_epoch,
+                carried,
             )
             .await;
-        });
+        }));
     });
 
     DeviceLink { events: rx, commands, playback_gen }
 }
 
+/// Runs `trial` while the commands keep coming in; every command but
+/// `CancelTrial` waits in `deferred` for its turn, in order. `None` when a
+/// command that ends a trial (`Command::ends_trial`) or the window's going
+/// (then also `true`) abandoned it: the form under way is not waited for,
+/// so the connection is mid-reply and has to be closed.
+async fn run_trial(
+    trial: impl std::future::Future<Output = reoling::TrialEnd>,
+    command_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Command>,
+    deferred: &mut VecDeque<Command>,
+) -> (Option<reoling::TrialEnd>, bool) {
+    tokio::pin!(trial);
+    loop {
+        tokio::select! {
+            // The trial first: one the window cancelled before this ran ends here without a form.
+            biased;
+            end = &mut trial => return (Some(end), false),
+            command = command_rx.recv() => match command {
+                Some(command) => {
+                    let ends = command.ends_trial();
+                    if !matches!(command, Command::CancelTrial) {
+                        deferred.push_back(command);
+                    }
+                    if ends {
+                        return (None, false);
+                    }
+                }
+                None => return (None, true),
+            },
+        }
+    }
+}
+
+/// The end of a trial abandoned mid-form (see `run_trial`): the connection logs out, and the window hears it as a
+/// cancelled trial's reconnection.
+fn abandoned(client: &ReolinkClient) -> Option<DeviceEvent> {
+    reoling::diag::masked(format_args!(
+        "[conn {}] TRIAL abandoned: the form under way is not waited for; the connection is closed",
+        client.debug_id()
+    ));
+    Some(DeviceEvent::TrialReconnect { legacy: false, message: None, carried: Carried::default() })
+}
+
+/// What the connection does after a trial (`after_cipher`: its last step):
+/// an accepted form's stream plays like any live stream; with none left
+/// the window hears so. `Some`: the event that ends this connection, sent
+/// once it is closed, for the device to be connected again.
+async fn after_trial(
+    end: reoling::TrialEnd,
+    channel: u8,
+    after_cipher: bool,
+    frames: &mut Option<tokio_stream::wrappers::ReceiverStream<reoling::Result<VideoFrame>>>,
+    tx: &async_channel::Sender<DeviceEvent>,
+) -> Option<DeviceEvent> {
+    let over = |message| {
+        Some(DeviceEvent::TrialReconnect { legacy: false, message: Some(message), carried: Carried::default() })
+    };
+    match end {
+        reoling::TrialEnd::Accepted { form, frames: accepted } => {
+            let _ = tx.send(DeviceEvent::TrialAccepted { channel, stream: form.stream }).await;
+            *frames = Some(accepted);
+        }
+        // The legacy cipher step was armed for that connection only: the next one is made as always.
+        reoling::TrialEnd::NoneAccepted if after_cipher => return over(NO_FORM_ACCEPTED),
+        reoling::TrialEnd::NoneAccepted => {
+            let reason = NO_FORM_ACCEPTED.to_string();
+            let _ = tx.send(DeviceEvent::PlayFailed { channel, reason, refused: false }).await;
+        }
+        reoling::TrialEnd::Reconnect => {
+            return Some(DeviceEvent::TrialReconnect { legacy: true, message: None, carried: Carried::default() })
+        }
+        reoling::TrialEnd::TimedOut => return over(TRIAL_TIMED_OUT),
+        reoling::TrialEnd::Lost => return over(TRIAL_LOST),
+        // The window ended it and says so; the command that did waits in `deferred`. After the cipher step the
+        // connection is replaced by an ordinary one.
+        reoling::TrialEnd::Cancelled if after_cipher => {
+            return Some(DeviceEvent::TrialReconnect { legacy: false, message: None, carried: Carried::default() })
+        }
+        reoling::TrialEnd::Cancelled => {}
+    }
+    None
+}
+
 /// A logged-in connection (see `spawn_device`), until a `Shutdown`, the
 /// window's going or the connection's loss: the commands, the pushes, live
 /// video, playback and downloads. Then the session ends on the device.
+/// `legacy_cipher`: made for a trial's legacy cipher step, so a trial
+/// cancelled on it ends it too, for an ordinary connection in its place.
+/// `trial_epoch` as in `spawn_device`; `carried`: the commands carried
+/// over, taken as this begins and served first (`Carried::into_commands_at`).
 #[allow(clippy::too_many_arguments)]
 async fn serve(
     mut client: ReolinkClient,
@@ -702,7 +1006,11 @@ async fn serve(
     sink_request_tx: tokio::sync::mpsc::Sender<SinkRequest>,
     replay_sink_request_tx: tokio::sync::mpsc::Sender<ReplaySinkRequest>,
     audio_out: std::sync::Arc<crate::ui::audio::AudioOutput>,
+    legacy_cipher: bool,
+    trial_epoch: reoling::TrialGate,
+    carried: Carried,
 ) {
+    let (mut deferred, mut late) = carried.into_commands_at(&mut command_rx, std::time::Instant::now());
     let mut frames: Option<tokio_stream::wrappers::ReceiverStream<reoling::Result<VideoFrame>>> =
         None;
     let mut sink: Option<VideoSink> = None;
@@ -717,18 +1025,27 @@ async fn serve(
     // download has (as a search would). They run, in order, once
     // it is over.
     let mut download: Option<DownloadJob> = None;
-    let mut deferred: VecDeque<Command> = VecDeque::new();
+    // The last stream the device refused, with its code, for a trial's log.
+    let mut refusal: Option<(u8, StreamProfile, u16)> = None;
+    // What a trial tells the window once this connection is closed on the device (see `after_trial`).
+    let mut farewell: Option<DeviceEvent> = None;
 
     loop {
+        late.prune(&mut deferred, std::time::Instant::now());
         let replay_active = driver.is_active();
         let downloading = download.is_some();
         let has_deferred = !downloading && !deferred.is_empty();
         tokio::select! {
             incoming = async {
                 if has_deferred { Incoming::Deferred } else { Incoming::Received(command_rx.recv().await) }
-            } => match incoming.command(&mut deferred) {
+            } => match {
+                late.took(&incoming);
+                incoming.command(&mut deferred)
+            } {
                 Some(
                     command @ (Command::Play { .. }
+                    | Command::TryLive { .. }
+                    | Command::TryLiveAfterCipher { .. }
                     | Command::Stop
                     | Command::Playback(_)
                     | Command::QuerySettings { .. }
@@ -775,9 +1092,65 @@ async fn serve(
                     match client.start_video(channel, profile).await {
                         Ok(f) => frames = Some(f),
                         Err(e) => {
-                            let event = DeviceEvent::PlayFailed { channel, reason: e.to_string() };
+                            if let reoling::Error::StreamRefused { code, .. } = &e {
+                                refusal = Some((channel, profile, *code));
+                            }
+                            let refused = matches!(e, reoling::Error::StreamRefused { .. });
+                            let event = DeviceEvent::PlayFailed { channel, reason: e.to_string(), refused };
                             let _ = tx.send(event).await;
                         }
+                    }
+                }
+                // A trial the window cancelled before this connection read it: nothing of it is done.
+                Some(Command::TryLive { gen, .. } | Command::TryLiveAfterCipher { gen, .. })
+                    if trial_epoch.cancelled(gen) => {}
+                Some(Command::TryLive { channel: wanted, refused, gen }) => {
+                    driver.end(&mut client).await;
+                    if frames.take().is_some() {
+                        let _ = client.stop_video(channel).await;
+                    }
+                    channel = wanted;
+                    sink = None;
+                    announced = false;
+                    let code = refusal.filter(|r| r.0 == wanted && r.1 == refused).map(|r| r.2);
+                    let trial = client.try_live(channel, refused, code, &trial_epoch, gen);
+                    let (end, gone) = run_trial(trial, &mut command_rx, &mut deferred).await;
+                    let gone = gone || closing(&mut command_rx, &mut deferred, end.is_none());
+                    let farewell_now = match end {
+                        Some(end) => after_trial(end, channel, false, &mut frames, &tx).await,
+                        None => abandoned(&client),
+                    };
+                    let farewell_now = farewell_now.filter(|_| !gone);
+                    if let Some(reconnect) = farewell_now {
+                        farewell = Some(reconnect);
+                        break;
+                    }
+                    if gone {
+                        break;
+                    }
+                }
+                Some(Command::TryLiveAfterCipher { channel: wanted, refused, gen }) => {
+                    driver.end(&mut client).await;
+                    if frames.take().is_some() {
+                        let _ = client.stop_video(channel).await;
+                    }
+                    channel = wanted;
+                    sink = None;
+                    announced = false;
+                    let trial = client.try_live_after_cipher(channel, refused, &trial_epoch, gen);
+                    let (end, gone) = run_trial(trial, &mut command_rx, &mut deferred).await;
+                    let gone = gone || closing(&mut command_rx, &mut deferred, end.is_none());
+                    let farewell_now = match end {
+                        Some(end) => after_trial(end, channel, true, &mut frames, &tx).await,
+                        None => abandoned(&client),
+                    };
+                    let farewell_now = farewell_now.filter(|_| !gone);
+                    if let Some(reconnect) = farewell_now {
+                        farewell = Some(reconnect);
+                        break;
+                    }
+                    if gone {
+                        break;
                     }
                 }
                 Some(Command::QueryEncoding { channel }) => client.query_encoding(channel).await,
@@ -913,6 +1286,15 @@ async fn serve(
                         let _ = client.stop_video(channel).await;
                     }
                 }
+                // No trial runs (`run_trial` takes it while one does). On a connection armed for the legacy
+                // cipher step, whose trial was cancelled before its last forms, an ordinary one takes its place.
+                Some(Command::CancelTrial) => {
+                    if legacy_cipher {
+                        let carried = Carried::default();
+                        farewell = Some(DeviceEvent::TrialReconnect { legacy: false, message: None, carried });
+                        break;
+                    }
+                }
                 Some(Command::Shutdown) | None => break,
             },
             // Live sound only: a playback's audio travels with its
@@ -996,7 +1378,8 @@ async fn serve(
                 }
                 Some(Err(e)) => {
                     frames = None;
-                    let _ = tx.send(DeviceEvent::PlayFailed { channel, reason: e.to_string() }).await;
+                    let refused = matches!(e, reoling::Error::StreamRefused { .. });
+                    let _ = tx.send(DeviceEvent::PlayFailed { channel, reason: e.to_string(), refused }).await;
                 }
                 None => frames = None,
             },
@@ -1036,13 +1419,34 @@ async fn serve(
         job.abandon();
     }
     client.disconnect().await;
+    if let Some(mut event) = farewell {
+        if let DeviceEvent::TrialReconnect { carried, .. } = &mut event {
+            *carried = Carried { deferred, rest: Some(command_rx), since: Some(std::time::Instant::now()) };
+        }
+        let _ = tx.send(event).await;
+    }
+}
+
+/// Whether the window is closing (a `Shutdown` waits): then the connection only logs out. After an abandoned trial
+/// (`drain`) the commands already sent are read first, so that a `Shutdown` right behind the cancel counts.
+fn closing(
+    command_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Command>,
+    deferred: &mut VecDeque<Command>,
+    drain: bool,
+) -> bool {
+    while let Some(command) = drain.then(|| command_rx.try_recv().ok()).flatten() {
+        if !matches!(command, Command::CancelTrial) {
+            deferred.push_back(command);
+        }
+    }
+    deferred.iter().any(|c| matches!(c, Command::Shutdown))
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
-        login_refused, on_live_frame, request_sink, serve, AfterFrame, Command, DeviceEvent, LiveStream, SinkAnswer,
-        SinkRequest,
+        login_refused, on_live_frame, request_sink, serve, AfterFrame, Carried, Command, DeviceEvent, DeviceLink,
+        LiveStream, SinkAnswer, SinkRequest,
     };
     use crate::ui::audio::AudioOutput;
     use crate::ui::video_view::fixtures::{self, View};
@@ -1099,7 +1503,7 @@ mod tests {
     /// An event the window hears, as read here.
     fn said(event: DeviceEvent) -> String {
         match event {
-            DeviceEvent::PlayFailed { channel, reason } => format!("PlayFailed {channel}: {reason}"),
+            DeviceEvent::PlayFailed { channel, reason, .. } => format!("PlayFailed {channel}: {reason}"),
             DeviceEvent::Playing => "Playing".to_string(),
             _ => "another event".to_string(),
         }
@@ -1308,7 +1712,10 @@ mod tests {
         let (tx, events) = async_channel::unbounded();
         let (replay_requests, _replay_incoming) = tokio::sync::mpsc::channel(1);
         let (gen, audio_out) = (Arc::new(AtomicU64::new(0)), Arc::new(AudioOutput::new(1.0)));
-        let connection = serve(client, command_rx, tx, updates, audio, gen, requests, replay_requests, audio_out);
+        let (replays, out) = (replay_requests, audio_out);
+        let (epoch, carried) = (reoling::TrialGate::default(), Carried::default());
+        let connection =
+            serve(client, command_rx, tx, updates, audio, gen, requests, replays, out, false, epoch, carried);
         tokio::pin!(connection);
         let script = async {
             // Play: the stream's first frame is H.265, which this system
@@ -1341,5 +1748,381 @@ mod tests {
         soon(device, "end of the device").await.expect("the device");
         assert!(heard(&events).is_empty());
         window.join().expect("the window's thread");
+    }
+
+    /// A device that refuses every Preview, holding back its answer to the
+    /// first one until `go` is sent or dropped: the test sends its command
+    /// meanwhile.
+    async fn refusing_camera(
+        mut device: BcConnection,
+        asked: tokio::sync::mpsc::UnboundedSender<BcMeta>,
+        go: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let mut go = Some(go);
+        while let Ok(request) = device.recv_bc(&PLAIN).await {
+            let meta = request.meta;
+            if meta.msg_id == MSG_ID_LINK_TYPE {
+                continue;
+            }
+            let _ = asked.send(meta.clone());
+            match meta.msg_id {
+                MSG_ID_VIDEO => {
+                    if let Some(go) = go.take() {
+                        let _ = go.await;
+                    }
+                    let mut refusal = device_message(&meta, None, None);
+                    refusal.meta.response_code = 400;
+                    device.send_bc(&refusal, &PLAIN).await.expect("the answer sent");
+                }
+                MSG_ID_LOGOUT => return,
+                _ => {}
+            }
+        }
+    }
+
+    /// A link with no connection behind it: the test reads its commands (`Commands::said`).
+    pub(crate) fn listened() -> (DeviceLink, Commands) {
+        let (commands, sent) = tokio::sync::mpsc::unbounded_channel();
+        let (_, events) = async_channel::unbounded();
+        (DeviceLink { events, commands, playback_gen: Arc::new(AtomicU64::new(0)) }, Commands(sent))
+    }
+
+    /// What a `listened` link was told.
+    pub(crate) struct Commands(tokio::sync::mpsc::UnboundedReceiver<Command>);
+
+    impl Commands {
+        /// The commands sent since last asked, in order: the ones the window's paths send by name, the rest as
+        /// "another command".
+        pub(crate) fn said(&mut self) -> Vec<String> {
+            std::iter::from_fn(|| self.0.try_recv().ok())
+                .map(|command| match command {
+                    Command::Play { channel, profile } => format!("Play {channel} {profile:?}"),
+                    Command::CancelTrial => "CancelTrial".to_string(),
+                    Command::TalkStop { channel } => format!("TalkStop {channel}"),
+                    Command::Stop => "Stop".to_string(),
+                    Command::Shutdown => "Shutdown".to_string(),
+                    _ => "another command".to_string(),
+                })
+                .collect()
+        }
+    }
+
+    /// One device's connection as the window drives it: its link, the connection's own loop (`serve`) on the
+    /// loopback, and a `refusing_camera` that answers its first Preview only when `answer` (else never).
+    pub(crate) struct Bench {
+        pub(crate) link: DeviceLink,
+        asked: tokio::sync::mpsc::UnboundedReceiver<BcMeta>,
+        connection: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+        device: tokio::task::JoinHandle<()>,
+        go: Option<tokio::sync::oneshot::Sender<()>>,
+        _sinks: (tokio::sync::mpsc::Receiver<SinkRequest>, tokio::sync::mpsc::Receiver<super::ReplaySinkRequest>),
+    }
+
+    impl Bench {
+        /// `epoch`: the device's trial number (see `spawn_device`); `carried`: what the connection serves first.
+        pub(crate) async fn new(
+            epoch: reoling::TrialGate,
+            answer: bool,
+            legacy_cipher: bool,
+            carried: Carried,
+        ) -> Self {
+            let (requests, incoming) = tokio::sync::mpsc::channel::<SinkRequest>(1);
+            let (replays, replay_incoming) = tokio::sync::mpsc::channel(1);
+            let (mut client, device) = client_and_device().await;
+            let (asked_tx, asked) = tokio::sync::mpsc::unbounded_channel();
+            let (go, go_rx) = tokio::sync::oneshot::channel();
+            let go = if answer { drop(go); None } else { Some(go) };
+            let device = tokio::spawn(refusing_camera(device, asked_tx, go_rx));
+            let updates = client.take_channel_updates().expect("taken once per client");
+            let audio = client.take_audio().expect("taken once per client");
+            let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, events) = async_channel::unbounded();
+            let (gen, out) = (Arc::new(AtomicU64::new(0)), Arc::new(AudioOutput::new(1.0)));
+            let link = DeviceLink { events, commands, playback_gen: Arc::clone(&gen) };
+            let connection = Box::pin(serve(
+                client, command_rx, tx, updates, audio, gen, requests, replays, out, legacy_cipher, epoch, carried,
+            ));
+            Self { link, asked, connection, device, go, _sinks: (incoming, replay_incoming) }
+        }
+
+        /// A second handle on the link, as the window keeps it (see `Wiring`): the same queue and events. Dropped, it
+        /// sends `Shutdown` as the window's does.
+        pub(crate) fn window_link(&self) -> DeviceLink {
+            let (events, commands) = (self.link.events.clone(), self.link.commands.clone());
+            DeviceLink { events, commands, playback_gen: Arc::clone(&self.link.playback_gen) }
+        }
+
+        /// The device's next request, the connection running meanwhile.
+        pub(crate) async fn next_request(&mut self) -> BcMeta {
+            tokio::select! {
+                () = &mut self.connection => panic!("the connection ended"),
+                meta = soon(self.asked.recv(), "request") => meta.expect("the device"),
+            }
+        }
+
+        /// Runs the connection to its end within `limit`, then the device's; the requests the device had since
+        /// last asked.
+        pub(crate) async fn end_within(&mut self, limit: Duration) -> Vec<u32> {
+            tokio::time::timeout(limit, &mut self.connection).await.expect("the connection ended in time");
+            // A held answer comes now, to a connection that has gone: the device reads the logout after it.
+            self.go.take();
+            soon(&mut self.device, "end of the device").await.expect("the device");
+            std::iter::from_fn(|| self.asked.try_recv().ok()).map(|meta| meta.msg_id).collect()
+        }
+    }
+
+    /// The window cancels a trial whose command the connection has not read yet, the first one or the one after
+    /// the cipher step's reconnection: no Preview of it goes out, in 200 runs.
+    #[tokio::test]
+    async fn a_trial_cancelled_before_it_is_read_sends_no_preview() {
+        let mut previews = 0;
+        for run in 0..200 {
+            let epoch = reoling::TrialGate::default();
+            let after_cipher = run % 2 == 1;
+            let mut bench = Bench::new(epoch.clone(), true, after_cipher, Carried::default()).await;
+            if after_cipher {
+                bench.link.try_live_after_cipher(CHANNEL, StreamProfile::Main, 0);
+            } else {
+                bench.link.try_live(CHANNEL, StreamProfile::Main, 0);
+            }
+            // The window's cancel (`Trials::cancel`, then `DeviceLink::cancel_trial`), and closing.
+            epoch.cancel();
+            bench.link.cancel_trial();
+            bench.link.shutdown();
+            let asked = bench.end_within(Duration::from_secs(5)).await;
+            previews += asked.iter().filter(|id| **id == MSG_ID_VIDEO).count();
+            assert_eq!(asked.last(), Some(&MSG_ID_LOGOUT), "run {run}: {asked:?}");
+        }
+        assert_eq!(previews, 0, "Previews of a cancelled trial");
+    }
+
+    /// A trial cancelled, or the window closed, while the device leaves a form unanswered: the connection does not
+    /// wait for the form's 10 s but logs out at once. Cancelled, it makes way for an ordinary connection; closed, the
+    /// window hears nothing more.
+    #[tokio::test]
+    async fn a_cancel_during_an_unanswered_form_logs_out_at_once() {
+        for closing in [false, true] {
+            let epoch = reoling::TrialGate::default();
+            let mut bench = Bench::new(epoch.clone(), false, false, Carried::default()).await;
+            bench.link.try_live(CHANNEL, StreamProfile::Main, 0);
+            assert_eq!(bench.next_request().await.msg_id, MSG_ID_VIDEO);
+            let cancelled = std::time::Instant::now();
+            epoch.cancel();
+            bench.link.cancel_trial();
+            if closing {
+                bench.link.shutdown();
+            }
+            assert_eq!(bench.end_within(Duration::from_secs(2)).await, [MSG_ID_LOGOUT], "closing {closing}");
+            assert!(cancelled.elapsed() < Duration::from_secs(2));
+            let event = bench.link.events.try_recv().ok();
+            if closing {
+                assert!(event.is_none(), "nothing after the window closed");
+            } else {
+                let event = event.expect("the window hears it");
+                assert!(matches!(event, DeviceEvent::TrialReconnect { legacy: false, message: None, .. }));
+            }
+        }
+    }
+
+    /// Stop while a trial's first form is under way, with a command given meanwhile: no further form goes out, the
+    /// connection, mid-reply, is closed, and the next connection serves both commands, in order.
+    #[tokio::test]
+    async fn commands_given_during_a_trial_run_on_the_next_connection() {
+        let epoch = reoling::TrialGate::default();
+        let mut bench = Bench::new(epoch.clone(), false, false, Carried::default()).await;
+        bench.link.try_live(CHANNEL, StreamProfile::Main, 0);
+        assert_eq!(bench.next_request().await.msg_id, MSG_ID_VIDEO);
+        bench.link.query_encoding(CHANNEL);
+        bench.link.stop();
+        bench.link.query_presets(CHANNEL);
+        assert_eq!(bench.end_within(Duration::from_secs(2)).await, [MSG_ID_LOGOUT], "nothing but the logout");
+        let Ok(DeviceEvent::TrialReconnect { legacy: false, message: None, carried }) = bench.link.events.try_recv()
+        else {
+            panic!("the window hears that the connection makes way for another");
+        };
+        // The window drops the old link before the next connection is made (see `MainWindow::connect`).
+        drop(bench.link);
+        let mut next = Bench::new(epoch, false, false, carried).await;
+        assert_eq!(next.next_request().await.msg_id, MSG_ID_GET_COMPRESSION);
+        assert_eq!(next.next_request().await.msg_id, reoling::protocol::bc::model::MSG_ID_GET_PTZ_PRESET);
+        next.link.shutdown();
+        assert_eq!(next.end_within(Duration::from_secs(2)).await, [MSG_ID_LOGOUT]);
+    }
+
+    /// A settings page's write given while a trial ran is not carried to the next connection: the camera window
+    /// reports it as dropped when the trial's connection makes way (`CameraSettings::reconnecting`). A read is
+    /// carried, and so is an encoding save, which the window still waits for.
+    #[tokio::test]
+    async fn a_write_the_window_reported_dropped_never_reaches_the_device() {
+        use reoling::protocol::bc::model::MSG_ID_SET_COMPRESSION;
+        use reoling::protocol::bc::settings_write::led_write;
+        use reoling::{CameraPage, DeviceKind, LedChange, RawBody, SettingsTarget};
+        const LED_READ: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<LedState version=\"1.1\">\n\
+            <channelId>1</channelId>\n<ledVersion>0</ledVersion>\n<IRLedBrightness>0</IRLedBrightness>\n\
+            <state>auto</state>\n<lightState>open</lightState>\n<doorbellLightState>close</doorbellLightState>\n\
+            </LedState>\n</body>\n";
+        let write = led_write(&RawBody::new(LED_READ), 1, &LedChange::default()).expect("the captured shape");
+        let epoch = reoling::TrialGate::default();
+        let mut bench = Bench::new(epoch.clone(), false, false, Carried::default()).await;
+        bench.link.try_live(CHANNEL, StreamProfile::Main, 0);
+        assert_eq!(bench.next_request().await.msg_id, MSG_ID_VIDEO);
+        let target = SettingsTarget::Camera { channel: 1, page: CameraPage::LightSound };
+        bench.link.write_settings(target, DeviceKind::Hub, 1, vec![write]);
+        bench.link.query_encoding(CHANNEL);
+        bench.link.set_encoding(CHANNEL, "<Compression/>".to_string());
+        bench.link.stop();
+        assert_eq!(bench.end_within(Duration::from_secs(2)).await, [MSG_ID_LOGOUT]);
+        let Ok(DeviceEvent::TrialReconnect { carried, .. }) = bench.link.events.try_recv() else {
+            panic!("the connection makes way for another");
+        };
+        drop(bench.link);
+        let mut next = Bench::new(epoch, false, false, carried).await;
+        assert_eq!(next.next_request().await.msg_id, MSG_ID_GET_COMPRESSION, "the read, not the LED write");
+        assert_eq!(next.next_request().await.msg_id, MSG_ID_SET_COMPRESSION, "the encoding save");
+        next.link.shutdown();
+        assert_eq!(next.end_within(Duration::from_secs(2)).await, [MSG_ID_LOGOUT]);
+    }
+
+    /// Carried commands that no connection took within `CARRY_LIMIT` are dropped: they would run long after the user
+    /// gave them.
+    #[test]
+    fn carried_commands_not_taken_in_time_are_dropped() {
+        let since = std::time::Instant::now();
+        let carried = || {
+            let play = Command::Play { channel: CHANNEL, profile: StreamProfile::Sub };
+            let deferred = std::collections::VecDeque::from([play]);
+            Carried { deferred, rest: None, since: Some(since) }
+        };
+        let (_link, mut pending) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(carried().into_commands_at(&mut pending, since + Duration::from_secs(1)).0.len(), 1);
+        let late = since + super::CARRY_LIMIT + Duration::from_millis(1);
+        assert!(carried().into_commands_at(&mut pending, late).0.is_empty());
+    }
+
+    /// The time limit is applied when the next connection begins to serve the carried commands, after its login:
+    /// a Play handed over within `CARRY_LIMIT` whose connection begins serving after the limit never starts.
+    #[tokio::test]
+    async fn carried_commands_past_the_limit_when_served_are_dropped() {
+        for (age, plays) in [(Duration::ZERO, true), (super::CARRY_LIMIT - Duration::from_millis(300), false)] {
+            let play = Command::Play { channel: CHANNEL, profile: StreamProfile::Sub };
+            let since = std::time::Instant::now() - age;
+            let deferred = std::collections::VecDeque::from([play]);
+            let carried = Carried { deferred, rest: None, since: Some(since) };
+            let mut next = Bench::new(reoling::TrialGate::default(), true, false, carried).await;
+            // The connection logs in meanwhile; it serves nothing before it is polled.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            if plays {
+                assert_eq!(next.next_request().await.msg_id, MSG_ID_VIDEO, "taken in time");
+            }
+            next.link.shutdown();
+            assert_eq!(next.end_within(Duration::from_secs(2)).await, [MSG_ID_LOGOUT], "{age:?}");
+        }
+    }
+
+    /// Carried commands still waiting behind an earlier one (a carried download holds the queue) are dropped once
+    /// `CARRY_LIMIT` has passed; a command given on the new link behind them stays, and so do carried ones already
+    /// served.
+    #[test]
+    fn carried_commands_still_waiting_at_the_limit_are_dropped() {
+        let since = std::time::Instant::now();
+        let play = || Command::Play { channel: CHANNEL, profile: StreamProfile::Sub };
+        let mut deferred = std::collections::VecDeque::from([play(), Command::QueryPresets { channel: CHANNEL }]);
+        let mut late = super::LateCarried { left: 1, since: Some(since) };
+        late.prune(&mut deferred, since + super::CARRY_LIMIT - Duration::from_millis(1));
+        assert_eq!(deferred.len(), 2, "within the limit");
+        late.prune(&mut deferred, since + super::CARRY_LIMIT + Duration::from_millis(1));
+        assert!(matches!(deferred.make_contiguous(), [Command::QueryPresets { .. }]), "the new link's command stays");
+        late.prune(&mut deferred, since + super::CARRY_LIMIT * 2);
+        assert_eq!(deferred.len(), 1);
+        // One of two carried commands already served: only the one behind it is dropped, not the new link's.
+        let mut deferred = std::collections::VecDeque::from([play(), Command::QueryPresets { channel: CHANNEL }]);
+        let mut late = super::LateCarried { left: 2, since: Some(since) };
+        late.took(&super::Incoming::Deferred);
+        late.prune(&mut deferred, since + super::CARRY_LIMIT * 2);
+        assert!(matches!(deferred.make_contiguous(), [Command::QueryPresets { .. }]));
+        late.took(&super::Incoming::Received(None));
+        assert_eq!(late.left, 0);
+    }
+
+    /// How a trial's end reaches the window: a timeout or a lost connection
+    /// with its own message, the cipher step's refusals as an ordinary
+    /// reconnection, the cancelled one not at all.
+    #[tokio::test]
+    async fn a_trial_end_tells_the_window_its_reason() {
+        let (tx, events) = async_channel::unbounded();
+        let mut frames = None;
+        let reason = |end, after_cipher| {
+            let (tx, mut frames) = (tx.clone(), None);
+            async move {
+                match super::after_trial(end, CHANNEL, after_cipher, &mut frames, &tx).await {
+                    Some(DeviceEvent::TrialReconnect { legacy, message, .. }) => Some((legacy, message)),
+                    Some(_) => panic!("another event"),
+                    None => None,
+                }
+            }
+        };
+        assert_eq!(reason(reoling::TrialEnd::TimedOut, false).await, Some((false, Some(super::TRIAL_TIMED_OUT))));
+        assert_eq!(reason(reoling::TrialEnd::Lost, true).await, Some((false, Some(super::TRIAL_LOST))));
+        assert_eq!(reason(reoling::TrialEnd::Reconnect, false).await, Some((true, None)));
+        assert_eq!(reason(reoling::TrialEnd::NoneAccepted, true).await, Some((false, Some(super::NO_FORM_ACCEPTED))));
+        assert_eq!(reason(reoling::TrialEnd::Cancelled, false).await, None);
+        assert_eq!(reason(reoling::TrialEnd::Cancelled, true).await, Some((false, None)));
+        assert!(heard(&events).is_empty());
+        assert!(super::after_trial(reoling::TrialEnd::NoneAccepted, CHANNEL, false, &mut frames, &tx).await.is_none());
+        assert_eq!(heard(&events), [format!("PlayFailed {CHANNEL}: {}", super::NO_FORM_ACCEPTED)]);
+    }
+
+    /// The connection made for a trial's legacy cipher step fails: the log
+    /// says the trial ended; an ordinary connection's failure says nothing
+    /// of a trial.
+    #[test]
+    fn a_failed_cipher_step_connection_ends_the_trial_in_the_log() {
+        // The only test of the application that opens the log (the library's run in another process).
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/diag-tests/cipher-step");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("reoling-diagnostic.log");
+        reoling::diag::set_file(Some(path.clone()));
+        // A loopback port nobody listens on: the connection is refused at once.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).expect("a port").port();
+        for legacy_cipher in [false, true] {
+            let (requests, _incoming) = tokio::sync::mpsc::channel::<SinkRequest>(1);
+            let (replay_requests, _replay_incoming) = tokio::sync::mpsc::channel(1);
+            let target = super::ConnectTarget::Ip { addr: std::net::Ipv4Addr::LOCALHOST.into(), port };
+            let link = super::spawn_device(
+                target,
+                "user".to_string(),
+                "secret".to_string(),
+                requests,
+                replay_requests,
+                Arc::new(AudioOutput::new(1.0)),
+                7,
+                legacy_cipher,
+                reoling::TrialGate::default(),
+                Carried::default(),
+            );
+            let event = link.events.recv_blocking().expect("an event");
+            assert!(matches!(event, DeviceEvent::Lost(_)), "{}", said(event));
+        }
+        reoling::diag::set_file(None);
+        let file = std::fs::read_to_string(&path).expect("the log");
+        let ended: Vec<&str> = file.lines().filter(|l| l.contains("[dev 7]") && l.contains("TRIAL ended")).collect();
+        assert_eq!(ended.len(), 1, "{file}");
+        assert!(ended[0].ends_with("TRIAL ended: the connection for the legacy cipher step failed"), "{file}");
+        // Tied to its connection, by the number the attempt was given.
+        assert!(ended[0].contains("[dev 7] [conn "), "{file}");
+        let failed: Vec<&str> = file.lines().filter(|l| l.contains("connecting to the device failed")).collect();
+        assert_eq!(failed.len(), 2, "{file}");
+        assert!(failed.iter().all(|l| l.contains("[dev 7] [conn ")), "{failed:?}");
+    }
+
+    /// A trial cancelled while its legacy cipher step's connection is made:
+    /// that connection ends on the device and makes way for an ordinary one.
+    #[tokio::test]
+    async fn a_cancelled_trial_ends_the_connection_armed_for_its_cipher_step() {
+        let mut bench = Bench::new(reoling::TrialGate::default(), false, true, Carried::default()).await;
+        bench.link.cancel_trial();
+        assert_eq!(bench.end_within(Duration::from_secs(5)).await, [MSG_ID_LOGOUT], "closed on the device, no form");
+        let event = bench.link.events.try_recv().expect("the window hears it");
+        assert!(matches!(event, DeviceEvent::TrialReconnect { legacy: false, message: None, .. }), "{}", said(event));
     }
 }

@@ -205,6 +205,7 @@ impl Problem {
     /// Sets the text and tells the handler, holding no borrow while it runs
     /// (it looks at the view).
     fn report(&self, text: &str) {
+        video_line(format_args!("no picture: {text}"));
         *self.text.borrow_mut() = Some(text.to_string());
         let handler = self.handler.borrow().clone();
         if let Some(handler) = handler {
@@ -669,6 +670,10 @@ impl VideoView {
             }
         });
 
+        if reoling::diag::on() {
+            log_video(&pipeline, &appsrc, &decodebin, &sink, video_type);
+        }
+
         // In place before the first state change: the one failure that
         // leaves this pipeline without a picture once built.
         let no_picture = Arc::new(AtomicBool::new(false));
@@ -865,6 +870,19 @@ fn watch_for_no_decoder(
     let _owner = context.acquire().ok()?;
     let (problem, no_picture, decodebin) = (Rc::clone(problem), Arc::clone(no_picture), decodebin.downgrade());
     let watch = bus.add_watch_local(move |_, message| {
+        if reoling::diag::on() {
+            let from = message.src().map(|src| src.name().to_string()).unwrap_or_default();
+            match message.view() {
+                gstreamer::MessageView::Error(e) => {
+                    video_line(format_args!("error from {from}: {} ({})", e.error(), e.debug().unwrap_or_default()))
+                }
+                gstreamer::MessageView::Warning(w) => {
+                    video_line(format_args!("warning from {from}: {} ({})", w.error(), w.debug().unwrap_or_default()))
+                }
+                gstreamer::MessageView::Eos(_) => video_line(format_args!("end of stream from {from}")),
+                _ => {}
+            }
+        }
         let no_decoder = || decodebin.upgrade().is_some_and(|decodebin| says_no_decoder(message, &decodebin));
         if !no_picture.load(Ordering::Relaxed) && no_decoder() {
             no_picture.store(true, Ordering::Relaxed);
@@ -879,6 +897,132 @@ fn watch_for_no_decoder(
             None
         }
     }
+}
+
+/// `text` with the user's home directory written as `~` and the user's name in any other path as `<user>`: the
+/// file names GStreamer and the requirements report give can hold both, and the log's masks know neither.
+fn without_home(text: &str, home: &str, user: &str) -> String {
+    let text = if home.len() > 1 { text.replace(home, "~") } else { text.to_string() };
+    if user.is_empty() {
+        text
+    } else {
+        text.replace(&format!("/{user}/"), "/<user>/")
+    }
+}
+
+/// A line of the diagnostic log about video: masked as every line is, and without the user's home or name.
+fn video_line(text: std::fmt::Arguments) {
+    if !reoling::diag::on() {
+        return;
+    }
+    let (home, user) = (glib::home_dir(), glib::user_name());
+    let text = without_home(&text.to_string(), &home.to_string_lossy(), &user.to_string_lossy());
+    // Written apart: the log's masks take the element's name, 17 letters and a digit, for a camera's UID.
+    let text = text.replace("gtk4paintablesink", "gtk4 paintable sink");
+    reoling::diag::masked(format_args!("VIDEO {text}"));
+}
+
+/// How long after its start a live pipeline's frame counts go into the diagnostic log.
+const VIDEO_COUNT_AFTER: Duration = Duration::from_secs(5);
+
+/// The diagnostic log's account of a live pipeline, for a report of a missing picture: what this system has
+/// for video (once a run), the pipeline's codec and settings, the decoder decodebin picks, the picture format it
+/// gives, the first picture to reach the display sink, and after `VIDEO_COUNT_AFTER` how many frames came from
+/// the device, left the decoder and reached the sink (which draws them; whether it did is not counted). A
+/// pipeline built while the log is off is not followed.
+fn log_video(
+    pipeline: &gstreamer::Pipeline,
+    appsrc: &AppSrc,
+    decodebin: &gstreamer::Element,
+    display: &gstreamer::Element,
+    video_type: VideoType,
+) {
+    static SYSTEM: std::sync::Once = std::sync::Once::new();
+    SYSTEM.call_once(|| {
+        let distribution = crate::ui::requirements::distribution();
+        video_line(format_args!("system: {}", distribution.as_deref().unwrap_or("distribution unknown")));
+        // What chooses the display and the renderer, when the user or the session set it.
+        for name in ["XDG_SESSION_TYPE", "GDK_BACKEND", "GSK_RENDERER", "GST_PLUGIN_FEATURE_RANK"] {
+            if let Ok(value) = std::env::var(name) {
+                video_line(format_args!("system: {name}={value}"));
+            }
+        }
+        for line in crate::ui::requirements::check().check_text().lines().filter(|line| !line.trim().is_empty()) {
+            video_line(format_args!("system: {}", line.trim()));
+        }
+    });
+    let decoding = if crate::ui::settings::force_software(video_type) { "software only" } else { "automatic" };
+    video_line(format_args!(
+        "pipeline: {video_type:?}, decoding {decoding}, latency {} ms",
+        crate::ui::settings::latency().as_millis()
+    ));
+    let started = std::time::Instant::now();
+    // Frames received from the device, decoded, and at the display.
+    let counts: Arc<[AtomicU64; 3]> = Arc::default();
+    let count = move |pad: Option<gstreamer::Pad>, which: usize, counts: &Arc<[AtomicU64; 3]>| {
+        let Some(pad) = pad else { return };
+        let counts = Arc::clone(counts);
+        pad.add_probe(gstreamer::PadProbeType::BUFFER, move |_, _| {
+            let before = counts[which].fetch_add(1, Ordering::Relaxed);
+            if which == 2 && before == 0 {
+                video_line(format_args!(
+                    "first picture reached the display sink after {} ms: {} frame(s) received, {} decoded",
+                    started.elapsed().as_millis(),
+                    counts[0].load(Ordering::Relaxed),
+                    counts[1].load(Ordering::Relaxed)
+                ));
+            }
+            gstreamer::PadProbeReturn::Ok
+        });
+    };
+    count(appsrc.static_pad("src"), 0, &counts);
+    count(display.static_pad("sink"), 2, &counts);
+    let decoded = Arc::clone(&counts);
+    decodebin.connect_pad_added(move |_, pad| {
+        let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
+        if caps.structure(0).is_none_or(|structure| structure.name() != "video/x-raw") {
+            return;
+        }
+        count(Some(pad.clone()), 1, &decoded);
+        let said = AtomicBool::new(false);
+        let say = move |pad: &gstreamer::Pad| {
+            let Some(caps) = pad.current_caps() else { return };
+            let Some(structure) = caps.structure(0) else { return };
+            if said.swap(true, Ordering::Relaxed) {
+                return;
+            }
+            let number = |field: &str| structure.get::<i32>(field).unwrap_or(0);
+            video_line(format_args!(
+                "decoded picture: {} {}x{}",
+                structure.get::<&str>("format").unwrap_or("unknown format"),
+                number("width"),
+                number("height")
+            ));
+        };
+        say(pad);
+        pad.connect_notify(Some("caps"), move |pad, _| say(pad));
+    });
+    pipeline.connect_deep_element_added(|_, _, element| {
+        let Some(factory) = element.factory() else { return };
+        let klass = factory.klass();
+        if klass.contains("Decoder") && klass.contains("Video") {
+            video_line(format_args!("decoder: {} ({klass})", factory.name()));
+        }
+    });
+    let watched = pipeline.downgrade();
+    glib::timeout_add_local_once(VIDEO_COUNT_AFTER, move || {
+        // A pipeline that is gone by now was stopped or replaced: nothing to say about it.
+        if watched.upgrade().is_some() {
+            let at = |which: usize| counts[which].load(Ordering::Relaxed);
+            video_line(format_args!(
+                "after {} s: {} frame(s) received, {} decoded, {} reached the display sink",
+                VIDEO_COUNT_AFTER.as_secs(),
+                at(0),
+                at(1),
+                at(2)
+            ));
+        }
+    });
 }
 
 /// Takes a sink's pipeline to NULL on a thread of its own (see
@@ -2422,6 +2566,21 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
+    /// Paths in the video lines of the diagnostic log name neither the user's home nor the user.
+    #[test]
+    fn video_lines_name_neither_the_home_directory_nor_the_user() {
+        use super::without_home;
+        let line = "Display: gtk4paintablesink 0.15.2 (/home/someone/Applications/lib/libgstgtk4.so)";
+        assert_eq!(
+            without_home(line, "/home/someone", "someone"),
+            "Display: gtk4paintablesink 0.15.2 (~/Applications/lib/libgstgtk4.so)"
+        );
+        let elsewhere = without_home("/media/someone/disk/x and /usr/lib/y", "/home/someone", "someone");
+        assert_eq!(elsewhere, "/media/<user>/disk/x and /usr/lib/y");
+        // No home or name known: the text as it is, and never a bare "/" replaced.
+        assert_eq!(without_home("/usr/lib/y", "/", ""), "/usr/lib/y");
+    }
+
     use super::fixtures::View;
     use super::*;
 

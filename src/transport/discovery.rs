@@ -1,14 +1,36 @@
 use crate::protocol::bcudp::codec::{read_bcudp, write_bcudp};
 use crate::protocol::bcudp::model::{BcUdp, UdpDiscovery};
-use crate::protocol::bcudp::xml::{C2mQ, UdpXml};
+use crate::protocol::bcudp::xml::{C2dC, C2mQ, ClientList, UdpXml};
 use crate::Error;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::time::timeout;
+use tokio::time::{sleep_until, timeout, Instant};
 
 const RESEND_INTERVAL: Duration = Duration::from_millis(500);
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(15);
+
+tokio::task_local! {
+    /// The race of `ReolinkClient::connect_and_login_by_uid` this task is running, for `race_note`: its number in
+    /// the negotiation debug lines and when it started.
+    pub(crate) static DEBUG_RACE: (u32, std::time::Instant);
+}
+
+/// One negotiation debug line about connecting by UID (see `crate::diag::line`): under the race's number and the
+/// time since it started when called inside one. The lines carry numbers, booleans and fixed words only (never an
+/// address, a UID or a device's text): they are pasted into public reports.
+pub(crate) fn race_note(text: std::fmt::Arguments) {
+    if !crate::diag::on() {
+        return;
+    }
+    match DEBUG_RACE.try_with(|race| *race) {
+        Ok((race, started)) => {
+            let ms = started.elapsed().as_millis();
+            crate::diag::line(format_args!("[race {race} +{ms} ms] NEGOTIATION race: {text}"))
+        }
+        Err(_) => crate::diag::line(format_args!("NEGOTIATION race: {text}")),
+    }
+}
 
 /// Sends a request to `dest` on a fixed `RESEND_INTERVAL` cadence and
 /// inspects every reply via `matcher` until it returns `Some` or
@@ -73,6 +95,8 @@ async fn send_and_await<T>(
 pub struct UidLookupResult {
     pub reg: SocketAddr,
     pub relay: SocketAddr,
+    /// The answer's `debug`, when it is a number: echoed in `C2R_DISC` (see `abandon`).
+    pub debug: Option<u32>,
 }
 
 /// Asks one P2P relay server what it knows about `uid`. Retries the send
@@ -109,6 +133,7 @@ pub async fn resolve_uid(
         Some(Ok(UidLookupResult {
             reg: SocketAddr::new(reg_ip, reg.port),
             relay: SocketAddr::new(relay_ip, relay.port),
+            debug: reply.debug.and_then(|debug| debug.trim().parse().ok()),
         }))
     })
     .await
@@ -136,10 +161,12 @@ pub async fn resolve_uid(
 /// rather than purely at address fan-out — see `send_and_await`'s doc
 /// comment for the per-send tid fix. Treat this function as a
 /// last-known-good mitigation, not a confirmed root-cause fix.
+///
+/// Returns the answer and the address it came from.
 async fn resolve_uid_broadcast(
     uid: &str,
     relay_addrs: &[SocketAddr],
-) -> crate::Result<UidLookupResult> {
+) -> crate::Result<(UidLookupResult, SocketAddr)> {
     use futures_util::stream::FuturesUnordered;
     use futures_util::StreamExt;
 
@@ -148,7 +175,7 @@ async fn resolve_uid_broadcast(
         .copied()
         .map(|addr| async move {
             let socket = UdpSocket::bind("0.0.0.0:0").await?;
-            resolve_uid(&socket, uid, addr).await
+            resolve_uid(&socket, uid, addr).await.map(|result| (result, addr))
         })
         .collect();
     while let Some(result) = queries.next().await {
@@ -178,6 +205,19 @@ pub async fn register(
     client_id: i32,
     local_port: u16,
     lookup: &UidLookupResult,
+) -> crate::Result<RegisterResult> {
+    register_fresh(socket, uid, client_id, local_port, lookup, None).await
+}
+
+/// `register`, skipping a reply that gives the `retired` session's sid: a new attempt waits within the same bound
+/// for a fresh session (every retry of the official app got a new sid in our captures).
+async fn register_fresh(
+    socket: &UdpSocket,
+    uid: &str,
+    client_id: i32,
+    local_port: u16,
+    lookup: &UidLookupResult,
+    retired: Option<u32>,
 ) -> crate::Result<RegisterResult> {
     // `cli.ip` needs our real outbound-routing local IP, not a placeholder.
     // `socket` itself is bound wildcard (0.0.0.0:0, see
@@ -222,13 +262,21 @@ pub async fn register(
         }
         match disc.payload {
             UdpXml::R2cCr(reply) => {
+                race_note(format_args!(
+                    "register reply R2C_C_R: rsp={} dev={} dmap={} relay={}",
+                    reply.rsp,
+                    reply.dev.is_some(),
+                    reply.dmap.is_some(),
+                    reply.relay.is_some()
+                ));
                 if reply.rsp != 0 {
-                    return Some(Err(Error::ProtocolError(format!(
-                        "register rejected with rsp={}",
-                        reply.rsp
-                    ))));
+                    return Some(Err(Error::RegisterRejected { rsp: reply.rsp }));
                 }
                 let sid = reply.sid?;
+                if retired == Some(sid) {
+                    race_note(format_args!("register reply R2C_C_R: the retired session's sid, still waiting"));
+                    return None;
+                }
                 Some(Ok(RegisterResult {
                     sid,
                     dev: reply
@@ -252,7 +300,15 @@ pub async fn register(
             // `dev` alongside the relay info this message never carries),
             // so treat this one as a keepalive and keep waiting for the
             // real answer instead of returning early on it.
-            UdpXml::R2cT(_) => None,
+            UdpXml::R2cT(reply) => {
+                // It has no `rsp` of its own.
+                race_note(format_args!(
+                    "register reply R2C_T: dev={} dmap={}",
+                    reply.dev.is_some(),
+                    reply.dmap.is_some()
+                ));
+                None
+            }
             _ => None,
         }
     })
@@ -291,7 +347,7 @@ pub struct PeerHandle {
 /// the register server, exactly as `connect_relay` does for `conn: "relay"`.
 /// `C2D_C` is apparently a separate, session-less legacy path the device
 /// also answers but never treats as "connected" for a UID/`sid`-registered
-/// client.
+/// client. `lan_connect` uses it for LAN discovery.
 pub async fn connect_direct(
     socket: &UdpSocket,
     register_addr: SocketAddr,
@@ -450,8 +506,14 @@ pub async fn connect_relay(
 /// and only falling back to relay on failure. With VPN on, the LAN-local
 /// candidate answered first (~80ms) and won; with VPN off (so the LAN
 /// address is genuinely unreachable), local's `D2C_CFM` never arrived and
-/// relay won instead (~100ms) — a real race, decided purely by whichever
-/// candidate answers first, not a priority order.
+/// relay won instead (~100ms).
+///
+/// The first `D2C_CFM` wins at once when no better path was offered (local
+/// before map before relay). After a map or relay one, a better path still
+/// gets `BETTER_PATH_GRACE` to confirm, and the best confirmed one wins: in a
+/// capture of ours (2026-11-07) the relay confirmed 10 ms before local, and
+/// the device answered our login on its LAN path, which the session pinned to
+/// the relay dropped.
 ///
 /// Confirms whichever path won back to the register server via
 /// `C2R_CFM{conn: <winner>}`, using the reply's own `conn` — never
@@ -471,6 +533,21 @@ pub async fn connect_race(
     register: &RegisterResult,
     client_id: i32,
 ) -> crate::Result<(PeerHandle, &'static str)> {
+    let deadline = Instant::now() + OVERALL_TIMEOUT;
+    let (peer, conn, _) = connect_race_until(socket, register_addr, relay_addr, register, client_id, deadline).await?;
+    Ok((peer, path_name(&conn)))
+}
+
+/// `connect_race` with its limit at `deadline`, giving the winning path as its `conn` and when the first
+/// `D2C_CFM` was accepted. Ends with `P2pNegotiationTimeout` when no `D2C_CFM` came by `deadline`.
+pub(crate) async fn connect_race_until(
+    socket: &UdpSocket,
+    register_addr: SocketAddr,
+    relay_addr: SocketAddr,
+    register: &RegisterResult,
+    client_id: i32,
+    deadline: Instant,
+) -> crate::Result<(PeerHandle, String, Instant)> {
     let candidates: Vec<(&'static str, SocketAddr)> = [
         register.dev.map(|a| ("local", a)),
         register.map.map(|a| ("map", a)),
@@ -480,15 +557,24 @@ pub async fn connect_race(
     .flatten()
     .collect();
 
+    let best_possible = candidates.iter().map(|(conn, _)| path_rank(conn)).min().unwrap_or(2);
+
     let mut resend = tokio::time::interval(RESEND_INTERVAL);
     resend.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut buf = [0u8; 2048];
 
-    let (peer, winning_conn): (PeerHandle, String) = timeout(OVERALL_TIMEOUT, async move {
+    let (peer, winning_conn, confirmed_at): (PeerHandle, String, Instant) = async move {
+        let mut best: Option<(PeerHandle, String)> = None;
+        let mut confirmed_at: Option<Instant> = None;
+        // A CFM confirmed shortly before the limit still wins: the grace never runs past it.
+        let mut deadline = deadline;
         loop {
             tokio::select! {
+                _ = sleep_until(deadline) => break,
                 _ = resend.tick() => {
-                    for (conn, addr) in &candidates {
+                    // A confirmed candidate is not asked again while a better one has its grace.
+                    let confirmed = best.as_ref().map(|(_, conn)| conn.as_str());
+                    for (conn, addr) in candidates.iter().filter(|(conn, _)| Some(*conn) != confirmed) {
                         let request = write_bcudp(&BcUdp::Discovery(UdpDiscovery {
                             tid: rand::random::<u32>().max(1),
                             payload: UdpXml::C2dT(crate::protocol::bcudp::xml::C2dT {
@@ -515,6 +601,13 @@ pub async fn connect_race(
                     if reply.rsp != 0 || reply.cid != client_id || reply.sid != register.sid {
                         continue;
                     }
+                    // Tells a device that gave its nonce with the handshake from one that left it to the login.
+                    race_note(format_args!(
+                        "D2C_CFM on the {} path: lver={} nonce present={}",
+                        path_name(&reply.conn),
+                        reply.lver,
+                        reply.nc.is_some()
+                    ));
                     let peer = PeerHandle {
                         addr: from,
                         local_connection_id: client_id,
@@ -524,25 +617,31 @@ pub async fn connect_race(
                         nonce: reply.nc.clone(),
                         is_direct: reply.conn != "relay",
                     };
-                    return Ok::<_, crate::Error>((peer, reply.conn.clone()));
+                    confirmed_at.get_or_insert_with(Instant::now);
+                    // The device answers on its LAN path once that path confirms (our captures), so a later
+                    // local D2C_CFM must win over an earlier relay one.
+                    if best.as_ref().is_none_or(|(_, conn)| path_rank(&reply.conn) < path_rank(conn)) {
+                        best = Some((peer, reply.conn));
+                    }
+                    if best.as_ref().is_some_and(|(_, conn)| path_rank(conn) <= best_possible) {
+                        break;
+                    }
+                    // shortcut: fixed grace; if a local D2C_CFM is seen later than this after the relay's, make
+                    // it relative to the relay's own CFM time.
+                    deadline = deadline.min(Instant::now() + BETTER_PATH_GRACE);
                 }
             }
         }
-    })
-    .await
-    .map_err(|_| Error::P2pNegotiationTimeout)??;
-    let path = match winning_conn.as_str() {
-        "local" => "local",
-        "map" => "NAT-mapped",
-        "relay" => "relay",
-        _ => "other",
-    };
+        let (peer, conn) = best.ok_or(Error::P2pNegotiationTimeout)?;
+        Ok::<_, Error>((peer, conn, confirmed_at.unwrap_or_else(Instant::now)))
+    }
+    .await?;
 
     let confirm = BcUdp::Discovery(UdpDiscovery {
         tid: rand::random::<u32>().max(1),
         payload: UdpXml::C2rCfm(crate::protocol::bcudp::xml::C2rCfm {
             sid: register.sid,
-            conn: winning_conn,
+            conn: winning_conn.clone(),
             rsp: 0,
             cid: client_id,
             did: peer.remote_connection_id,
@@ -552,7 +651,32 @@ pub async fn connect_race(
         .send_to(&write_bcudp(&confirm), register_addr)
         .await?;
 
-    Ok((peer, path))
+    Ok((peer, winning_conn, confirmed_at))
+}
+
+/// How long `connect_race` waits, after a map or relay `D2C_CFM`, for a
+/// better path to confirm. The relay confirmed 10-12 ms before local in our
+/// captures, and local took 74-111 ms over a VPN.
+const BETTER_PATH_GRACE: Duration = Duration::from_millis(150);
+
+/// A `D2C_CFM`'s `conn` as the negotiation debug output names the path: one of four fixed words, never the
+/// device's own text.
+pub(crate) fn path_name(conn: &str) -> &'static str {
+    match conn {
+        "local" => "local",
+        "map" => "NAT-mapped",
+        "relay" => "relay",
+        _ => "other",
+    }
+}
+
+/// Which confirmed path `connect_race` prefers: lower is better.
+fn path_rank(conn: &str) -> u8 {
+    match conn {
+        "local" => 0,
+        "map" => 1,
+        _ => 2,
+    }
 }
 
 /// The P2P servers asked about a UID, all in parallel. Exactly the set the
@@ -576,16 +700,49 @@ const P2P_RELAY_HOSTNAMES: [&str; 14] = [
     "p2p16.reolink.com",
 ];
 
-/// Shared prefix of `connect_by_uid`: resolve the relay hostnames, broadcast
-/// the UID lookup, and register our address. Returns everything both the
-/// relay-preferring and direct-preferring connect strategies need.
-async fn resolve_and_register(
+/// Shared prefix of `connect_by_uid` and `connect_by_uid_prefer_direct`: `register_attempt` with a new client id.
+/// Returns everything both connect strategies need.
+pub(crate) async fn resolve_and_register(
     socket: &UdpSocket,
     uid: &str,
 ) -> crate::Result<(UidLookupResult, RegisterResult, i32)> {
+    let attempt = register_attempt(socket, uid, new_client_id(), None).await?;
+    Ok((attempt.lookup, attempt.register, attempt.client_id))
+}
+
+/// A random client id, positive (`abs` of `i32::MIN` would overflow).
+pub(crate) fn new_client_id() -> i32 {
+    ((rand::random::<u32>() >> 1) as i32).max(1)
+}
+
+/// One accepted registration of a UID on `socket`: what its P2P attempt needs, and what `register_again` and
+/// `abandon` take from it. The times are those `C2R_DISC` reports.
+#[derive(Debug, Clone)]
+pub(crate) struct Registration {
+    pub lookup: UidLookupResult,
+    pub register: RegisterResult,
+    pub client_id: i32,
+    /// The lookup server whose answer was accepted: the one the official app asks again (our captures).
+    pub lookup_server: SocketAddr,
+    /// When the attempt began, and when the accepted lookup answer came.
+    pub started: Instant,
+    pub answered: Instant,
+    /// When the first `C2R_C` went out.
+    pub registered: Instant,
+}
+
+/// The P2P part of `ReolinkClient::connect_and_login_by_uid` up to a registration: resolve the relay hostnames,
+/// broadcast the UID lookup, and register our address under `client_id`, never taking the `retired` sid.
+pub(crate) async fn register_attempt(
+    socket: &UdpSocket,
+    uid: &str,
+    client_id: i32,
+    retired: Option<u32>,
+) -> crate::Result<Registration> {
     use futures_util::stream::FuturesUnordered;
     use futures_util::StreamExt;
     use std::net::ToSocketAddrs;
+    let started = Instant::now();
 
     // `to_socket_addrs()` is a blocking syscall with no timeout of its own,
     // so a slow or blocked resolver (common behind a VPN) can otherwise
@@ -598,20 +755,29 @@ async fn resolve_and_register(
         .map(|&host| async move {
             let resolved =
                 tokio::task::spawn_blocking(move || format!("{host}:9999").to_socket_addrs().ok());
-            tokio::time::timeout(DNS_TIMEOUT, resolved)
+            let addrs = tokio::time::timeout(DNS_TIMEOUT, resolved)
                 .await
                 .ok()
                 .and_then(|joined| joined.ok())
-                .flatten()
+                .flatten();
+            (host, addrs)
         })
         .collect();
     let mut relay_addrs = Vec::new();
-    while let Some(resolved) = dns_lookups.next().await {
+    // Which name of our list each address came from, for the debug line below: filled only when it prints.
+    let debug = crate::diag::on();
+    let mut hosts: Vec<(SocketAddr, &'static str)> = Vec::new();
+    while let Some((host, resolved)) = dns_lookups.next().await {
         if let Some(addrs) = resolved {
             // resolve_uid_broadcast binds each candidate socket to
             // "0.0.0.0:0", which cannot send to an AAAA address, so drop
             // IPv6 candidates here rather than failing on them later.
-            relay_addrs.extend(addrs.filter(|a| a.is_ipv4()));
+            for addr in addrs.filter(|a| a.is_ipv4()) {
+                relay_addrs.push(addr);
+                if debug {
+                    hosts.push((addr, host));
+                }
+            }
         }
     }
     relay_addrs.sort();
@@ -622,12 +788,123 @@ async fn resolve_and_register(
 
     // Query every resolved relay concurrently, each on its own socket — see
     // resolve_uid_broadcast's doc comment for why a shared socket doesn't work.
-    let lookup = resolve_uid_broadcast(uid, &relay_addrs).await?;
+    let (lookup, answered_by) = resolve_uid_broadcast(uid, &relay_addrs).await?;
+    let answered = Instant::now();
+    // The name is one of `P2P_RELAY_HOSTNAMES`, the first that resolved to the address: never the address itself.
+    let host = hosts.iter().find(|(addr, _)| *addr == answered_by).map_or("unknown", |(_, host)| *host);
+    race_note(format_args!("lookup answered by {host}, {} server address(es) asked", relay_addrs.len()));
+    register_on(socket, uid, client_id, lookup, answered_by, (started, answered), retired).await
+}
 
+/// `register_fresh` under `client_id` after the lookup `lookup_server` answered; `times` are when the attempt
+/// began and when that answer came.
+async fn register_on(
+    socket: &UdpSocket,
+    uid: &str,
+    client_id: i32,
+    lookup: UidLookupResult,
+    lookup_server: SocketAddr,
+    (started, answered): (Instant, Instant),
+    retired: Option<u32>,
+) -> crate::Result<Registration> {
     let local_port = socket.local_addr()?.port();
-    let client_id = rand::random::<i32>().abs().max(1);
-    let register_result = register(socket, uid, client_id, local_port, &lookup).await?;
-    Ok((lookup, register_result, client_id))
+    let registered = Instant::now();
+    let register = register_fresh(socket, uid, client_id, local_port, &lookup, retired).await?;
+    Ok(Registration { lookup, register, client_id, lookup_server, started, answered, registered })
+}
+
+/// The next attempt after `previous` was abandoned, as the official app makes it (our captures): one lookup from
+/// the new `socket` to the server whose answer `previous` accepted, then a registration under the next client id.
+/// When that server gives no usable answer, the full lookup of `register_attempt` instead (our own fallback, never
+/// seen in the captures).
+pub(crate) async fn register_again(
+    socket: &UdpSocket,
+    uid: &str,
+    previous: &Registration,
+) -> crate::Result<Registration> {
+    // The official app's retries count the client id up by one.
+    let client_id = previous.client_id.checked_add(1).unwrap_or(1);
+    let retired = Some(previous.register.sid);
+    let started = Instant::now();
+    match resolve_uid(socket, uid, previous.lookup_server).await {
+        Ok(lookup) => {
+            let times = (started, Instant::now());
+            register_on(socket, uid, client_id, lookup, previous.lookup_server, times, retired).await
+        }
+        Err(_) => {
+            race_note(format_args!("the lookup server asked again did not answer, asking every server"));
+            register_attempt(socket, uid, client_id, retired).await
+        }
+    }
+}
+
+/// How many abandon messages of each kind `abandon` sends, `gap` apart: three, 0.5 s apart, in our captures.
+const ABANDON_ROUNDS: u32 = 3;
+
+/// The `debug` the official app put in every `C2R_DISC` of our captures, for a lookup answer that gave none.
+const DISC_DEBUG: u32 = 251658240;
+
+/// Abandons the silent attempt `attempt` on its own `socket`, as the official app does (our captures): in each of
+/// `ABANDON_ROUNDS` rounds `gap` apart, `C2D_DISC` to the path that confirmed the session, if one did, then
+/// `C2R_DISC` to the register server. Each message keeps one tid and payload through its rounds; no reply is
+/// awaited and no BC logout is sent (the attempt never logged in). `confirmed` is the confirmed peer, its `conn`
+/// and when its first `D2C_CFM` came; `sent` is the BC data the session sent its peer (`C2R_DISC`'s `send`);
+/// `c2d_t_from` is when the first `C2D_T` went out.
+pub(crate) async fn abandon(
+    socket: &UdpSocket,
+    uid: &str,
+    attempt: &Registration,
+    confirmed: Option<(&PeerHandle, &str, Instant)>,
+    sent: crate::transport::connection::SentData,
+    c2d_t_from: Instant,
+    gap: Duration,
+) {
+    use crate::protocol::bcudp::xml::{C2dDisc, C2rDisc, DiscCounters, DiscTime};
+    let now = Instant::now();
+    let ms = |from: Instant, to: Instant| {
+        i64::try_from(to.saturating_duration_since(from).as_millis()).unwrap_or(i64::MAX)
+    };
+    let tid = || rand::random::<u32>().max(1);
+    // Nothing is received from a silent peer in our captures, hence -1.
+    let recv = DiscCounters { lc: -1, rc: -1, ..Default::default() };
+    let disc = C2rDisc {
+        uid: uid.to_string(),
+        sid: attempt.register.sid,
+        time: DiscTime {
+            query: ms(attempt.started, attempt.answered),
+            setup: confirmed.map_or(0, |(_, _, at)| ms(attempt.started, at)),
+            conn: ms(confirmed.map_or(c2d_t_from, |(_, _, at)| at), now),
+        },
+        conn: confirmed.map_or("unknown", |(_, conn, _)| conn).to_string(),
+        rsp: if confirmed.is_some() { 0 } else { -1 },
+        cid: attempt.client_id,
+        send: DiscCounters {
+            cnt: sent.copies,
+            cntr: sent.resent,
+            size: sent.bytes,
+            sizer: sent.resent_bytes,
+            lc: 0,
+            rc: if confirmed.is_some() { 0 } else { -1 },
+            ..Default::default()
+        },
+        recv,
+        debug: attempt.lookup.debug.unwrap_or(DISC_DEBUG),
+    };
+    let to_register = write_bcudp(&BcUdp::Discovery(UdpDiscovery { tid: tid(), payload: UdpXml::C2rDisc(disc) }));
+    let to_peer = confirmed.map(|(peer, _, _)| {
+        let disc = C2dDisc { cid: peer.local_connection_id, did: peer.remote_connection_id };
+        (write_bcudp(&BcUdp::Discovery(UdpDiscovery { tid: tid(), payload: UdpXml::C2dDisc(disc) })), peer.addr)
+    });
+    for round in 0..ABANDON_ROUNDS {
+        // Each gap from the round before, so a late round never sends the next one at once.
+        if round > 0 {
+            tokio::time::sleep(gap).await;
+        }
+        if let Some((bytes, addr)) = &to_peer {
+            let _ = socket.send_to(bytes, *addr).await;
+        }
+        let _ = socket.send_to(&to_register, attempt.lookup.reg).await;
+    }
 }
 
 /// Resolves `uid` against whichever relay hostname answers first, registers
@@ -683,44 +960,63 @@ pub async fn connect_by_uid_prefer_direct(socket: &UdpSocket, uid: &str) -> crat
     connect_relay(socket, lookup.reg, relay_addr, &register_result, client_id).await
 }
 
-/// A real device that IS reachable directly responds to `C2D_T` within
-/// about a second (matches `connect_by_uid_prefer_direct`'s own observed
-/// timing); a device that ISN'T only tells us so via the register server's
-/// `R2C_DISC`, sent roughly `OVERALL_TIMEOUT` after the attempt starts (see
-/// `connect_direct`'s own doc comment). Bounding the attempt at this much
-/// shorter timeout instead turns "device unreachable directly" into a
-/// prompt fall-through to relay rather than a multi-second hang that reads,
-/// to a user watching a static "Connecting..." label, as the app simply
-/// not connecting — confirmed against real hardware 2026-09-14 (VPN off,
-/// so the device really isn't reachable directly) via
-/// `ReolinkClient::connect_by_uid_prefer_tcp`, the only caller.
-const OPPORTUNISTIC_DIRECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Where `lan_connect` asks: the broadcast address of the LAN, port 2018.
+// shortcut: 255.255.255.255 leaves on one interface only; add per-interface directed broadcasts if a multi-homed
+// user needs them.
+pub const LAN_DISCOVERY: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, 2018));
 
-/// Like `connect_by_uid_prefer_direct`, but bounds the opportunistic direct
-/// attempt at `OPPORTUNISTIC_DIRECT_TIMEOUT` instead of letting it run the
-/// full `OVERALL_TIMEOUT` before falling back to relay. Used by
-/// `ReolinkClient::connect_by_uid_prefer_tcp` to attempt a direct (and
-/// from there, TCP) session without a long hang on devices that turn out
-/// not to be reachable directly.
-pub async fn connect_by_uid_prefer_direct_bounded(
-    socket: &UdpSocket,
-    uid: &str,
-) -> crate::Result<PeerHandle> {
-    let (lookup, register_result, client_id) = resolve_and_register(socket, uid).await?;
-
-    if let Some(dev_addr) = register_result.dev {
-        if let Ok(Ok(peer)) = timeout(
-            OPPORTUNISTIC_DIRECT_TIMEOUT,
-            connect_direct(socket, lookup.reg, dev_addr, &register_result, client_id),
-        )
-        .await
-        {
-            return Ok(peer);
+/// Asks the LAN for the device `uid` with `C2D_C` sent to `to`
+/// (`LAN_DISCOVERY` in the app), as the official app does alongside the
+/// server lookup (our captures): one request, one tid, resent on
+/// `send_and_await`'s cadence. The first `D2C_C_R` that echoes our cid gives
+/// the device's LAN address and its id for a session-less direct session.
+/// `D2C_C_R` names no UID: the answer proves only that a host on our LAN
+/// answered for it.
+pub async fn lan_connect(socket: &UdpSocket, uid: &str, to: SocketAddr) -> crate::Result<PeerHandle> {
+    let client_id = rand::random::<i32>().abs().max(1);
+    let request = write_bcudp(&BcUdp::Discovery(UdpDiscovery {
+        tid: rand::random::<u32>().max(1),
+        payload: UdpXml::C2dC(C2dC {
+            uid: uid.to_string(),
+            // The device answers to this port.
+            cli: ClientList { port: u32::from(socket.local_addr()?.port()) },
+            cid: client_id,
+            mtu: 1350,
+            debug: 0,
+            os: "WIN".to_string(),
+            pl: String::new(),
+            lver: 3,
+        }),
+    }));
+    // Counted for the debug line: the broadcasts sent, and the answers that were not ours.
+    let (mut sent, mut ignored) = (0u32, 0u32);
+    let build_request = || {
+        sent += 1;
+        request.clone()
+    };
+    let result = send_and_await(socket, to, build_request, |disc, from| {
+        let UdpXml::D2cCr(reply) = disc.payload else {
+            return None;
+        };
+        if reply.rsp != 0 || reply.cid != client_id {
+            ignored += 1;
+            return None;
         }
-    }
-
-    let relay_addr = register_result.relay.unwrap_or(lookup.relay);
-    connect_relay(socket, lookup.reg, relay_addr, &register_result, client_id).await
+        Some(Ok(PeerHandle {
+            addr: from,
+            local_connection_id: client_id,
+            remote_connection_id: reply.did,
+            // The legacy nonce exchange gives it at login.
+            nonce: None,
+            is_direct: true,
+        }))
+    })
+    .await;
+    race_note(format_args!(
+        "LAN discovery: {sent} broadcast(s) sent, answered={}, {ignored} answer(s) with another cid or rsp ignored",
+        result.is_ok()
+    ));
+    result
 }
 
 #[cfg(test)]
@@ -729,6 +1025,7 @@ mod tests {
     use crate::protocol::bcudp::model::BcUdp;
     use crate::protocol::bcudp::xml::{IpPort, UdpXml};
     use tokio::net::UdpSocket;
+    use tokio::task::JoinHandle;
 
     #[tokio::test]
     #[ignore = "hits the real Reolink relay network; run manually with --ignored"]
@@ -763,6 +1060,7 @@ mod tests {
                 payload: UdpXml::M2cQr(crate::protocol::bcudp::xml::M2cQr {
                     reg: Some(IpPort { ip: "127.0.0.1".to_string(), port: 12345 }),
                     relay: Some(IpPort { ip: "127.0.0.1".to_string(), port: 12346 }),
+                    debug: None,
                 }),
             });
             relay
@@ -807,6 +1105,7 @@ mod tests {
                 payload: UdpXml::M2cQr(crate::protocol::bcudp::xml::M2cQr {
                     reg: Some(IpPort { ip: "127.0.0.1".to_string(), port: 22345 }),
                     relay: Some(IpPort { ip: "127.0.0.1".to_string(), port: 22346 }),
+                    debug: None,
                 }),
             });
             real_relay
@@ -816,9 +1115,10 @@ mod tests {
         });
 
         let relay_addrs = [silent_a_addr, silent_b_addr, real_relay_addr];
-        let result = resolve_uid_broadcast("9527000EXAMPLE01", &relay_addrs)
+        let (result, answered_by) = resolve_uid_broadcast("9527000EXAMPLE01", &relay_addrs)
             .await
             .unwrap();
+        assert_eq!(answered_by, real_relay_addr);
         assert_eq!(result.reg.port(), 22345);
         assert_eq!(result.relay.port(), 22346);
         fake_real_relay.await.unwrap();
@@ -864,6 +1164,7 @@ mod tests {
         let lookup = UidLookupResult {
             reg: register_addr,
             relay: "127.0.0.1:1".parse().unwrap(),
+            debug: None,
         };
         let result = register(&client, "9527000EXAMPLE01", 1, 40000, &lookup)
             .await
@@ -934,6 +1235,7 @@ mod tests {
         let lookup = UidLookupResult {
             reg: register_addr,
             relay: "127.0.0.1:1".parse().unwrap(),
+            debug: None,
         };
         let result = register(&client, "9527000EXAMPLE01", 1, 40000, &lookup)
             .await
@@ -1152,9 +1454,13 @@ mod tests {
             map: None,
             relay: Some(relay_addr),
         };
+        let start = Instant::now();
         let (peer, path) = connect_race(&client, register_addr, relay_addr, &register_result, 1)
             .await
             .unwrap();
+        // The silent local candidate had its grace before the relay won.
+        let elapsed = start.elapsed();
+        assert!(elapsed >= BETTER_PATH_GRACE && elapsed < Duration::from_secs(2), "{elapsed:?}");
         assert_eq!(path, "relay");
         assert_eq!(peer.addr, relay_addr);
         assert_eq!(peer.remote_connection_id, 88);
@@ -1164,5 +1470,165 @@ mod tests {
         fake_relay.await.unwrap();
         confirm_check.await.unwrap();
         silent_dev.await.unwrap();
+    }
+
+    /// A connect candidate that answers the first `C2D_T` it gets, `delay`
+    /// after this call, with a `D2C_CFM` of `conn` and `did`.
+    fn confirming_candidate(socket: UdpSocket, conn: &'static str, did: i32, delay: Duration) -> JoinHandle<()> {
+        // From the call, not the receipt: under a paused clock a spawned task may read the request a tick late.
+        let answer_at = Instant::now() + delay;
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, from) = socket.recv_from(&mut buf).await.unwrap();
+            let Ok(Some((BcUdp::Discovery(disc), _))) = read_bcudp(&buf[..n]) else { panic!("expected discovery") };
+            let UdpXml::C2dT(req) = disc.payload else { panic!("expected C2D_T") };
+            assert_eq!(req.conn, conn);
+            sleep_until(answer_at).await;
+            let cfm = crate::protocol::bcudp::xml::D2cCfm {
+                sid: req.sid,
+                conn: conn.to_string(),
+                rsp: 0,
+                cid: req.cid,
+                did,
+                nc: None,
+                pl: String::new(),
+                lver: 3,
+            };
+            let reply = BcUdp::Discovery(UdpDiscovery { tid: disc.tid, payload: UdpXml::D2cCfm(cfm) });
+            socket.send_to(&write_bcudp(&reply), from).await.unwrap();
+        })
+    }
+
+    /// The path the register server is told: the first `C2R_CFM`'s conn and did.
+    async fn confirmed_path(register: &UdpSocket) -> (String, i32) {
+        let mut buf = [0u8; 2048];
+        let (n, _) = register.recv_from(&mut buf).await.unwrap();
+        let Ok(Some((BcUdp::Discovery(disc), _))) = read_bcudp(&buf[..n]) else { panic!("expected discovery") };
+        let UdpXml::C2rCfm(cfm) = disc.payload else { panic!("expected C2R_CFM") };
+        (cfm.conn, cfm.did)
+    }
+
+    /// The 2026-11-07 failure: the relay confirms first, local 20 ms later.
+    /// Local wins, and the register server is told so.
+    #[tokio::test]
+    async fn connect_race_waits_briefly_for_local_after_a_relay_cfm() {
+        let dev = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (dev_addr, relay_addr) = (dev.local_addr().unwrap(), relay.local_addr().unwrap());
+        let register = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local = confirming_candidate(dev, "local", 99, Duration::from_millis(20));
+        let via_relay = confirming_candidate(relay, "relay", 88, Duration::ZERO);
+        let offer = RegisterResult { sid: 555, dev: Some(dev_addr), map: None, relay: Some(relay_addr) };
+        let (peer, path) = connect_race(&client, register.local_addr().unwrap(), relay_addr, &offer, 1).await.unwrap();
+        assert_eq!((path, peer.addr, peer.remote_connection_id, peer.is_direct), ("local", dev_addr, 99, true));
+        assert_eq!(confirmed_path(&register).await, ("local".to_string(), 99));
+        local.await.unwrap();
+        via_relay.await.unwrap();
+    }
+
+    /// A relay CFM just before the overall limit still wins, though the
+    /// silent local candidate's grace would run past that limit.
+    #[tokio::test(start_paused = true)]
+    async fn connect_race_keeps_a_cfm_that_comes_just_before_the_limit() {
+        let dev = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (dev_addr, relay_addr) = (dev.local_addr().unwrap(), relay.local_addr().unwrap());
+        let register = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let via_relay = confirming_candidate(relay, "relay", 88, OVERALL_TIMEOUT - Duration::from_millis(100));
+        let offer = RegisterResult { sid: 555, dev: Some(dev_addr), map: None, relay: Some(relay_addr) };
+        let (peer, path) = connect_race(&client, register.local_addr().unwrap(), relay_addr, &offer, 1).await.unwrap();
+        assert_eq!((path, peer.addr), ("relay", relay_addr));
+        assert_eq!(confirmed_path(&register).await, ("relay".to_string(), 88));
+        via_relay.await.unwrap();
+        drop(dev);
+    }
+
+    /// With only a relay offered there is nothing better to wait for.
+    #[tokio::test]
+    async fn connect_race_does_not_wait_without_a_better_candidate() {
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let register = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let via_relay = confirming_candidate(relay, "relay", 88, Duration::ZERO);
+        let offer = RegisterResult { sid: 555, dev: None, map: None, relay: Some(relay_addr) };
+        let start = Instant::now();
+        let (_, path) = connect_race(&client, register.local_addr().unwrap(), relay_addr, &offer, 1).await.unwrap();
+        assert!(start.elapsed() < BETTER_PATH_GRACE, "{:?}", start.elapsed());
+        assert_eq!(path, "relay");
+        via_relay.await.unwrap();
+    }
+
+    /// The Home Hub's usual case: local confirms first and wins at once.
+    #[tokio::test]
+    async fn connect_race_returns_at_once_when_local_answers_first() {
+        let dev = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (dev_addr, relay_addr) = (dev.local_addr().unwrap(), relay.local_addr().unwrap());
+        let register = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local = confirming_candidate(dev, "local", 99, Duration::ZERO);
+        let offer = RegisterResult { sid: 555, dev: Some(dev_addr), map: None, relay: Some(relay_addr) };
+        let start = Instant::now();
+        let (peer, path) = connect_race(&client, register.local_addr().unwrap(), relay_addr, &offer, 1).await.unwrap();
+        assert!(start.elapsed() < BETTER_PATH_GRACE, "{:?}", start.elapsed());
+        assert_eq!((path, peer.addr), ("local", dev_addr));
+        assert_eq!(confirmed_path(&register).await, ("local".to_string(), 99));
+        local.await.unwrap();
+        drop(relay);
+    }
+
+    /// The next `C2D_C` a fake device gets: the request, its tid and where it came from.
+    async fn lan_request(device: &UdpSocket) -> (C2dC, u32, SocketAddr) {
+        let mut buf = [0u8; 2048];
+        let (n, from) = device.recv_from(&mut buf).await.unwrap();
+        let Ok(Some((BcUdp::Discovery(disc), _))) = read_bcudp(&buf[..n]) else { panic!("expected discovery") };
+        let UdpXml::C2dC(request) = disc.payload else { panic!("expected C2D_C") };
+        (request, disc.tid, from)
+    }
+
+    async fn send_d2c_c_r(device: &UdpSocket, to: SocketAddr, rsp: i32, cid: i32, did: i32) {
+        let reply = crate::protocol::bcudp::xml::D2cCr { rsp, cid, did };
+        let reply = BcUdp::Discovery(UdpDiscovery { tid: 1, payload: UdpXml::D2cCr(reply) });
+        device.send_to(&write_bcudp(&reply), to).await.unwrap();
+    }
+
+    /// The request has the captured fields and keeps its tid on a resend;
+    /// the device's answer gives its address and id.
+    #[tokio::test]
+    async fn lan_connect_finds_the_device_that_answers_c2d_c() {
+        let device = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let device_addr = device.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_port = u32::from(client.local_addr().unwrap().port());
+        let fake = tokio::spawn(async move {
+            let (first, first_tid, _) = lan_request(&device).await;
+            let (again, tid, from) = lan_request(&device).await;
+            assert_eq!((first, first_tid), (again.clone(), tid), "the resend is the same request");
+            let fields = (again.uid.as_str(), again.cli.port, again.mtu, again.debug, again.os.as_str(), again.lver);
+            assert_eq!(fields, ("9527000EXAMPLE01", client_port, 1350, 0, "WIN", 3));
+            send_d2c_c_r(&device, from, 0, again.cid, 7).await;
+        });
+        let peer = lan_connect(&client, "9527000EXAMPLE01", device_addr).await.unwrap();
+        assert_eq!((peer.addr, peer.remote_connection_id, peer.nonce, peer.is_direct), (device_addr, 7, None, true));
+        fake.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lan_connect_ignores_an_answer_with_another_cid_or_rsp() {
+        let device = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let device_addr = device.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fake = tokio::spawn(async move {
+            let (request, _, from) = lan_request(&device).await;
+            send_d2c_c_r(&device, from, 0, request.cid.wrapping_add(1), 1).await;
+            send_d2c_c_r(&device, from, -1, request.cid, 2).await;
+            send_d2c_c_r(&device, from, 0, request.cid, 3).await;
+        });
+        let peer = lan_connect(&client, "9527000EXAMPLE01", device_addr).await.unwrap();
+        assert_eq!(peer.remote_connection_id, 3);
+        fake.await.unwrap();
     }
 }

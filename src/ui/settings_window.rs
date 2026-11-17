@@ -181,6 +181,118 @@ fn folder_row(
     row
 }
 
+/// The diagnostic log's row: its path under the title, "Save As…" to keep a
+/// copy (to attach to an issue), and a button that opens its folder.
+/// How often an open window and the device menus look again at whether the log is written (a write can fail on any
+/// device's thread).
+pub const RECORDING_CHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What the switch row says when the log it asks for is not written, and how to try again; `None` while it is
+/// written or off.
+fn recording_problem() -> Option<String> {
+    let reoling::diag::Recording::Failed(failure) = reoling::diag::recording() else { return None };
+    let step = if failure.opening { "opened" } else { "written" };
+    Some(format!(
+        "Not recording: the log file could not be {step} ({}). Turn the switch off and on to try again.",
+        failure.kind
+    ))
+}
+
+/// Shows `recording_problem` under the log's path, and gives it to the switch as its accessible description.
+fn show_recording(problem: &Label, switch: &Switch) {
+    let text = recording_problem();
+    problem.set_text(text.as_deref().unwrap_or(""));
+    problem.set_visible(text.is_some());
+    switch.update_property(&[gtk4::accessible::Property::Description(text.as_deref().unwrap_or(""))]);
+}
+
+/// The diagnostic log's row (see `log_row`) and the label under its path that says when recording failed.
+fn log_row(parent: &Window) -> (ListBoxRow, Label) {
+    let path = settings::log_path();
+    let shown_path = path.display().to_string();
+    let save = Button::with_label("Save As…");
+    save.add_css_class("suggested-action");
+    let open = Button::from_icon_name("folder-symbolic");
+    open.set_tooltip_text(Some("Open the folder"));
+    open.update_property(&[gtk4::accessible::Property::Label("Open the folder")]);
+    let controls = GtkBox::new(Orientation::Horizontal, 8);
+    controls.append(&save);
+    controls.append(&open);
+    controls.set_valign(gtk4::Align::Center);
+
+    let shown = Label::new(Some(&shown_path));
+    shown.add_css_class("dim-label");
+    shown.add_css_class("caption");
+    shown.set_halign(gtk4::Align::Start);
+    shown.set_xalign(0.0);
+    shown.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+    shown.set_max_width_chars(48);
+    // The middle of a long path is cut: the whole of it on hover.
+    shown.set_tooltip_text(Some(&shown_path));
+
+    // Said in words, not by colour alone; the "error" class colours it as the theme does.
+    let problem = Label::new(None);
+    problem.add_css_class("error");
+    problem.add_css_class("caption");
+    problem.set_halign(gtk4::Align::Start);
+    problem.set_xalign(0.0);
+    problem.set_wrap(true);
+    problem.set_max_width_chars(48);
+    problem.set_visible(false);
+
+    let text = GtkBox::new(Orientation::Vertical, 2);
+    text.set_hexpand(true);
+    let heading = Label::new(Some("Diagnostic Log File"));
+    heading.set_halign(gtk4::Align::Start);
+    text.append(&heading);
+    text.append(&shown);
+    text.append(&problem);
+
+    let line = GtkBox::new(Orientation::Horizontal, 12);
+    line.set_margin_top(10);
+    line.set_margin_bottom(10);
+    line.set_margin_start(12);
+    line.set_margin_end(12);
+    line.append(&text);
+    line.append(&controls);
+
+    let folder = path.parent().map(std::path::Path::to_path_buf);
+    open.connect_clicked(move |_| {
+        if let Some(uri) = folder.as_ref().and_then(|f| glib::filename_to_uri(f, None).ok()) {
+            crate::ui::dialogs::open_uri(&uri);
+        }
+    });
+    let parent = parent.clone();
+    save.connect_clicked(move |_| {
+        let (path, shown, shown_path) = (path.clone(), shown.clone(), shown_path.clone());
+        let downloads = glib::user_special_dir(glib::UserDirectory::Downloads).unwrap_or_else(glib::home_dir);
+        let title = "Save the diagnostic log";
+        crate::ui::dialogs::save_file(&parent, title, "reoling-diagnostic.log", &downloads, move |to| {
+            let said = match reoling::diag::export(&path, &to) {
+                Ok(_) => None,
+                Err(reoling::diag::ExportError::TheLogItself) => {
+                    Some("Not saved: that is the log file itself. Choose another name or folder.".to_string())
+                }
+                Err(reoling::diag::ExportError::Io(kind)) => Some(format!("Could not save: {kind}")),
+            };
+            shown.set_text(said.as_deref().unwrap_or(&shown_path));
+            if said.is_some() {
+                shown.remove_css_class("dim-label");
+                shown.add_css_class("error");
+            } else {
+                shown.remove_css_class("error");
+                shown.add_css_class("dim-label");
+            }
+        });
+    });
+
+    let row = ListBoxRow::new();
+    row.set_activatable(false);
+    row.set_selectable(false);
+    row.set_child(Some(&line));
+    (row, problem)
+}
+
 fn default_dir(kind: glib::UserDirectory) -> String {
     glib::user_special_dir(kind)
         .map(|d| d.join("Reoling").display().to_string())
@@ -238,6 +350,32 @@ pub fn open(parent: &Window, current: &Settings, on_change: impl Fn(Settings) + 
     let w = window.clone();
     let st = Rc::clone(&state);
     status_button.connect_clicked(move |_| system_status(&w, st.borrow().decoding));
+    let diagnostics = switch(current.diagnostics);
+    diagnostics.update_property(&[gtk4::accessible::Property::Label("Diagnostic Log")]);
+    let (log, problem) = log_row(&window);
+    log.set_visible(current.diagnostics || settings::log_path().exists());
+    show_recording(&problem, &diagnostics);
+    // A write that fails while the window is open shows here too, the line and the switch's description changed
+    // only when the problem does.
+    let (watched, switch_of) = (problem.downgrade(), diagnostics.downgrade());
+    glib::timeout_add_local(RECORDING_CHECK, move || {
+        let (Some(problem), Some(switch)) = (watched.upgrade(), switch_of.upgrade()) else {
+            return glib::ControlFlow::Break;
+        };
+        if problem.text() != recording_problem().unwrap_or_default() {
+            show_recording(&problem, &switch);
+        }
+        glib::ControlFlow::Continue
+    });
+    let c = Rc::clone(&commit);
+    let shown = log.clone();
+    diagnostics.connect_state_set(move |switch, on| {
+        // Applied at once (see `commit`): the row then says whether the file is written.
+        c(&|s| s.diagnostics = on);
+        shown.set_visible(on || settings::log_path().exists());
+        show_recording(&problem, switch);
+        glib::Propagation::Proceed
+    });
     let general = GtkBox::new(Orientation::Vertical, 0);
     general.set_margin_top(14);
     general.append(&list(&[
@@ -249,6 +387,17 @@ pub fn open(parent: &Window, current: &Settings, on_change: impl Fn(Settings) + 
         row("Language", None, &drop_down(&["Auto"], 0), false),
         row("Theme", None, &theme, true),
         row("System Status", None, &status_button, true),
+        row(
+            "Diagnostic Log",
+            Some(
+                "Writes a detailed connection and video log to attach to a GitHub issue. Camera IDs, addresses, \
+                 e-mail addresses and names are masked. It stays on until Reoling is closed. To also log how \
+                 each device connects, start Reoling with --diagnostics.",
+            ),
+            &diagnostics,
+            true,
+        ),
+        log,
     ]));
     tabs.append_page(&scrolled(&general), Some(&Label::new(Some("General Settings"))));
 
@@ -516,6 +665,13 @@ fn system_status(parent: &Window, decoding: Decoding) {
     }
     lines.extend(crate::ui::requirements::check().status_lines());
     lines.push(format!("Settings: {}", glib::user_config_dir().join("reoling").join("settings.ini").display()));
+    lines.push(match reoling::diag::recording() {
+        reoling::diag::Recording::On(path) => format!("Diagnostic log: on, {}", path.display()),
+        reoling::diag::Recording::Off => "Diagnostic log: off".to_string(),
+        reoling::diag::Recording::Failed(_) => {
+            format!("Diagnostic log: {}", recording_problem().unwrap_or_default())
+        }
+    });
     let text = Label::new(Some(&lines.join("\n")));
     text.set_selectable(true);
     // A selectable label takes the focus, and with it a select-all, when the

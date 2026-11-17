@@ -1204,7 +1204,7 @@ fn reply_text(bc: &Bc) -> Option<RawBody> {
 /// or the page read again) is consumed all the same, so its id is never
 /// mistaken for a message of its own. Only the id, channel, code and length
 /// of such a reply are ever printed, never its body.
-pub(super) fn settings_reply(bc: &Bc, pending: &Mutex<HashMap<u16, ImageKind>>) -> Routed {
+pub(super) fn settings_reply(bc: &Bc, pending: &Mutex<HashMap<u16, ImageKind>>, debug_id: u32) -> Routed {
     let msg_num = bc.meta.msg_num;
     let (page, write) = match lock(pending).get(&msg_num) {
         Some(ImageKind::SettingsPage(collector)) => (Some(Arc::clone(collector)), None),
@@ -1219,18 +1219,19 @@ pub(super) fn settings_reply(bc: &Bc, pending: &Mutex<HashMap<u16, ImageKind>>) 
     if !ours {
         return Routed::NotOurs;
     }
-    if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
+    if crate::diag::on() {
         let bytes = match &bc.body {
             BcBody::Modern(ModernMsg { payload: Some(p), .. }) => p.len(),
             _ => 0,
         };
-        eprintln!(
-            "DEBUG settings {}: msg={} channel={} code={} bytes={bytes}",
+        crate::diag::line(format_args!(
+            "{}DEBUG settings {}: msg={} channel={} code={} bytes={bytes}",
+            super::debug_prefix(debug_id, None),
             if write.is_some() { "write answer" } else { "reply" },
             bc.meta.msg_id,
             bc.meta.channel_id,
             bc.meta.response_code
-        );
+        ));
     }
     lock(pending).remove(&msg_num);
     if let Some(write) = write {
@@ -1360,13 +1361,14 @@ impl ReolinkClient {
                         payload: Some(write.body().as_bytes().to_vec()),
                     }),
                 };
-                if std::env::var("REOLING_DEBUG_NEGOTIATION").is_ok() {
-                    eprintln!(
-                        "DEBUG settings write: msg={} channel={} bytes={}",
+                if crate::diag::on() {
+                    crate::diag::line(format_args!(
+                        "{}DEBUG settings write: msg={} channel={} bytes={}",
+                        super::debug_prefix(self.debug_id, self.logged_in_at),
                         write.msg_id,
                         write.channel,
                         write.body().len()
-                    );
+                    ));
                 }
                 lock(&collector).sent(index, msg_num);
                 // Registered before the send, as for the reads.
@@ -1446,7 +1448,7 @@ impl ReolinkClient {
                     Err(crate::Error::ReplyTimeout) => continue,
                     Err(_) => return None,
                 };
-                match pushed_update(&bc, &mut image_chunks, &self.pending_images, &self.channel_uids) {
+                match pushed_update(&bc, &mut image_chunks, &self.pending_images, &self.channel_uids, self.debug_id) {
                     Some(DeviceUpdate::Settings { page, .. }) if page.target() == target => return Some(page),
                     Some(update) => {
                         let _ = self.channel_updates_tx.send(update);
@@ -1490,6 +1492,7 @@ mod tests {
             tracking: true,
             binning: true,
             pet_label: false,
+            extern_stream: true,
         }
     }
 
@@ -1771,13 +1774,13 @@ mod tests {
         lock(&pending).insert(7u16, ImageKind::SettingsPage(Arc::clone(&collector)));
         lock(&pending).insert(8u16, ImageKind::Preset(2));
         // Not ours: an image request's number, an unknown number, a wrong id.
-        assert!(matches!(settings_reply(&reply(101, 8, 200, None), &pending), Routed::NotOurs));
-        assert!(matches!(settings_reply(&reply(101, 9, 200, None), &pending), Routed::NotOurs));
-        assert!(matches!(settings_reply(&reply(80, 7, 200, None), &pending), Routed::NotOurs));
+        assert!(matches!(settings_reply(&reply(101, 8, 200, None), &pending, 0), Routed::NotOurs));
+        assert!(matches!(settings_reply(&reply(101, 9, 200, None), &pending, 0), Routed::NotOurs));
+        assert!(matches!(settings_reply(&reply(80, 7, 200, None), &pending, 0), Routed::NotOurs));
         assert!(lock(&pending).contains_key(&7));
         let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<AutoReboot version=\"1.1\">\n<enable>1</enable>\n<weekDay>Sunday</weekDay>\n<hour>11</hour>\n<minute>0</minute>\n<second>0</second>\n</AutoReboot>\n</body>\n";
         let Routed::Consumed(Some(DeviceUpdate::Settings { page: SettingsPage::DeviceMaintenance(page), .. })) =
-            settings_reply(&reply(101, 7, 200, Some(xml)), &pending)
+            settings_reply(&reply(101, 7, 200, Some(xml)), &pending, 0)
         else {
             panic!("the complete page is returned")
         };
@@ -1793,18 +1796,18 @@ mod tests {
             lock(&pending).insert(20 + i as u16, ImageKind::SettingsPage(Arc::clone(&collector)));
         }
         let compression = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<Compression version=\"1.1\">\n<channelId>0</channelId>\n<mainStream>\n<audio>1</audio>\n</mainStream>\n</Compression>\n</body>\n";
-        assert!(matches!(settings_reply(&reply(56, 24, 200, Some(compression)), &pending), Routed::Consumed(None)));
+        assert!(matches!(settings_reply(&reply(56, 24, 200, Some(compression)), &pending, 0), Routed::Consumed(None)));
         assert!(!lock(&pending).contains_key(&24) && lock(&pending).contains_key(&20));
         assert!(!lock(&collector).is_done());
         // Given up (the timeout): a late reply is still consumed, not routed
         // by its id, and its number is freed.
         lock(&collector).fill_open(ReadFailure::NoReply);
         assert!(lock(&collector).finish_if_complete().is_some());
-        assert!(matches!(settings_reply(&reply(208, 20, 200, None), &pending), Routed::Consumed(None)));
+        assert!(matches!(settings_reply(&reply(208, 20, 200, None), &pending, 0), Routed::Consumed(None)));
         assert!(!lock(&pending).contains_key(&20));
         // A number another request took over is that request's.
         lock(&pending).insert(21, ImageKind::Preset(1));
-        assert!(matches!(settings_reply(&reply(289, 21, 200, None), &pending), Routed::NotOurs));
+        assert!(matches!(settings_reply(&reply(289, 21, 200, None), &pending, 0), Routed::NotOurs));
         // Outcomes of the other reply shapes.
         assert_eq!(reply_outcome(&reply(101, 1, 400, None)), Err(ReadFailure::Refused(400)));
         assert_eq!(reply_outcome(&reply(101, 1, 200, None)), Err(ReadFailure::Unreadable));
@@ -1830,7 +1833,7 @@ mod tests {
         number_reused(&pending, 40);
         assert!(!lock(&pending).contains_key(&40));
         let compression = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<Compression version=\"1.1\">\n<channelId>0</channelId>\n</Compression>\n</body>\n";
-        assert!(matches!(settings_reply(&reply(56, 40, 200, Some(compression)), &pending), Routed::NotOurs));
+        assert!(matches!(settings_reply(&reply(56, 40, 200, Some(compression)), &pending, 0), Routed::NotOurs));
         // A number nobody holds is left alone.
         number_reused(&pending, 41);
         assert!(lock(&pending).is_empty());
@@ -1847,7 +1850,7 @@ mod tests {
         lock(&collector).sent(0, 60);
         lock(&pending).insert(60u16, ImageKind::SettingsPage(Arc::clone(&collector)));
         let Routed::Consumed(Some(DeviceUpdate::Settings { page: SettingsPage::CameraDisplay { page, .. }, .. })) =
-            settings_reply(&reply(44, 60, 200, Some(OSD_READ)), &pending)
+            settings_reply(&reply(44, 60, 200, Some(OSD_READ)), &pending, 0)
         else {
             panic!("the page is complete")
         };
@@ -1881,7 +1884,7 @@ mod tests {
         lock(&older).sent(0, 70);
         lock(&pending).insert(70u16, ImageKind::SettingsPage(Arc::clone(&older)));
         let Routed::Consumed(Some(DeviceUpdate::Settings { page, read: 5 })) =
-            settings_reply(&reply(44, 70, 200, Some(OSD_READ)), &pending)
+            settings_reply(&reply(44, 70, 200, Some(OSD_READ)), &pending, 0)
         else {
             panic!("the older read's page, under its number")
         };
@@ -1960,10 +1963,10 @@ mod tests {
         lock(&pending).insert(70u16, ImageKind::SettingsWrite(Arc::clone(&collector)));
         lock(&pending).insert(71u16, ImageKind::SettingsWrite(Arc::clone(&collector)));
         // Another id under the number is not this write's answer.
-        assert!(matches!(settings_reply(&reply(57, 70, 200, None), &pending), Routed::NotOurs));
-        assert!(matches!(settings_reply(&reply(picture, 70, 200, None), &pending), Routed::Consumed(None)));
+        assert!(matches!(settings_reply(&reply(57, 70, 200, None), &pending, 0), Routed::NotOurs));
+        assert!(matches!(settings_reply(&reply(picture, 70, 200, None), &pending, 0), Routed::Consumed(None)));
         let Routed::Consumed(Some(DeviceUpdate::SettingsWritten { target: t, group, results })) =
-            settings_reply(&reply(threshold, 71, 400, None), &pending)
+            settings_reply(&reply(threshold, 71, 400, None), &pending, 0)
         else {
             panic!("the group is answered")
         };
@@ -1988,7 +1991,7 @@ mod tests {
             panic!("given up")
         };
         assert_eq!(results[0].reply, WriteReply::NoReply);
-        assert!(matches!(settings_reply(&reply(45, 72, 200, None), &pending), Routed::Consumed(None)));
+        assert!(matches!(settings_reply(&reply(45, 72, 200, None), &pending, 0), Routed::Consumed(None)));
         // Not sent: this write and every later one.
         let mut c = WriteCollector::new(target, 9, &[osd_write_for(1), osd_write_for(1)]);
         c.sent(0, 80);
@@ -2019,7 +2022,7 @@ mod tests {
             lock(&collector).sent(0, msg_num);
             lock(&pending).insert(msg_num, ImageKind::SettingsPage(Arc::clone(&collector)));
             let Routed::Consumed(Some(DeviceUpdate::Settings { page, read })) =
-                settings_reply(&reply(44, msg_num, 200, Some(text)), &pending)
+                settings_reply(&reply(44, msg_num, 200, Some(text)), &pending, 0)
             else {
                 panic!("the page")
             };
@@ -2035,7 +2038,7 @@ mod tests {
             lock(&collector).sent(0, msg_num);
             lock(&pending).insert(msg_num, ImageKind::SettingsWrite(Arc::clone(&collector)));
             let Routed::Consumed(Some(DeviceUpdate::SettingsWritten { group: g, results, .. })) =
-                settings_reply(&reply(write.msg_id, msg_num, 200, None), &pending)
+                settings_reply(&reply(write.msg_id, msg_num, 200, None), &pending, 0)
             else {
                 panic!("the write is answered")
             };
