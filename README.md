@@ -24,7 +24,7 @@ Version **1.0.6**, with installable packages since 1.0.0 (see [Installation](#in
 **What the app does today**
 
 - Devices: add by UID or IP, or pick one of the devices found on the local network; each connects at start, with its own name, channels and streams; one password per device, in the desktop keyring.
-- Diagnostic Log (Settings, or `reoling --diagnostics`): a connection and video log with UIDs, addresses and names masked, to attach to an issue.
+- Diagnostic Log (Settings, or `reoling --diagnostics`): a connection and video log with UIDs, addresses and names masked, to attach to an issue; see [the guide](docs/DIAGNOSTIC-LOG.md).
 - Live view of a device or channel, the lightest stream first, Stop and Play, a latency setting; fullscreen controls hide after 2.5 s unused.
 - Digital zoom in live view and playback: the wheel zooms at the pointer up to 16×, a left drag pans, a middle click shows the whole picture.
 - Sound with a volume control, and Talk from the computer's microphone to the camera.
