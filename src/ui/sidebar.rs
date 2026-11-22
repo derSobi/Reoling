@@ -91,11 +91,13 @@ pub struct Sidebar {
 /// The connected dot in the theme's accent colour. The colour is the
 /// theme's own named one, not ours.
 ///
-/// A card's menu is a child of its row, and a theme that gives its popovers no text colour of their own (Mint-Y on
-/// Linux Mint 22) lets them take the selected row's: white entries on a white menu. The menu therefore names the
-/// theme's ordinary text colour.
+/// A card's menu is a child of its row, and Mint-Y (Linux Mint 22) colours every flat button inside a selected row
+/// white (`row:selected button.flat`), the menu's entries included: white on the menu's white. The entries
+/// therefore name the theme's ordinary text colour, and its dimmed one while they cannot be used.
 const DOT_CSS: &str = ".status-connected { color: @theme_selected_bg_color; } \
-                       popover.card-menu, popover.card-menu > contents { color: @theme_fg_color; }";
+                       popover.card-menu button, popover.card-menu button label { color: @theme_fg_color; } \
+                       popover.card-menu button:disabled, popover.card-menu button:disabled label \
+                       { color: @insensitive_fg_color; }";
 
 impl Sidebar {
     pub fn new(handlers: Handlers) -> Rc<Self> {
