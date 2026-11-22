@@ -20,6 +20,9 @@ pub struct BcXml {
     pub preview: Option<Preview>,
     #[serde(rename = "VersionInfo", skip_serializing_if = "Option::is_none")]
     pub version_info: Option<VersionInfo>,
+    /// Reply to `MSG_ID_UID`.
+    #[serde(rename = "Uid", skip_serializing_if = "Option::is_none")]
+    pub uid: Option<Uid>,
     #[serde(rename = "ChannelInfoList", skip_serializing_if = "Option::is_none")]
     pub channel_info_list: Option<ChannelInfoList>,
     #[serde(rename = "OsdChannelName", skip_serializing_if = "Option::is_none")]
@@ -300,6 +303,12 @@ impl ChannelInfoList {
             })
             .collect()
     }
+}
+
+/// The device's own UID (reply to `MSG_ID_UID`).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub struct Uid {
+    pub uid: Option<CameraUid>,
 }
 
 /// The device's own description of itself (reply to `MSG_ID_VERSION`, or
@@ -1261,6 +1270,19 @@ impl CoverPreview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_uid_reply_gives_the_devices_uid_and_hides_it_in_debug() {
+        let reply = b"<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<Uid version=\"1.1\">\n\
+                      <uid>9527000EXAMPLE01</uid>\n</Uid>\n</body>\n";
+        let uid = BcXml::from_bytes(reply).unwrap().uid.and_then(|u| u.uid).unwrap();
+        assert_eq!(uid.as_str(), "9527000EXAMPLE01");
+        assert!(!format!("{uid:?}").contains("9527000EXAMPLE01"));
+
+        let empty = b"<body><Uid version=\"1.1\"><uid></uid></Uid></body>";
+        assert!(BcXml::from_bytes(empty).unwrap().uid.and_then(|u| u.uid).is_none_or(|u| u.is_empty()));
+        assert!(BcXml::from_bytes(b"<body></body>").unwrap().uid.is_none());
+    }
 
     #[test]
     fn login_user_round_trips() {

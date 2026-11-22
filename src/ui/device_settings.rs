@@ -1,5 +1,5 @@
-//! The settings window of an NVR or Home Hub itself (not of one of its
-//! cameras): what the device tells about itself, its storage, network,
+//! The settings window of a device itself (an NVR, a Home Hub or a camera on
+//! its own; not of a camera behind an NVR or Hub): what the device tells about itself, its storage, network,
 //! clock, lights and sounds, alert switches, accounts and scheduled reboot,
 //! all read-only, one tab each, read when the tab is first shown and again
 //! on Reload.
@@ -51,7 +51,8 @@ fn page_of(name: &str) -> Option<DevicePage> {
 }
 
 /// Which tabs a kind of device has: a Hub has its own lights and sounds, an
-/// NVR device-wide alert switches.
+/// NVR device-wide alert switches; a camera on its own has neither (its lights
+/// and alerts are on its camera pages).
 pub fn has_tab(kind: DeviceKind, page: DevicePage) -> bool {
     match page {
         DevicePage::LightSound => kind == DeviceKind::Hub,
@@ -307,4 +308,20 @@ impl DeviceSettings {
 fn local_now() -> Option<i64> {
     let now = gtk4::glib::DateTime::now_local().ok()?;
     Some(now.to_unix() + now.utc_offset().as_seconds())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_camera_on_its_own_gets_the_tabs_it_answers() {
+        // The device-level light, sound and alert reads are refused by a camera on its own (read-only probe of an
+        // RLC-520A and an RLC-1224A); every other device page is answered.
+        let shown: Vec<DevicePage> = DevicePage::ALL.into_iter().filter(|p| has_tab(DeviceKind::Camera, *p)).collect();
+        use DevicePage::*;
+        assert_eq!(shown, [Info, Storage, Network, Time, Users, Maintenance]);
+        assert!(has_tab(DeviceKind::Hub, LightSound) && !has_tab(DeviceKind::Hub, Alerts));
+        assert!(has_tab(DeviceKind::Nvr, Alerts) && !has_tab(DeviceKind::Nvr, LightSound));
+    }
 }

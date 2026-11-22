@@ -2,6 +2,24 @@
 
 All notable changes of Reoling, newest first.
 
+## 1.0.7 — 2026-11-22
+
+`reoling_1.0.7-1_amd64.deb`, `Reoling-1.0.7-embed-x86_64.AppImage` and `Reoling-1.0.7-system-x86_64.AppImage`, built as 1.0.6's were. After a login, Reoling now asks the device which one it is before it uses the connection, and it remembers where a device is on the network, so a device behind a VPN connects directly.
+
+- A path of a device added by UID wins only after the device has said which one it is. Right after the login, Reoling asks for the device's UID (a read the official app also makes) and compares it with the one the device was added with. On the local network a path counts only when the answer names that UID. Over P2P a path also counts when the device gives no answer, so that a model without this request connects as before; it fails only when another device answers. Before, the reply "200" to the login was enough, and that reply is not protected by the password.
+- A path that fails this check is disconnected and the others go on. It is never taken for a wrong password, so the saved password stays. When no path is left, the device's card says "the device did not confirm its UID" or "another device answered for this UID". A device that cannot answer the request can still be added by its address.
+- Reoling remembers where a device added by UID is. After connecting, it asks the device for its own network address (a read) and saves it once a connection to that address has reported the device's UID. From then on it tries that address directly at every start, beside P2P and the search on the local network. My Home Hub is behind a site-to-site VPN in another subnet, where no search arrives: it now connects in about 0.4 s through the VPN instead of 1.7 s through the relay, and its video no longer passes through the relay.
+- The saved address is used only on the network it was saved on (the network of the default route). On another network the device connects as it did the first time.
+- An address at which something other than the device answers is remembered as rejected and not tried again. That is the usual case for a device in another place without a VPN, whose own address means nothing here.
+- Once an address is saved, the login on the local network goes only to a host that answers the search from that address. An answer from another address gets no login. If the device has a new address, it connects over P2P and the saved address is corrected without a question.
+- When the answer from another address is all there is and nothing else connects, Reoling asks: "A device answered on the local network for …, but from a different address than the one saved for it." "Disconnect" leaves the device not connected. "Continue" forgets the saved address and connects as at the first time.
+- The first connection to a new device is as before: the paths on the local network run at once.
+- "Device settings…" in a card's menu is now offered for a camera on its own too: Info, Storage, Network, Time, Users and Maintenance, read-only. Before, it was there for a Home Hub or NVR only.
+- "Remove device" asks before it removes; Cancel is the default.
+- The Diagnostic Log says for each path whether the device was checked, when a saved address joins the connection attempt, when an answer on the local network was held back, and whether a reported address was saved or rejected. No address and no UID is written.
+- What this does not do: it does not protect the first login to a new device on the local network, and it is no cryptographic proof. The protocol gives a client nothing fresh to add to the session key, so a recorded session of the same device could be replayed, and a host that knows the password can report any UID.
+- Tested on my Home Hub Pro, two RLN36 and the two test cameras (RLC-520A, RLC-1224A): all five report the UID they were added with as the first request after login.
+
 ## 1.0.6 — 2026-11-17
 
 `reoling_1.0.6-1_amd64.deb`, `Reoling-1.0.6-embed-x86_64.AppImage` and `Reoling-1.0.6-system-x86_64.AppImage`, built as 1.0.5's were. A device added by UID now also connects directly on the local network, as the official app does. Add device lists the devices it finds on the network, and a Diagnostic Log writes a file to attach to a report.

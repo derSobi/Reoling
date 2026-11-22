@@ -33,7 +33,7 @@ pub struct Handlers {
     pub on_select: Box<dyn Fn(&str)>,
     /// Click on one of its channels.
     pub on_channel: ChannelHandler,
-    /// "Device settings…" in the card's menu (an NVR or Home Hub).
+    /// "Device settings…" in the card's menu.
     pub on_settings: Box<dyn Fn(&str)>,
     pub on_relogin: Box<dyn Fn(&str)>,
     pub on_remove: Box<dyn Fn(&str)>,
@@ -47,7 +47,7 @@ struct Card {
     dot: Label,
     status: Label,
     /// The menu's "Device settings…" entry, sensitive only while the
-    /// device is a connected NVR or Home Hub.
+    /// device is connected.
     settings: Button,
     /// The menu's "Try other live view requests…" entry: shown while the
     /// diagnostic log is on, sensitive after the device refused live view.
@@ -188,7 +188,7 @@ impl Sidebar {
         ));
         settings.add_css_class("flat");
         settings.set_sensitive(false);
-        settings.set_tooltip_text(Some("The settings of a connected NVR or Home Hub"));
+        settings.set_tooltip_text(Some("The settings of a connected device"));
         relogin.add_css_class("flat");
         remove.add_css_class("flat");
         menu_box.append(&settings);
@@ -317,7 +317,7 @@ impl Sidebar {
     }
 
     /// Whether the card's menu offers the device's own settings (a
-    /// connected NVR or Home Hub).
+    /// connected device).
     pub fn set_settings_available(&self, key: &str, available: bool) {
         if let Some(card) = self.cards.borrow().get(key) {
             card.settings.set_sensitive(available);

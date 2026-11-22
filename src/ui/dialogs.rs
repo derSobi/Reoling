@@ -375,6 +375,101 @@ pub fn add_device(parent: &Window, added: Vec<String>, on_add: impl Fn(ConnectTa
     window.present();
 }
 
+/// What the dialog asks before a device is removed; a device that has no name yet is "this device".
+fn remove_question(name: &str) -> String {
+    match name.trim() {
+        "" => "Remove this device?".to_string(),
+        name => format!("Remove “{name}”?"),
+    }
+}
+
+/// Asks before a device is removed: `on_remove` runs only on "Remove". Cancel is the default button, so Enter
+/// alone removes nothing.
+pub fn confirm_remove(parent: &Window, device_name: &str, on_remove: impl Fn() + 'static) {
+    let (window, content) = dialog(Some(parent), "Remove device", DIALOG_WIDTH);
+    let heading = Label::new(Some(&remove_question(device_name)));
+    heading.add_css_class("title-3");
+    heading.set_halign(gtk4::Align::Start);
+    heading.set_wrap(true);
+    heading.set_xalign(0.0);
+    content.append(&heading);
+    let consequence = Label::new(Some(
+        "Reoling forgets this device and its saved password. Recordings and snapshots on this computer are kept.",
+    ));
+    consequence.set_wrap(true);
+    consequence.set_xalign(0.0);
+    content.append(&consequence);
+
+    let cancel = Button::with_label("Cancel");
+    let remove = Button::with_label("Remove");
+    content.append(&button_row(&cancel, &remove));
+    // Removing cannot be undone: marked as the theme marks a destructive action, and never the default.
+    remove.remove_css_class("suggested-action");
+    remove.add_css_class("destructive-action");
+    window.set_default_widget(Some(&cancel));
+
+    let w = window.clone();
+    cancel.connect_clicked(move |_| w.close());
+    let w = window.clone();
+    remove.connect_clicked(move |_| {
+        on_remove();
+        w.close();
+    });
+    window.present();
+    cancel.grab_focus();
+}
+
+/// What the warning says when the only answer on the local network came from another address than the saved one.
+fn lan_answer_held_question(name: &str) -> String {
+    let device = match name.trim() {
+        "" => "this device".to_string(),
+        name => format!("“{name}”"),
+    };
+    format!(
+        "A device answered on the local network for {device}, but from a different address than the one saved for it."
+    )
+}
+
+/// Warns that the device could not be reached and that the answer on the local network came from another address
+/// than the saved one. `on_continue` runs only on "Continue"; "Disconnect" is the default button and what closing
+/// the window does, and leaves the device not connected. No address is shown.
+pub fn warn_lan_answer_held(parent: &Window, device_name: &str, on_continue: impl Fn() + 'static) {
+    let (window, content) = dialog(Some(parent), "Different address", DIALOG_WIDTH);
+    let heading = Label::new(Some(&lan_answer_held_question(device_name)));
+    heading.add_css_class("title-3");
+    heading.set_halign(gtk4::Align::Start);
+    heading.set_wrap(true);
+    heading.set_xalign(0.0);
+    content.append(&heading);
+    let consequence = Label::new(Some(
+        "Continue only if its address may have changed, for example after a change at the router. Reoling then \
+         forgets the saved address and connects again.",
+    ));
+    consequence.set_wrap(true);
+    consequence.set_xalign(0.0);
+    content.append(&consequence);
+
+    let disconnect = Button::with_label("Disconnect");
+    let go_on = Button::with_label("Continue");
+    content.append(&button_row(&disconnect, &go_on));
+    // Continuing sends the login to that host: never the default. The safe answer is the one marked as the
+    // suggested action, and the focus ring shows from the start, so that Enter's effect can be seen.
+    go_on.remove_css_class("suggested-action");
+    disconnect.add_css_class("suggested-action");
+    window.set_default_widget(Some(&disconnect));
+    window.set_focus_visible(true);
+
+    let w = window.clone();
+    disconnect.connect_clicked(move |_| w.close());
+    let w = window.clone();
+    go_on.connect_clicked(move |_| {
+        on_continue();
+        w.close();
+    });
+    window.present();
+    disconnect.grab_focus();
+}
+
 /// The device's login: username, password (with a reveal toggle) and whether
 /// to keep the password in the keyring. `on_login(username, password, remember)`.
 pub fn login(
@@ -425,6 +520,23 @@ pub fn login(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_warning_about_another_address_names_the_device_and_no_address() {
+        assert_eq!(
+            lan_answer_held_question("Garden"),
+            "A device answered on the local network for “Garden”, but from a different address than the one saved for \
+             it."
+        );
+        assert!(lan_answer_held_question(" ").contains("for this device,"));
+    }
+
+    #[test]
+    fn the_question_before_a_removal_names_the_device() {
+        assert_eq!(remove_question("Garden"), "Remove “Garden”?");
+        assert_eq!(remove_question("  "), "Remove this device?");
+        assert_eq!(remove_question(""), "Remove this device?");
+    }
 
     #[test]
     fn a_found_device_is_titled_by_its_model_and_says_when_it_is_added_already() {

@@ -20,7 +20,7 @@ pub mod encoding;
 pub mod diag;
 
 pub use protocol::{Error, LoginRefusal, Result};
-pub use client::{looks_multi_channel, ChannelAbilities, ChannelInfo, DeviceIdentity, DeviceUpdate, DeviceInfoSummary, MonitorPoint, PtzPreset, ReolinkClient, StreamProfile, VideoFrame, VideoType};
+pub use client::{looks_multi_channel, ChannelAbilities, ChannelInfo, DeviceCheck, DeviceIdentity, RaceResult, DeviceUpdate, DeviceInfoSummary, MonitorPoint, PtzPreset, ReolinkClient, StreamProfile, VideoFrame, VideoType};
 pub use client::{PreviewForm, TrialEnd, TrialForm, TrialGate};
 pub use client::{
     file_for_time, next_file, sort_and_dedup_files, DownloadCancel, DownloadProgress, DownloadStream, DownloadSummary,

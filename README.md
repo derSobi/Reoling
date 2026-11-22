@@ -19,7 +19,7 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink. "Reolink" 
 
 ## Status
 
-Version **1.0.6**, with installable packages since 1.0.0 (see [Installation](#installation)). Login, live video, PTZ, the camera and device settings pages, and playback with sound, events and downloads work end to end on a real Home Hub, two NVRs, their cameras and two cameras on their own. A device added by UID is reached over whichever path logs in first: directly on the local network (TCP or UDP), or over P2P (local, NAT-mapped or relay address).
+Version **1.0.7**, with installable packages since 1.0.0 (see [Installation](#installation)). Login, live video, PTZ, the camera and device settings pages, and playback with sound, events and downloads work end to end on a real Home Hub, two NVRs, their cameras and two cameras on their own. A device added by UID is reached over whichever path logs in first: directly on the local network (TCP or UDP), at the address saved for it, or over P2P (local, NAT-mapped or relay address). Before a path is used, the device has to report the UID it was added with.
 
 **What the app does today**
 
@@ -35,7 +35,7 @@ Version **1.0.6**, with installable packages since 1.0.0 (see [Installation](#in
 - Monitor Point (a home position with Auto Return) and Preset Points, with pictures; go to, add, edit and delete the presets.
 - Camera settings: main and sub stream Encoding (resolution, frame rate, bitrate, I-frame interval) can be changed; the other tabs are shown.
 - Save and Revert on a Home Hub's cameras for a few Display, Image and Light & sound rows (E1 Outdoor PoE) and noise reduction (RLC-1224A).
-- Device settings of a Home Hub or NVR, read-only: info, storage, network, time, sound or alerts, users and maintenance.
+- Device settings of a Home Hub, an NVR or a camera on its own, read-only: info, storage, network, time, sound or alerts (Home Hub and NVR), users and maintenance.
 - Snapshot (PNG in `~/Pictures/Reoling`) and recording (MKV in `~/Videos/Reoling`, where downloads go too).
 - Client Settings: run at startup, the theme (Auto, Light or Dark), Auto Live View, Stretch Mode, System Status, snapshot and recording folders.
 - Decoding: Auto tries the integrated GPU first (or the dedicated one), then software; Hardware or Software can be set instead.
@@ -53,7 +53,7 @@ Each of these in full: [docs/FEATURES.md](docs/FEATURES.md).
 
 **Version history**
 
-- 1.0.6 — a device added by UID also connects directly on the local network (TCP or UDP), whichever path logs in first, and a refused P2P registration no longer stops it. Add device lists the devices found on the network, and a camera on its own offers its third stream. A Diagnostic Log (Settings, or `--diagnostics`) writes a masked connection and video log to attach to an issue.
+- 1.0.7 — after a login the device has to report the UID it was added with before the connection is used. Reoling remembers where a device is on the network and tries that address directly at every start, so a device behind a VPN connects without the relay; on the local network the login then goes only to that address, and a warning asks when another address answers and nothing else connects. "Device settings…" is offered for a camera on its own, and "Remove device" asks first.
 
 The full history, with the date of every version, is in [CHANGELOG.md](CHANGELOG.md).
 

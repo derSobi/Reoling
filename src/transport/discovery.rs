@@ -972,7 +972,17 @@ pub const LAN_DISCOVERY: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr:
 /// the device's LAN address and its id for a session-less direct session.
 /// `D2C_C_R` names no UID: the answer proves only that a host on our LAN
 /// answered for it.
-pub async fn lan_connect(socket: &UdpSocket, uid: &str, to: SocketAddr) -> crate::Result<PeerHandle> {
+///
+/// With `only_from`, an answer from any other address is not taken: that
+/// host is told at once that its session ends, `held_back` is set, and the
+/// wait goes on for the answer from that address.
+pub async fn lan_connect(
+    socket: &UdpSocket,
+    uid: &str,
+    to: SocketAddr,
+    only_from: Option<std::net::IpAddr>,
+    held_back: &std::sync::atomic::AtomicBool,
+) -> crate::Result<PeerHandle> {
     let client_id = rand::random::<i32>().abs().max(1);
     let request = write_bcudp(&BcUdp::Discovery(UdpDiscovery {
         tid: rand::random::<u32>().max(1),
@@ -1002,14 +1012,26 @@ pub async fn lan_connect(socket: &UdpSocket, uid: &str, to: SocketAddr) -> crate
             ignored += 1;
             return None;
         }
-        Some(Ok(PeerHandle {
+        let peer = PeerHandle {
             addr: from,
             local_connection_id: client_id,
             remote_connection_id: reply.did,
             // The legacy nonce exchange gives it at login.
             nonce: None,
             is_direct: true,
-        }))
+        };
+        if only_from.is_some_and(|ip| ip != from.ip()) {
+            // Said without waiting, so that it is said even when the race ends before this search does.
+            let (cid, did) = (peer.local_connection_id, peer.remote_connection_id);
+            let end = UdpXml::C2dDisc(crate::protocol::bcudp::xml::C2dDisc { cid, did });
+            let end = BcUdp::Discovery(UdpDiscovery { tid: rand::random::<u32>().max(1), payload: end });
+            let _ = socket.try_send_to(&write_bcudp(&end), from);
+            if !held_back.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                race_note(format_args!("a LAN answer from another address than the saved one was held back"));
+            }
+            return None;
+        }
+        Some(Ok(peer))
     })
     .await;
     race_note(format_args!(
@@ -1611,9 +1633,40 @@ mod tests {
             assert_eq!(fields, ("9527000EXAMPLE01", client_port, 1350, 0, "WIN", 3));
             send_d2c_c_r(&device, from, 0, again.cid, 7).await;
         });
-        let peer = lan_connect(&client, "9527000EXAMPLE01", device_addr).await.unwrap();
+        let peer = lan_connect(&client, "9527000EXAMPLE01", device_addr, None, &Default::default()).await.unwrap();
         assert_eq!((peer.addr, peer.remote_connection_id, peer.nonce, peer.is_direct), (device_addr, 7, None, true));
         fake.await.unwrap();
+    }
+
+    /// With an address to go by, a host that answers from another one is told that its session ends, and the
+    /// caller is told at once, while the wait for the right answer goes on.
+    #[tokio::test]
+    async fn lan_connect_holds_back_an_answer_from_another_address_and_says_goodbye() {
+        let device = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let device_addr = device.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fake = tokio::spawn(async move {
+            let (request, _, from) = lan_request(&device).await;
+            send_d2c_c_r(&device, from, 0, request.cid, 7).await;
+            let mut buf = [0u8; 2048];
+            loop {
+                let (n, _) = device.recv_from(&mut buf).await.unwrap();
+                let Ok(Some((BcUdp::Discovery(disc), _))) = read_bcudp(&buf[..n]) else { continue };
+                if let UdpXml::C2dDisc(end) = disc.payload {
+                    return (end.cid == request.cid, end.did);
+                }
+            }
+        });
+        let held_back = std::sync::atomic::AtomicBool::new(false);
+        let elsewhere = Some("127.0.0.9".parse().unwrap());
+        let asking = lan_connect(&client, "9527000EXAMPLE01", device_addr, elsewhere, &held_back);
+        tokio::pin!(asking);
+        let goodbye = tokio::select! {
+            goodbye = tokio::time::timeout(Duration::from_secs(2), fake) => goodbye.expect("no goodbye").unwrap(),
+            _ = &mut asking => panic!("the wait for the saved address's answer ended"),
+        };
+        assert_eq!(goodbye, (true, 7));
+        assert!(held_back.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[tokio::test]
@@ -1627,7 +1680,7 @@ mod tests {
             send_d2c_c_r(&device, from, -1, request.cid, 2).await;
             send_d2c_c_r(&device, from, 0, request.cid, 3).await;
         });
-        let peer = lan_connect(&client, "9527000EXAMPLE01", device_addr).await.unwrap();
+        let peer = lan_connect(&client, "9527000EXAMPLE01", device_addr, None, &Default::default()).await.unwrap();
         assert_eq!(peer.remote_connection_id, 3);
         fake.await.unwrap();
     }

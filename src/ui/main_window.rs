@@ -687,7 +687,7 @@ pub struct MainWindow {
     remote: Rc<RemoteControl>,
     camera_settings_button: Button,
     camera_settings: Rc<CameraSettings>,
-    /// The read-only settings of an NVR or Home Hub itself.
+    /// The read-only settings of a device itself.
     device_settings: Rc<DeviceSettings>,
     talk: ToggleButton,
     updating_talk: Cell<bool>,
@@ -736,6 +736,10 @@ pub struct MainWindow {
     snap_purpose: RefCell<Option<SnapPurpose>>,
     /// The devices that have logged in on their current link.
     connected: RefCell<HashSet<String>>,
+    /// The devices already warned in this run that an answer came from another address than the saved one, and
+    /// those whose warning waits for the lost connection to be put away (`DeviceEvent::LanAnswerHeld`).
+    lan_warned: RefCell<HashSet<String>>,
+    lan_warning_due: RefCell<HashSet<String>>,
     /// The trials, and the refusal that offers one (see `Trials`).
     trials: RefCell<Trials>,
     /// The stream a trial got the watched device to play on a channel: (device, channel, stream). Kept until another
@@ -836,7 +840,7 @@ pub fn build(app: &Application) -> Rc<MainWindow> {
             }),
             on_settings: Box::new(with_key(MainWindow::open_device_settings)),
             on_relogin: Box::new(with_key(MainWindow::relogin)),
-            on_remove: Box::new(with_key(MainWindow::remove)),
+            on_remove: Box::new(with_key(MainWindow::ask_remove)),
             on_trial: Box::new(with_key(MainWindow::start_trial)),
         });
 
@@ -1103,7 +1107,7 @@ pub fn build(app: &Application) -> Rc<MainWindow> {
                 w_write.upgrade().is_some_and(|m| m.write_camera_page(key, channel, page, group, writes))
             }),
         });
-        // An NVR's or Hub's own settings, opened from its sidebar card.
+        // A device's own settings, opened from its sidebar card.
         let w_device_page = weak.clone();
         let device_settings = DeviceSettings::new(device_settings::Handlers {
             on_read_page: Box::new(move |key, page| w_device_page.upgrade().is_some_and(|m| m.read_device_page(key, page))),
@@ -1477,6 +1481,8 @@ pub fn build(app: &Application) -> Rc<MainWindow> {
             preset_queue_generation: Cell::new(0),
             snap_purpose: RefCell::new(None),
             connected: RefCell::new(HashSet::new()),
+            lan_warned: RefCell::new(HashSet::new()),
+            lan_warning_due: RefCell::new(HashSet::new()),
             trials: RefCell::new(Trials::default()),
             trial_stream: RefCell::new(None),
             carried: RefCell::new(HashMap::new()),
@@ -1993,8 +1999,8 @@ impl MainWindow {
         true
     }
 
-    /// "Device settings…" on a sidebar card: the NVR's or Hub's own
-    /// settings window.
+    /// "Device settings…" on a sidebar card: the device's own settings
+    /// window (an NVR, a Home Hub or a camera on its own).
     fn open_device_settings(self: &Rc<Self>, key: &str) {
         if !self.connected.borrow().contains(key) || !self.links.borrow().contains_key(key) {
             return;
@@ -2009,10 +2015,11 @@ impl MainWindow {
         self.device_settings.open(key, &device.name, &device.model, DeviceKind::from_model(&device.model), uid_hint.as_deref());
     }
 
-    /// Whether the card's menu offers the device's own settings: a
-    /// connected NVR or Home Hub.
+    /// Whether the card's menu offers the device's own settings: any
+    /// connected device. A camera on its own answers the same device pages
+    /// as an NVR or Home Hub, less the tabs `device_settings::has_tab` hides.
     fn refresh_settings_entry(&self, key: &str) {
-        let available = self.connected.borrow().contains(key) && self.device(key).is_some_and(|d| d.multi_channel);
+        let available = self.connected.borrow().contains(key) && self.device(key).is_some();
         self.sidebar.set_settings_available(key, available);
     }
 
@@ -2564,10 +2571,19 @@ impl MainWindow {
             let legacy_cipher = this.trials.borrow_mut().arm(&key);
             let trial_epoch = this.trials.borrow_mut().epoch(&key);
             let carried = this.wired(|w| w.take_carried(&key));
+            let network = reoling::transport::lan_search::current_network();
+            let saved = device.saved_address_for(network);
+            if device.lan_ip.is_some() && saved.is_none() {
+                let unused = "NEGOTIATION device: the saved address is not used on this network";
+                reoling::diag::masked(format_args!("{unused}"));
+            }
             let link = spawn_device(
                 device.target.clone(),
                 username,
                 password,
+                saved,
+                device.lan_rejected,
+                device.learns_address_on(network),
                 this.sink_request_tx.clone(),
                 this.replay_sink_request_tx.clone(),
                 Arc::clone(&this.audio),
@@ -2918,6 +2934,19 @@ impl MainWindow {
                     self.device_settings.lost("Incorrect password");
                 }
             }
+            DeviceEvent::LanAddress { ip, network, confirmed } => {
+                // Dropped when the device was removed meanwhile.
+                if let Some(d) = self.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
+                    d.learn_address(ip, network, confirmed);
+                }
+                self.persist();
+            }
+            // Once per device and run; shown when the lost connection has been put away (below).
+            DeviceEvent::LanAnswerHeld => {
+                if self.lan_warned.borrow_mut().insert(key.to_string()) {
+                    self.lan_warning_due.borrow_mut().insert(key.to_string());
+                }
+            }
             DeviceEvent::Lost(reason) => {
                 // A trial on this link (one whose last forms were queued too) ends here; its link said nothing.
                 if self.trials.borrow_mut().end(key) == Some(Phase::OnLink) {
@@ -2932,6 +2961,9 @@ impl MainWindow {
                 self.refresh_settings_entry(key);
                 if self.device_settings.is_open_for(key) {
                     self.device_settings.lost(&reason);
+                }
+                if self.lan_warning_due.borrow_mut().remove(key) {
+                    self.warn_lan_answer_held(key);
                 }
             }
             DeviceEvent::Playback(event) => self.playback.on_event(key, event),
@@ -3163,6 +3195,28 @@ impl MainWindow {
         let Some(index) = ids.iter().position(|c| *c == device.channel) else { return };
         let next = (index as i32 + delta).rem_euclid(ids.len() as i32) as usize;
         self.pick_channel(&key, ids[next]);
+    }
+
+    /// The warning for a device that could not be reached while a host answered for it on the local network from
+    /// another address than the saved one. "Continue" forgets what was saved and connects again, by the rules
+    /// of a first connection; "Disconnect" leaves the device as it is, not connected.
+    fn warn_lan_answer_held(self: &Rc<Self>, key: &str) {
+        let name = self.device(key).map(|d| d.name).unwrap_or_default();
+        let (this, key) = (Rc::clone(self), key.to_string());
+        dialogs::warn_lan_answer_held(self.window.upcast_ref(), &name, move || {
+            if let Some(d) = this.devices.borrow_mut().iter_mut().find(|d| d.key == key) {
+                d.forget_address();
+            }
+            this.persist();
+            this.connect(&key, false);
+        });
+    }
+
+    /// "Remove device" in a card's menu: asks first, since the device and its saved password go at once.
+    fn ask_remove(self: &Rc<Self>, key: &str) {
+        let name = self.device(key).map(|d| d.name).unwrap_or_default();
+        let (this, key) = (Rc::clone(self), key.to_string());
+        dialogs::confirm_remove(self.window.upcast_ref(), &name, move || this.remove(&key));
     }
 
     fn remove(self: &Rc<Self>, key: &str) {

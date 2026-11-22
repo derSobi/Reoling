@@ -18,6 +18,12 @@ pub use crate::ui::playback_driver::{FileSpan, PlaybackEvent, PlayerPhase, Playe
 pub enum DeviceEvent {
     /// Logged in; carries the device's own name and model.
     Connected(DeviceIdentity),
+    /// The address a device added by UID reports for itself, on the network this machine is on (`network`).
+    /// `confirmed`: a connection to that address reported the device's UID; otherwise something else is there.
+    LanAddress { ip: std::net::Ipv4Addr, network: std::net::Ipv4Addr, confirmed: bool },
+    /// The connection failed, and an answer on the local network from another address than the saved one got
+    /// no login. Sent before `Lost`.
+    LanAnswerHeld,
     /// The device (NVR / Home Hub) described its channels.
     Channels(Vec<ChannelInfo>),
     /// The device's answer to a siren or spotlight command (`code` 200 is
@@ -740,6 +746,19 @@ fn error_kind(e: &reoling::Error) -> &'static str {
         Error::Io(_) => "network or socket error",
         Error::Xml(_) => "unreadable XML reply",
         Error::AddrParse(_) => "invalid IP address",
+        Error::DeviceNotConfirmed { other_device: true } => "other device",
+        Error::DeviceNotConfirmed { other_device: false } => "unconfirmed",
+    }
+}
+
+/// What the card says after a failed connection. A device that logged in but gave no answer to the device check
+/// (`ReolinkClient::check_uid`) can still be reached when it is added by its address, which is not checked.
+fn lost_reason(e: &reoling::Error) -> String {
+    match e {
+        reoling::Error::DeviceNotConfirmed { other_device: false } => {
+            format!("{e}. If this keeps happening, add it by its address.")
+        }
+        _ => e.to_string(),
     }
 }
 
@@ -781,6 +800,9 @@ pub fn spawn_device(
     target: ConnectTarget,
     username: String,
     password: String,
+    saved: Option<std::net::Ipv4Addr>,
+    rejected: Option<std::net::Ipv4Addr>,
+    learn_address: bool,
     sink_request_tx: tokio::sync::mpsc::Sender<SinkRequest>,
     replay_sink_request_tx: tokio::sync::mpsc::Sender<ReplaySinkRequest>,
     audio_out: std::sync::Arc<crate::ui::audio::AudioOutput>,
@@ -805,10 +827,19 @@ pub fn spawn_device(
             // lines carry it; one added by UID is numbered in its race.
             let attempt = matches!(target, ConnectTarget::Ip { .. }).then(ReolinkClient::reserve_debug_id);
             let tag = attempt.map_or(String::new(), |id| format!("[conn {id}] "));
+            // Diagnostic-only (`REOLING_PROBE_UID`): the UID to ask a device added by UID for, right after its login.
+            let probe_uid = match &target {
+                ConnectTarget::Uid(uid) if std::env::var("REOLING_PROBE_UID").is_ok() => Some(uid.clone()),
+                _ => None,
+            };
             // A UID device races its paths and comes back logged in; one added by IP logs in below.
+            // For a device added by UID: its UID, and what its race said beside the client.
+            let mut raced = None;
             let connect_result = match target {
                 ConnectTarget::Uid(uid) => {
-                    ReolinkClient::connect_and_login_by_uid(&uid, &username, &password).await.map(|c| (c, true))
+                    let race = ReolinkClient::connect_and_login_by_uid(&uid, &username, &password, saved).await;
+                    raced = Some((uid, race.held_back, race.won_by_address));
+                    race.client.map(|c| (c, true))
                 }
                 ConnectTarget::Ip { addr, port } => {
                     let id = attempt.unwrap_or_else(ReolinkClient::reserve_debug_id);
@@ -836,7 +867,10 @@ pub fn spawn_device(
                     reoling::diag::always_under(&tag, failed);
                     reoling::diag::masked(format_args!("{tag}NEGOTIATION device: connect failed: {}", error_kind(&e)));
                     trial_failed();
-                    let _ = tx.send(DeviceEvent::Lost(e.to_string())).await;
+                    if raced.as_ref().is_some_and(|(_, held_back, _)| *held_back) {
+                        let _ = tx.send(DeviceEvent::LanAnswerHeld).await;
+                    }
+                    let _ = tx.send(DeviceEvent::Lost(lost_reason(&e))).await;
                     return;
                 }
             };
@@ -868,7 +902,27 @@ pub fn spawn_device(
             let channel_updates =
                 client.take_channel_updates().expect("taken once per client");
             let audio = client.take_audio().expect("taken once per client");
+            // The device check as the first request after login; the line names the outcome, never a UID.
+            let mut uid_probe = None;
+            if let Some(uid) = &probe_uid {
+                let started = std::time::Instant::now();
+                let said = match client.check_uid(uid, std::time::Duration::from_secs(5)).await {
+                    reoling::DeviceCheck::Checked => "checked",
+                    reoling::DeviceCheck::OtherDevice => "other device",
+                    reoling::DeviceCheck::NoAnswer => "no answer",
+                    reoling::DeviceCheck::Lost => "connection lost",
+                };
+                uid_probe = Some((said, started.elapsed()));
+            }
             let identity = client.identity().await;
+            if let Some((said, took)) = uid_probe {
+                let model = identity.model.as_deref().map(str::trim).filter(|m| !m.is_empty()).unwrap_or("device");
+                eprintln!("PROBE uid [{model}]: {said} in {took:.0?} on [conn {}]", client.debug_id());
+                // Whether the device says where it is on its network; never the address.
+                let reported = client.lan_address(std::time::Duration::from_secs(1)).await.is_some();
+                let said = if reported { "reported" } else { "not reported" };
+                eprintln!("PROBE uid [{model}]: network address {said}");
+            }
             if std::env::var("REOLING_PROBE_PUSH").is_ok() {
                 client.probe_pushes(&username).await;
             }
@@ -884,6 +938,34 @@ pub fn spawn_device(
             }
             let _ = tx.send(DeviceEvent::Connected(identity)).await;
             let _ = tx.send(DeviceEvent::EncodeProfiles(client.encode_profiles())).await;
+            // Where the device is on its network, for the next start (a read; see `DeviceEvent::LanAddress`). Only
+            // with a network to tie the address to, and not for an address already saved or rejected.
+            let network = reoling::transport::lan_search::current_network().filter(|_| learn_address);
+            if let (Some((uid, _, won_by)), Some(network)) = (raced, network) {
+                let reported = client.lan_address(std::time::Duration::from_secs(1)).await;
+                let said = if reported.is_some() { "network address reported" } else { "no network address reported" };
+                reoling::diag::masked(format_args!("NEGOTIATION device: {said}"));
+                if let Some(ip) = reported.filter(|ip| Some(*ip) != saved) {
+                    let learned = move |confirmed: bool| {
+                        let said = if confirmed { "confirmed and saved" } else { "rejected" };
+                        reoling::diag::masked(format_args!("NEGOTIATION device: reported address {said}"));
+                        DeviceEvent::LanAddress { ip, network, confirmed }
+                    };
+                    if won_by == Some(std::net::IpAddr::V4(ip)) {
+                        // The connection in use is to that address and the device there said who it is: that
+                        // holds even for an address rejected earlier.
+                        let _ = tx.send(learned(true)).await;
+                    } else if Some(ip) != rejected {
+                        // Not the connection in use: one of its own to that address says whether the device is
+                        // there, without holding this one up.
+                        let (tx, username, password) = (tx.clone(), username.clone(), password.clone());
+                        tokio::spawn(reoling::diag::with_device(async move {
+                            let confirmed = ReolinkClient::confirm_address(ip, &uid, &username, &password).await;
+                            let _ = tx.send(learned(confirmed)).await;
+                        }));
+                    }
+                }
+            }
 
             serve(
                 client,
@@ -2072,6 +2154,18 @@ pub(crate) mod tests {
         assert_eq!(heard(&events), [format!("PlayFailed {CHANNEL}: {}", super::NO_FORM_ACCEPTED)]);
     }
 
+    #[test]
+    fn a_device_that_did_not_confirm_its_uid_gets_the_hint_to_add_it_by_address() {
+        let unconfirmed = super::lost_reason(&reoling::Error::DeviceNotConfirmed { other_device: false });
+        assert_eq!(unconfirmed, "the device did not confirm its UID. If this keeps happening, add it by its address.");
+        let other = super::lost_reason(&reoling::Error::DeviceNotConfirmed { other_device: true });
+        assert_eq!(other, "another device answered for this UID");
+        assert_eq!(super::lost_reason(&reoling::Error::ConnectionLost), "connection lost");
+        // Neither is a refused login, so neither reaches the path that forgets the saved password.
+        assert_eq!(super::error_kind(&reoling::Error::DeviceNotConfirmed { other_device: true }), "other device");
+        assert_eq!(super::error_kind(&reoling::Error::DeviceNotConfirmed { other_device: false }), "unconfirmed");
+    }
+
     /// The connection made for a trial's legacy cipher step fails: the log
     /// says the trial ended; an ordinary connection's failure says nothing
     /// of a trial.
@@ -2092,6 +2186,9 @@ pub(crate) mod tests {
                 target,
                 "user".to_string(),
                 "secret".to_string(),
+                None,
+                None,
+                false,
                 requests,
                 replay_requests,
                 Arc::new(AudioOutput::new(1.0)),

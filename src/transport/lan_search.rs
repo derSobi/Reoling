@@ -87,6 +87,39 @@ fn broadcast_addresses(route_table: &str) -> Vec<Ipv4Addr> {
     found
 }
 
+/// What tells one network from another for a saved device address: the broadcast address of the network the
+/// default route leaves through, from the kernel's route table. Networks on other interfaces (a bridge for
+/// virtual machines, a tunnel) are the same wherever the machine is and say nothing. `None` without a default
+/// route, or when its interface has no network that holds the gateway.
+fn default_network(route_table: &str) -> Option<Ipv4Addr> {
+    // Iface, Destination, Gateway, Flags, RefCnt, Use, Metric, Mask (numbers as in `broadcast_addresses`).
+    let rows: Vec<Vec<&str>> = route_table.lines().map(|line| line.split_whitespace().collect()).collect();
+    let number = |row: &[&str], at: usize| row.get(at).and_then(|text| u32::from_str_radix(text, 16).ok());
+    let (up, has_gateway) = (0x1, 0x2);
+    let default = rows
+        .iter()
+        .filter(|row| {
+            let flags = number(row, 3).unwrap_or(0);
+            number(row, 1) == Some(0) && number(row, 7) == Some(0) && flags & up != 0 && flags & has_gateway != 0
+        })
+        .min_by_key(|row| row.get(6).and_then(|metric| metric.parse::<u32>().ok()).unwrap_or(u32::MAX))?;
+    let gateway = number(default, 2)?;
+    rows.iter().find_map(|row| {
+        let (destination, mask, flags) = (number(row, 1)?, number(row, 7)?, number(row, 3)?);
+        let same_interface = row[0] == default[0] && number(row, 2) == Some(0);
+        let on_link = same_interface && flags & up != 0 && mask != 0 && mask != u32::MAX;
+        (on_link && gateway & mask == destination).then(|| {
+            let (destination, mask) = (destination.to_le_bytes(), mask.to_le_bytes());
+            Ipv4Addr::from([0, 1, 2, 3].map(|i| destination[i] | !mask[i]))
+        })
+    })
+}
+
+/// `default_network` of this machine now.
+pub fn current_network() -> Option<Ipv4Addr> {
+    default_network(&std::fs::read_to_string("/proc/net/route").unwrap_or_default())
+}
+
 /// Searches until `event` returns false: asks every `ASK_EVERY`, calls `event(Some(device))` once for each
 /// device that answers, up to `MAX_FOUND` of them, and `event(None)` about every `TICK` in between. Fails when
 /// the port the devices answer to stays taken for `PORT_WAIT`, as it does while the official app runs on the
@@ -148,6 +181,28 @@ fn search_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HEADER: &str = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n";
+
+    #[test]
+    fn the_network_of_the_default_route_tells_networks_apart() {
+        // 192.0.2.0/24 on eth0 with the gateway 192.0.2.1; a bridge and a tunnel beside it.
+        let eth = "eth0\t00000000\t010200C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+                   eth0\t000200C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n";
+        let others = "virbr0\t007AA8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n\
+                      tun0\t0000000A\t00000000\t0001\t0\t0\t0\t000000FF\t0\t0\t0\n";
+        let here = Some(Ipv4Addr::new(192, 0, 2, 255));
+        assert_eq!(default_network(&format!("{HEADER}{eth}")), here);
+        assert_eq!(default_network(&format!("{HEADER}{others}{eth}")), here, "other interfaces do not count");
+        assert_eq!(default_network(&format!("{HEADER}{others}")), None, "no default route");
+        let only_default = "eth0\t00000000\t010200C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n";
+        assert_eq!(default_network(&format!("{HEADER}{only_default}")), None, "no network that holds the gateway");
+        assert_eq!(default_network(""), None);
+        // Two default routes: the one with the lower metric says which network this is.
+        let wifi = "wlan0\t00000000\t016433C6\t0003\t0\t0\t600\t00000000\t0\t0\t0\n\
+                    wlan0\t006433C6\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n";
+        assert_eq!(default_network(&format!("{HEADER}{wifi}{eth}")), here);
+    }
 
     /// An answer laid out as the two of our captures are, with made-up values.
     fn answer(model: &str, uid: &str) -> Vec<u8> {

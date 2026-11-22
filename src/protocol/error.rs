@@ -12,6 +12,11 @@ pub enum Error {
     #[error("login failed, camera returned response code {code}")]
     LoginFailed { code: u16 },
 
+    /// A path of the UID race logged in, but the device did not report the UID asked for (`ReolinkClient::check_uid`).
+    /// Not a refusal of the password.
+    #[error("{}", not_confirmed(*.other_device))]
+    DeviceNotConfirmed { other_device: bool },
+
     #[error("protocol error: {0}")]
     ProtocolError(String),
 
@@ -185,5 +190,14 @@ mod tests {
             text(StreamProfile::Extern, 0xffff),
             "The camera refused the extern stream (code 65535). Try the main or the sub stream in the stream selector."
         );
+    }
+}
+
+/// The text of `Error::DeviceNotConfirmed`.
+fn not_confirmed(other_device: bool) -> &'static str {
+    if other_device {
+        "another device answered for this UID"
+    } else {
+        "the device did not confirm its UID"
     }
 }

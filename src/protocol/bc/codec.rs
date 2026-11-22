@@ -1,7 +1,7 @@
 use crate::protocol::bc::header_codec::{read_header, wire_len, write_header};
 use crate::protocol::bc::model::{
     header_has_payload_offset, Bc, BcBody, BcHeader, BcMeta, LegacyMsg, ModernMsg, MSG_ID_COVER_PREVIEW,
-    MSG_ID_DOWNLOAD, MSG_ID_IMAGE_UPLOAD, MSG_ID_LOGIN, MSG_ID_REPLAY, MSG_ID_TALK_DATA,
+    MSG_ID_DOWNLOAD, MSG_ID_IMAGE_UPLOAD, MSG_ID_LOGIN, MSG_ID_REPLAY, MSG_ID_TALK_DATA, MSG_ID_UID,
 };
 use crate::protocol::bc::xml::Extension;
 use crate::protocol::crypto::EncryptionProtocol;
@@ -199,7 +199,11 @@ pub fn read_bc(
             // undecrypted bytes. Every other id (live video included) keeps
             // the per-msg_num rule.
             let per_message_binary = RECORDED_MEDIA_MSG_IDS.contains(&header.msg_id);
-            if let (false, Some(extension)) = (per_message_binary, &parsed_extension) {
+            // The UID reply is what tells which device answered: it is never binary. Its payload is decrypted in
+            // full whatever was stored for its number and whatever its own Extension says, so that a peer cannot
+            // have clear bytes read as the reply.
+            let never_binary = header.msg_id == MSG_ID_UID;
+            if let (false, false, Some(extension)) = (per_message_binary, never_binary, &parsed_extension) {
                 match extension.binary_data {
                     Some(1) => {
                         bin_mode.insert(header.msg_num);
@@ -210,7 +214,9 @@ pub fn read_bc(
                     _ => {}
                 }
             }
-            let is_binary = if per_message_binary {
+            let is_binary = if never_binary {
+                false
+            } else if per_message_binary {
                 parsed_extension.as_ref().is_some_and(|ext| ext.binary_data == Some(1))
             } else {
                 bin_mode.contains(&header.msg_num)
@@ -820,6 +826,30 @@ mod replay_framing_tests {
         };
         let (parsed, _) = read_bc(&write_bc(&push, &enc), &enc, &mut bin_mode).unwrap().unwrap();
         assert_eq!(payload_of(&parsed), xml.as_slice(), "the push is decrypted as usual");
+    }
+
+    #[test]
+    fn a_uid_reply_is_always_decrypted() {
+        let enc = aes();
+        let xml = b"<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<Uid version=\"1.1\">\n\
+                    <uid>9527000EXAMPLE01</uid>\n</Uid>\n</body>\n"
+            .to_vec();
+        // An earlier message marked the request's number binary: a reply sent in the clear under it must not be
+        // read as it stands, and an encrypted one is read as usual.
+        let mut bin_mode = HashSet::from([7u16]);
+        let clear = media_message(&enc, MSG_ID_UID, 0x0000, 200, 7, &[], &xml, 0);
+        let (parsed, _) = read_bc(&clear, &enc, &mut bin_mode).unwrap().unwrap();
+        assert_ne!(payload_of(&parsed), xml.as_slice(), "a clear UID reply is not accepted as it stands");
+        let encrypted = media_message(&enc, MSG_ID_UID, 0x0000, 200, 7, &[], &xml, xml.len());
+        let (parsed, _) = read_bc(&encrypted, &enc, &mut bin_mode).unwrap().unwrap();
+        assert_eq!(payload_of(&parsed), xml.as_slice());
+
+        // Its own Extension cannot declare it binary either, nor mark the number for later messages.
+        let mut bin_mode = HashSet::new();
+        let marked = media_message(&enc, MSG_ID_UID, 0x0000, 200, 9, &ext_xml("<binaryData>1</binaryData>\n"), &xml, 0);
+        let (parsed, _) = read_bc(&marked, &enc, &mut bin_mode).unwrap().unwrap();
+        assert_ne!(payload_of(&parsed), xml.as_slice());
+        assert!(bin_mode.is_empty());
     }
 
     #[test]

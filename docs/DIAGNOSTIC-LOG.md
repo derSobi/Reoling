@@ -1,6 +1,6 @@
 # The Diagnostic Log
 
-When a device does not connect, refuses live view or shows no picture, I usually cannot reproduce it: I only have my own devices. The Diagnostic Log lets Reoling write down what happened on your machine, in a file you can attach to an issue. It is available since Reoling 1.0.6.
+When a device does not connect, refuses live view or shows no picture, I usually cannot reproduce it: I only have my own devices. The Diagnostic Log lets Reoling write down what happened on your machine, in a file you can attach to an issue. It is available since Reoling 1.0.6; the lines about the device check and the saved address since 1.0.7.
 
 The log is off unless you turn it on, and it turns itself off when Reoling is closed.
 
@@ -19,7 +19,7 @@ reoling --diagnostics
 With an AppImage, add the option to the file you start:
 
 ```bash
-./Reoling-1.0.6-embed-x86_64.AppImage --diagnostics
+./Reoling-1.0.7-embed-x86_64.AppImage --diagnostics
 ```
 
 Started this way, the switch in the settings is on already. If Reoling is running, close it first: a second start only brings the running window to the front.
@@ -42,7 +42,8 @@ The file is `~/.local/state/reoling/reoling-diagnostic.log`, or `reoling/reoling
 
 Every line starts with the time in seconds since Reoling started. `[dev 2]` is the device's place in the device list, and `[conn 7]` or `[race 3]` number one connection or one connection attempt, so the lines that belong together can be found.
 
-- How each device connects: the paths tried (the P2P session, the local network), which one won, how long it took, and the reason when none did.
+- How each device connects: the paths tried (the P2P session, the local network, the address saved for the device), which one won, how long it took, and the reason when none did.
+- The device check: for each path, whether the device reported the UID it was added with ("checked"), another one, or gave no answer. Whether an answer on the local network was held back because it came from another address than the saved one, and whether an address the device reported was saved or rejected. The addresses themselves are not written.
 - The login: which steps were made and the device's answer code. Never the user name or the password.
 - What the device says about itself: its model, the streams it offers and what its cameras can do.
 - Live view: each request Reoling sent, and the device's answer code. During "Try other live view requests…", each form tried and its result.
@@ -54,6 +55,7 @@ A few lines from a camera that connects on the local network and shows its pictu
 ```text
 +0.238 [dev 4] NEGOTIATION device: added by UID
 +0.279 [dev 4] [race 1 +40 ms] NEGOTIATION race: a device answered the LAN discovery, its legs join the race: LanUdp, LanTcp
++0.353 [dev 4] [race 1 +114 ms] NEGOTIATION race: LanTcp checked
 +0.353 [dev 4] [race 1 +114 ms] NEGOTIATION race: won by LanTcp ([conn 7])
 +0.393 [dev 4] [conn 7 +39 ms] DEBUG identity model: RLC-520A
 +0.425 [dev 4] [conn 7 +71 ms] NEGOTIATION preview reply: response_code=200 class=0x0 msg_id=3 body_len=138

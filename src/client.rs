@@ -134,6 +134,20 @@ pub enum DeviceUpdate {
     SettingsWritten { target: SettingsTarget, group: u64, results: Vec<settings::WriteOutcome> },
 }
 
+/// What a device said when asked for its UID (`ReolinkClient::check_uid`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceCheck {
+    /// It reported the UID asked for.
+    Checked,
+    /// It reported another UID.
+    OtherDevice,
+    /// No reply in time, or one that names no UID: a refusal, no body, a body that is not valid under the session
+    /// key, an empty UID.
+    NoAnswer,
+    /// The connection failed while the reply was awaited.
+    Lost,
+}
+
 /// What the device says it is, as reported after login.
 #[derive(Debug, Clone, Default)]
 pub struct DeviceIdentity {
@@ -154,6 +168,9 @@ pub fn looks_multi_channel(name: &str, model: &str) -> bool {
 /// How long to wait for the device to describe itself before carrying on
 /// without: the name is a nicety, the video must not wait for it.
 const IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a leg of the UID race waits for the device's answer to the device check (`confirm_device`).
+const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long a login step waits for its reply in all, other messages read
 /// past included (see `ReolinkClient::recv_login_reply`): the connection's
@@ -268,6 +285,17 @@ enum LegKind {
     /// The device that answered the LAN discovery, over UDP or TCP.
     LanUdp,
     LanTcp,
+    /// TCP to the address saved for the device, from the start of the race.
+    SavedTcp,
+}
+
+/// What `connect_and_login_by_uid` found.
+pub struct RaceResult {
+    pub client: crate::Result<ReolinkClient>,
+    /// An answer to the LAN discovery came from another address than the saved one and got no login.
+    pub held_back: bool,
+    /// The winner's address, when the device there reported the UID asked for.
+    pub won_by_address: Option<std::net::IpAddr>,
 }
 
 /// What the LAN legs of one race know about their host's answer to the credentials. The two go to the same
@@ -333,7 +361,7 @@ const P2P_ATTEMPTS: u32 = 3;
 /// attempt, at most `unconfirmed` + `confirmed` of `P2P_ATTEMPT_TIMES` and its
 /// abandon, as the race's end starts no new one), so none that logs in is left
 /// without a logout. A P2P attempt still registering then is dropped.
-const LOSERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+const LOSERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Logs out of every leg that logs in after the race was won, until
 /// `LOSERS_TIMEOUT`; a leg still pending then is dropped.
@@ -441,6 +469,8 @@ pub struct ReolinkClient {
     /// Set on the two LAN legs of `connect_and_login_by_uid`, which go to one host: they send it their credentials
     /// one after the other (see `login`).
     lan_turn: Option<Arc<tokio::sync::Mutex<LanTurn>>>,
+    /// The device reported the UID asked for (`confirm_device`).
+    device_checked: bool,
     /// What turns on the legacy cipher step (see `ask_version`): `REOLING_TRY_LEGACY_CIPHER`, or a trial
     /// (`set_try_legacy`); `None`: off.
     try_legacy: Option<&'static str>,
@@ -1026,6 +1056,8 @@ fn error_word(e: &Error) -> std::borrow::Cow<'static, str> {
         Error::RegisterRejected { rsp } => format!("register rejected with rsp={rsp}").into(),
         Error::UidResolutionFailed => "lookup failed".into(),
         Error::P2pNegotiationTimeout | Error::ReplyTimeout => "timed out".into(),
+        Error::DeviceNotConfirmed { other_device: true } => "other device".into(),
+        Error::DeviceNotConfirmed { other_device: false } => "unconfirmed".into(),
         Error::ConnectionLost => "connection lost".into(),
         // `connect_by_ip`'s two texts, told apart by how they start.
         Error::ProtocolError(text) if text.starts_with("connecting to") => "connect timed out".into(),
@@ -1295,12 +1327,63 @@ impl ReolinkClient {
     /// are logged out. The LAN legs join the race as soon as the LAN
     /// discovery is answered, whatever the registration does; after a refused
     /// registration (`rsp` != 0) the race waits for that answer.
-    pub async fn connect_and_login_by_uid(uid: &str, username: &str, password: &str) -> crate::Result<Self> {
+    ///
+    /// `saved` is the address saved for the device, when this machine is on
+    /// the network it was saved on: TCP to it runs from the start, and the
+    /// LAN legs then go only to a host that answers from that address.
+    pub async fn connect_and_login_by_uid(
+        uid: &str,
+        username: &str,
+        password: &str,
+        saved: Option<std::net::Ipv4Addr>,
+    ) -> RaceResult {
         use futures_util::FutureExt;
         let login = (uid.to_string(), username.to_string(), password.to_string());
         let p2p = Self::p2p_legs(login, BASIC_SERVICE_PORT).boxed();
-        let lan = Self::lan_legs(uid, crate::transport::discovery::LAN_DISCOVERY, BASIC_SERVICE_PORT).boxed();
-        Self::first_login(p2p, lan, username, password).await
+        let saved = saved.map(|ip| std::net::SocketAddr::from((ip, BASIC_SERVICE_PORT)));
+        let (turn, held_back) = (LanTurn::shared(), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let to = crate::transport::discovery::LAN_DISCOVERY;
+        let only_from = saved.map(|addr| addr.ip());
+        let lan = Self::lan_legs_for(uid, to, BASIC_SERVICE_PORT, only_from, turn.clone(), held_back.clone()).boxed();
+        let saved = saved.map(|addr| Self::saved_leg(addr, turn));
+        let client = Self::first_login(p2p, lan, saved, &held_back, uid, username, password).await;
+        let won_by_address = match &client {
+            Ok(client) if client.device_checked => Some(client.peer_addr().await.ip()),
+            _ => None,
+        };
+        RaceResult { client, held_back: held_back.load(std::sync::atomic::Ordering::Relaxed), won_by_address }
+    }
+
+    /// Whether the device `uid` is at `ip`: a connection of its own to the device's port there, a login, the
+    /// device check, and the end of that session. For an address the device reported over another path.
+    pub async fn confirm_address(ip: std::net::Ipv4Addr, uid: &str, username: &str, password: &str) -> bool {
+        Self::confirm_at(std::net::SocketAddr::from((ip, BASIC_SERVICE_PORT)), uid, username, password).await
+    }
+
+    async fn confirm_at(addr: std::net::SocketAddr, uid: &str, username: &str, password: &str) -> bool {
+        let connecting = Self::connect_by_ip(addr.ip(), addr.port());
+        let Ok(Ok(mut client)) = tokio::time::timeout(std::time::Duration::from_secs(3), connecting).await else {
+            return false;
+        };
+        let checked = match client.login(username, password).await {
+            Ok(_) => client.check_uid(uid, CHECK_TIMEOUT).await == DeviceCheck::Checked,
+            Err(_) => false,
+        };
+        client.disconnect().await;
+        checked
+    }
+
+    /// The leg that goes straight to the address saved for the device. It shares the LAN legs' turn: the host
+    /// there gets one credential message at a time from this group, and none after its refusal or login.
+    fn saved_leg(addr: std::net::SocketAddr, turn: Arc<tokio::sync::Mutex<LanTurn>>) -> Leg {
+        use futures_util::FutureExt;
+        let client = async move {
+            let mut client = Self::connect_by_ip(addr.ip(), addr.port()).await?;
+            client.p2p_path = Some("TCP");
+            client.lan_turn = Some(turn);
+            Ok(client)
+        };
+        Leg { kind: LegKind::SavedTcp, client: client.boxed(), race_over: None }
     }
 
     /// The P2P branch of `connect_and_login_by_uid` for `login` (UID, user
@@ -1392,7 +1475,9 @@ impl ReolinkClient {
                     let mut client = Self::from_udp(socket.clone(), peer.clone(), path_name(&conn));
                     let logged_in = client.login(&username, &password);
                     match tokio::time::timeout_at(confirmed_at + times.confirmed, logged_in).await {
-                        Ok(Ok(_)) => return Ok(client),
+                        // The device check has its own limit, after the login's: another device ends the attempts,
+                        // since a new one would reach the same device.
+                        Ok(Ok(_)) => return client.confirm_device(LegKind::P2pUdp, &uid).await,
                         Ok(Err(e)) => return Err(e),
                         // Dropped, the client stops receiving, acking, resending and its keepalive.
                         Err(_) => Some((peer, conn, confirmed_at, client.connection.lock().await.sent_data().await)),
@@ -1435,15 +1520,30 @@ impl ReolinkClient {
     /// The LAN branch of `connect_and_login_by_uid`: `C2D_C` to `to` on a
     /// socket of its own, and for the device that answers, a UDP leg and TCP
     /// to `tcp_port` at its address. Neither opens anything until polled.
+    #[cfg(test)]
     async fn lan_legs(uid: &str, to: std::net::SocketAddr, tcp_port: u16) -> crate::Result<Vec<Leg>> {
+        let held_back = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Self::lan_legs_for(uid, to, tcp_port, None, LanTurn::shared(), held_back).await
+    }
+
+    /// `lan_legs` for a device with a saved address: only a host that answers from `only_from` gets the legs.
+    /// An answer from another address is told that its session ends, gets no login, and sets `held_back`; the
+    /// wait for the right answer goes on. The legs take `turn`, which the saved-address leg shares.
+    async fn lan_legs_for(
+        uid: &str,
+        to: std::net::SocketAddr,
+        tcp_port: u16,
+        only_from: Option<std::net::IpAddr>,
+        turn: Arc<tokio::sync::Mutex<LanTurn>>,
+        held_back: Arc<std::sync::atomic::AtomicBool>,
+    ) -> crate::Result<Vec<Leg>> {
         use futures_util::FutureExt;
         let socket = crate::transport::bind_udp_socket_with_large_rcvbuf().await?;
         socket.set_broadcast(true)?;
-        let peer = crate::transport::discovery::lan_connect(&socket, uid, to).await?;
-        let ip = peer.addr.ip();
         let socket = Arc::new(socket);
-        let udp_turn = LanTurn::shared();
-        let tcp_turn = udp_turn.clone();
+        let peer = crate::transport::discovery::lan_connect(&socket, uid, to, only_from, &held_back).await?;
+        let ip = peer.addr.ip();
+        let (udp_turn, tcp_turn) = (turn.clone(), turn);
         let tcp = async move {
             let mut client = Self::connect_by_ip(ip, tcp_port).await?;
             client.p2p_path = Some("TCP");
@@ -1478,6 +1578,9 @@ impl ReolinkClient {
     async fn first_login(
         p2p: futures_util::future::BoxFuture<'_, crate::Result<Vec<Leg>>>,
         lan: futures_util::future::BoxFuture<'_, crate::Result<Vec<Leg>>>,
+        saved: Option<Leg>,
+        held_back: &std::sync::atomic::AtomicBool,
+        uid: &str,
         username: &str,
         password: &str,
     ) -> crate::Result<Self> {
@@ -1485,13 +1588,16 @@ impl ReolinkClient {
         // Each leg's progress for the negotiation debug output, under a number of its own (the device unnamed) and
         // the time since here (`race_note`).
         let race = (NEXT_DEBUG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed), std::time::Instant::now());
-        DEBUG_RACE.scope(race, Self::race_logins(p2p, lan, username, password)).await
+        DEBUG_RACE.scope(race, Self::race_logins(p2p, lan, saved, held_back, uid, username, password)).await
     }
 
     /// `first_login`'s race itself, run inside `DEBUG_RACE`.
     async fn race_logins(
         p2p: futures_util::future::BoxFuture<'_, crate::Result<Vec<Leg>>>,
         lan: futures_util::future::BoxFuture<'_, crate::Result<Vec<Leg>>>,
+        saved: Option<Leg>,
+        held_back: &std::sync::atomic::AtomicBool,
+        uid: &str,
         username: &str,
         password: &str,
     ) -> crate::Result<Self> {
@@ -1502,14 +1608,15 @@ impl ReolinkClient {
         branches.push(async move { (true, p2p.await) }.boxed());
         branches.push(async move { (false, lan.await) }.boxed());
         let login = |leg: Leg| {
-            let (username, password) = (username.to_string(), password.to_string());
+            let (uid, username, password) = (uid.to_string(), username.to_string(), password.to_string());
             async move {
                 let logged_in = async {
                     let mut client = leg.client.await?;
-                    // The P2P UDP leg logs in by itself (`p2p_attempts`).
+                    // The P2P UDP leg logs in, and asks which device it has, by itself (`p2p_attempts`).
                     if client.logged_in_at.is_none() {
                         note(format_args!("{:?} connected ([conn {}])", leg.kind, client.debug_id));
                         client.login(&username, &password).await?;
+                        client = client.confirm_device(leg.kind, &uid).await?;
                     }
                     Ok(client)
                 };
@@ -1522,9 +1629,17 @@ impl ReolinkClient {
         let mut race_over: Vec<Arc<std::sync::atomic::AtomicBool>> = Vec::new();
         // The P2P branch and every P2P leg still running, and the LAN legs still running.
         let (mut p2p_open, mut lan_open) = (1usize, 0usize);
+        // The saved-address leg runs from the start and counts with the LAN legs.
+        if let Some(saved) = saved {
+            note(format_args!("the saved address joins the race: {:?}", saved.kind));
+            lan_open += 1;
+            logins.push(login(saved));
+        }
         // Set by a refused registration: the race then waits for the LAN discovery after the P2P legs end.
         let mut wait_for_lan = false;
         let mut refused: Option<Error> = None;
+        // Set by a leg that logged in to something other than the device asked for (`confirm_device`).
+        let mut unconfirmed: Option<bool> = None;
         let mut p2p_error: Option<Error> = None;
         // How the LAN discovery stood, for the decision to end and for the debug line that ends the race.
         let mut lan_answer: Option<bool> = None;
@@ -1604,6 +1719,10 @@ impl ReolinkClient {
                                 refused = Some(Error::LoginFailed { code });
                             }
                         }
+                        Err(Error::DeviceNotConfirmed { other_device }) => {
+                            // A failed leg, noted by `confirm_device`: never a wrong password, and the race goes on.
+                            unconfirmed = Some(unconfirmed.unwrap_or(false) || other_device);
+                        }
                         Err(e) => {
                             note(format_args!("{kind:?} failed: {}", error_word(&e)));
                             if kind == LegKind::P2pUdp {
@@ -1616,13 +1735,49 @@ impl ReolinkClient {
                 }
                 else => break,
             }
-            // Over once no leg runs, unless a refused registration leaves the LAN discovery still to answer.
-            if p2p_open == 0 && lan_open == 0 && (lan_answer.is_some() || !wait_for_lan) {
+            // Over once no leg runs, unless a refused registration leaves the LAN discovery still to answer. An
+            // answer it has held back (from another address than the saved one) is that answer for this purpose:
+            // the saved address has been tried by then, and the user is asked instead of waiting the search out.
+            let lan_said = lan_answer.is_some() || held_back.load(std::sync::atomic::Ordering::Relaxed);
+            if p2p_open == 0 && lan_open == 0 && (lan_said || !wait_for_lan) {
                 break;
             }
         }
         ended("without a winner", lan_answer);
-        Err(refused.or(p2p_error).unwrap_or(Error::P2pNegotiationTimeout))
+        let unconfirmed = unconfirmed.map(|other_device| Error::DeviceNotConfirmed { other_device });
+        Err(refused.or(unconfirmed).or(p2p_error).unwrap_or(Error::P2pNegotiationTimeout))
+    }
+
+    /// The device check of a leg of the UID race that has just logged in: asks the device for its UID and applies
+    /// the leg's rule. A LAN leg must be answered with the UID asked for, since any host can answer the broadcast
+    /// that led to it. A P2P leg, which Reolink's servers led to, also goes on when the device gives no answer, so
+    /// that a model without the request connects as before; it fails only on another device's UID. A leg that
+    /// fails is disconnected first, as a login that comes after the race is won is.
+    async fn confirm_device(mut self, kind: LegKind, uid: &str) -> crate::Result<Self> {
+        let said = self.check_uid(uid, CHECK_TIMEOUT).await;
+        let p2p = matches!(kind, LegKind::P2pUdp | LegKind::P2pTcp);
+        match said {
+            DeviceCheck::Checked => {
+                race_note(format_args!("{kind:?} checked"));
+                self.device_checked = true;
+                Ok(self)
+            }
+            DeviceCheck::NoAnswer if p2p => {
+                race_note(format_args!("{kind:?} gave no answer to the device check, accepted on the P2P path"));
+                Ok(self)
+            }
+            said => {
+                let other_device = said == DeviceCheck::OtherDevice;
+                let what = match said {
+                    DeviceCheck::OtherDevice => "reported another device",
+                    DeviceCheck::Lost => "lost its connection at the device check",
+                    _ => "gave no answer to the device check",
+                };
+                race_note(format_args!("{kind:?} {what}"));
+                let _ = tokio::time::timeout(CHECK_TIMEOUT, self.disconnect()).await;
+                Err(Error::DeviceNotConfirmed { other_device })
+            }
+        }
     }
 
     /// A UDP client on `peer`, with the direct path's keepalive when it is
@@ -1701,6 +1856,7 @@ impl ReolinkClient {
             debug_id: NEXT_DEBUG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             p2p_path: None,
             lan_turn: None,
+            device_checked: false,
             try_legacy: std::env::var("REOLING_TRY_LEGACY_CIPHER").is_ok().then_some("REOLING_TRY_LEGACY_CIPHER"),
             try_policy: std::env::var("REOLING_TRY_PREVIEW_POLICY").is_ok(),
             legacy_candidate: false,
@@ -2533,6 +2689,70 @@ impl ReolinkClient {
             ));
         }
         (info, answer, others)
+    }
+
+    /// Asks the logged-in device for its own UID (`MSG_ID_UID`, which the
+    /// official app also asks after login) and compares it with `uid`,
+    /// ignoring letter case. The reply is the one with the request's id and
+    /// number; its body is read whatever its code and counts only when it
+    /// decrypts under the session key (the codec never takes this id as
+    /// binary). Other messages are passed on as pushes. Waits at most `wait`.
+    pub async fn check_uid(&mut self, uid: &str, wait: std::time::Duration) -> DeviceCheck {
+        let Ok(reply) = self.ask(MSG_ID_UID, wait).await else { return DeviceCheck::Lost };
+        let reported = reply.and_then(|payload| BcXml::from_bytes(&payload).ok());
+        match reported.and_then(|xml| xml.uid).and_then(|u| u.uid) {
+            Some(reported) if !reported.is_empty() => {
+                if reported.as_str().trim().eq_ignore_ascii_case(uid.trim()) {
+                    DeviceCheck::Checked
+                } else {
+                    DeviceCheck::OtherDevice
+                }
+            }
+            _ => DeviceCheck::NoAnswer,
+        }
+    }
+
+    /// Asks the logged-in device for its network settings (`MSG_ID_NETWORK`
+    /// at device level, a read) and gives the address it reports for itself,
+    /// when that is one IPv4 address. Waits at most `wait`; a refusal comes
+    /// back at once.
+    pub async fn lan_address(&mut self, wait: std::time::Duration) -> Option<std::net::Ipv4Addr> {
+        let payload = self.ask(settings::MSG_ID_NETWORK, wait).await.ok()??;
+        let ip = crate::protocol::bc::settings_xml::SettingsBody::from_bytes(&payload)?.ip?.ip?;
+        ip.trim().parse().ok()
+    }
+
+    /// Sends the bodiless request `msg_id` and gives the body of its reply:
+    /// the message with that id under the request's number, whatever its
+    /// code. Other messages are passed on as pushes. `None` when the reply
+    /// has no body or does not come within `wait`; an error when the
+    /// connection fails meanwhile.
+    async fn ask(&mut self, msg_id: u32, wait: std::time::Duration) -> crate::Result<Option<Vec<u8>>> {
+        let exchange = async {
+            let msg_num = self.send_empty_request(msg_id).await?;
+            let mut image_chunks = HashMap::new();
+            for _ in 0..LOGIN_READ_LIMIT {
+                let reply = match self.connection.lock().await.recv_bc(&self.encryption).await {
+                    Ok(reply) => reply,
+                    Err(Error::ReplyTimeout) => continue,
+                    Err(e) => return Err(e),
+                };
+                if reply.meta.msg_id != msg_id || reply.meta.msg_num != msg_num {
+                    let (pending, uids) = (&self.pending_images, &self.channel_uids);
+                    let update = pushed_update(&reply, &mut image_chunks, pending, uids, self.debug_id);
+                    if let Some(update) = update {
+                        let _ = self.channel_updates_tx.send(update);
+                    }
+                    continue;
+                }
+                return Ok(match reply.body {
+                    BcBody::Modern(ModernMsg { payload, .. }) => payload,
+                    BcBody::Legacy(_) => None,
+                });
+            }
+            Ok(None)
+        };
+        tokio::time::timeout(wait, exchange).await.unwrap_or(Ok(None))
     }
 
     /// Diagnostic-only (`REOLING_PROBE_PUSH`): sends the empty requests the
@@ -4359,6 +4579,120 @@ mod keepalive_tests {
         assert_eq!(client.subscribe_msg_num, Some(2));
     }
 
+    const TEST_UID: &str = "9527000EXAMPLE01";
+
+    fn uid_reply(msg_num: u16, code: u16, uid: &str) -> Bc {
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<Uid version=\"1.1\">\n<uid>{uid}</uid>\n</Uid>\n\
+             </body>\n"
+        );
+        device_message(MSG_ID_UID, msg_num, code, None, Some(xml.into_bytes()))
+    }
+
+    /// The outcome of `check_uid(TEST_UID)` against a device that answers the request under `msg_num` with
+    /// `answers(msg_num)`, each sent under the key given with it; the request must be the bodiless one.
+    async fn uid_check_against(answers: fn(u16) -> Vec<(Bc, EncryptionProtocol)>, wait: Duration) -> DeviceCheck {
+        let enc = EncryptionProtocol::Aes { key: [0x5a; 16] };
+        let (mut client, mut device) = client_and_device_with(enc.clone()).await;
+        let fake = tokio::spawn(async move {
+            let request = device.recv_bc(&enc).await.unwrap();
+            assert_eq!((request.meta.msg_id, request.meta.class), (MSG_ID_UID, 0x6414));
+            assert!(matches!(&request.body, BcBody::Modern(ModernMsg { extension_xml: None, payload: None })));
+            for (answer, key) in answers(request.meta.msg_num) {
+                device.send_bc(&answer, &key).await.unwrap();
+            }
+            device
+        });
+        let outcome = client.check_uid(TEST_UID, wait).await;
+        fake.await.unwrap();
+        outcome
+    }
+
+    fn session_key() -> EncryptionProtocol {
+        EncryptionProtocol::Aes { key: [0x5a; 16] }
+    }
+
+    #[tokio::test]
+    async fn the_device_check_goes_by_the_uid_the_device_reports() {
+        let long = Duration::from_secs(5);
+        let right = uid_check_against(|n| vec![(uid_reply(n, 200, TEST_UID), session_key())], long).await;
+        assert_eq!(right, DeviceCheck::Checked);
+        let lower = |n| vec![(uid_reply(n, 200, "9527000example01"), session_key())];
+        let other_case = uid_check_against(lower, long).await;
+        assert_eq!(other_case, DeviceCheck::Checked, "letter case is ignored");
+        // The body is read whatever the code: a Hub or NVR answers some requests with 300 and a full body.
+        let code_300 = uid_check_against(|n| vec![(uid_reply(n, 300, TEST_UID), session_key())], long).await;
+        assert_eq!(code_300, DeviceCheck::Checked);
+        let another = uid_check_against(|n| vec![(uid_reply(n, 200, "9527000EXAMPLE02"), session_key())], long).await;
+        assert_eq!(another, DeviceCheck::OtherDevice);
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_names_no_uid_is_no_answer_to_the_device_check() {
+        let long = Duration::from_secs(5);
+        let empty = uid_check_against(|n| vec![(uid_reply(n, 200, ""), session_key())], long).await;
+        assert_eq!(empty, DeviceCheck::NoAnswer, "an empty UID");
+        let refusal = |n| vec![(device_message(MSG_ID_UID, n, 400, None, None), session_key())];
+        let refused = uid_check_against(refusal, long).await;
+        assert_eq!(refused, DeviceCheck::NoAnswer, "a refusal without a body");
+        // Sent under another key: what the client decrypts is not the reply.
+        let other_key = |n| vec![(uid_reply(n, 200, TEST_UID), EncryptionProtocol::Aes { key: [0x33; 16] })];
+        let garbage = uid_check_against(other_key, long).await;
+        assert_eq!(garbage, DeviceCheck::NoAnswer, "a body that is not valid under the session key");
+        let short = Duration::from_millis(200);
+        let silent = uid_check_against(|_| Vec::new(), short).await;
+        assert_eq!(silent, DeviceCheck::NoAnswer, "silence");
+        let other_number =
+            uid_check_against(|n| vec![(uid_reply(n.wrapping_add(1), 200, TEST_UID), session_key())], short).await;
+        assert_eq!(other_number, DeviceCheck::NoAnswer, "a UID reply under another request's number");
+    }
+
+    /// What `lan_address` gives against a device that answers the request with `answer(msg_num)`, or not at all.
+    async fn lan_address_against(answer: Option<fn(u16) -> Bc>, wait: Duration) -> Option<std::net::Ipv4Addr> {
+        let enc = session_key();
+        let (mut client, mut device) = client_and_device_with(enc.clone()).await;
+        let fake = tokio::spawn(async move {
+            let request = device.recv_bc(&enc).await.unwrap();
+            assert_eq!((request.meta.msg_id, request.meta.class), (settings::MSG_ID_NETWORK, 0x6414));
+            assert!(matches!(&request.body, BcBody::Modern(ModernMsg { extension_xml: None, payload: None })));
+            if let Some(answer) = answer {
+                device.send_bc(&answer(request.meta.msg_num), &enc).await.unwrap();
+            }
+            device
+        });
+        let address = client.lan_address(wait).await;
+        fake.await.unwrap();
+        address
+    }
+
+    fn network_reply(msg_num: u16, ip_block: &str) -> Bc {
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<Dhcp version=\"1.1\">\n<enable>1</enable>\n</Dhcp>\n\
+             {ip_block}</body>\n"
+        );
+        device_message(settings::MSG_ID_NETWORK, msg_num, 200, None, Some(xml.into_bytes()))
+    }
+
+    #[tokio::test]
+    async fn the_address_a_device_reports_for_itself_is_read_from_its_network_settings() {
+        let long = Duration::from_secs(5);
+        const IP_BLOCK: &str = "<Ip version=\"1.1\">\n<ip>192.0.2.5</ip>\n<mask>255.255.255.0</mask>\n</Ip>\n";
+        let reported = |n| network_reply(n, IP_BLOCK);
+        assert_eq!(lan_address_against(Some(reported), long).await, Some(std::net::Ipv4Addr::new(192, 0, 2, 5)));
+        let refused = |n| device_message(settings::MSG_ID_NETWORK, n, 400, None, None);
+        assert_eq!(lan_address_against(Some(refused), long).await, None, "a refusal");
+        assert_eq!(lan_address_against(Some(|n| network_reply(n, "")), long).await, None, "no Ip block");
+        let not_ipv4 = |n| network_reply(n, "<Ip version=\"1.1\">\n<ip>2001:db8::5</ip>\n</Ip>\n");
+        assert_eq!(lan_address_against(Some(not_ipv4), long).await, None, "not one IPv4 address");
+        assert_eq!(lan_address_against(None, Duration::from_millis(200)).await, None, "silence");
+    }
+
+    #[tokio::test]
+    async fn a_push_ahead_of_the_uid_reply_does_not_disturb_the_device_check() {
+        let answers = |n| vec![(alarm_push(), session_key()), (uid_reply(n, 200, TEST_UID), session_key())];
+        assert_eq!(uid_check_against(answers, Duration::from_secs(5)).await, DeviceCheck::Checked);
+    }
+
     /// Once the count has come round, `identity` asks under 65533 to 65535
     /// and then 1, not 0. An image under 1 left that number marked binary
     /// long ago; the answer to the version request under it is still read
@@ -5001,7 +5335,7 @@ mod keepalive_tests {
         before_nonce: Vec<Bc>,
         before_login: Vec<Bc>,
         reply: fn(u16) -> Bc,
-    ) {
+    ) -> BcConnection {
         let upgrade = device.recv_bc(&PLAIN).await.unwrap();
         assert_eq!(upgrade.meta, login_request_meta(0xdc12, 0x6514));
         assert!(matches!(upgrade.body, BcBody::Legacy(LegacyMsg::LoginUpgrade)), "{:?}", upgrade.body);
@@ -5011,14 +5345,14 @@ mod keepalive_tests {
             device.send_bc(message, &EncryptionProtocol::BcEncrypt).await.unwrap();
         }
         device.send_bc(&nonce_reply(upgrade.meta.msg_num, "TESTNONCE"), &EncryptionProtocol::BcEncrypt).await.unwrap();
-        fake_login_step(device, before_login, reply).await;
+        fake_login_step(device, before_login, reply).await
     }
 
     /// The device end of the login step, with the nonce "TESTNONCE": checks
     /// that the request is the one `login` always sends, hashed with that
     /// nonce, and sends `before_reply` ahead of `reply` under the request's
     /// number.
-    async fn fake_login_step(mut device: BcConnection, before_reply: Vec<Bc>, reply: fn(u16) -> Bc) {
+    async fn fake_login_step(mut device: BcConnection, before_reply: Vec<Bc>, reply: fn(u16) -> Bc) -> BcConnection {
         let aes = EncryptionProtocol::Aes { key: aes_key_from_password("swordfish", "TESTNONCE") };
         let login = device.recv_bc(&aes).await.unwrap();
         assert_eq!(login.meta, login_request_meta(0, 0x6414));
@@ -5032,6 +5366,30 @@ mod keepalive_tests {
             device.send_bc(message, &aes).await.unwrap();
         }
         device.send_bc(&reply(login.meta.msg_num), &aes).await.unwrap();
+        device
+    }
+
+    /// The device end of the device check a leg of the UID race makes after its login ("swordfish", "TESTNONCE"):
+    /// the next request must be the one for the UID, and is answered with `uid`.
+    async fn answer_uid_as(device: &mut BcConnection, uid: &str) {
+        let aes = EncryptionProtocol::Aes { key: aes_key_from_password("swordfish", "TESTNONCE") };
+        let request = device.recv_bc(&aes).await.unwrap();
+        assert_eq!(request.meta.msg_id, MSG_ID_UID, "the first request after a login in the race");
+        device.send_bc(&uid_reply(request.meta.msg_num, 200, uid), &aes).await.unwrap();
+    }
+
+    /// Reads until the connection ends, answering the device check with the UID the race tests connect to.
+    async fn serve_uid_until_closed(device: &mut BcConnection, aes: &EncryptionProtocol) {
+        while let Ok(request) = device.recv_bc(aes).await {
+            if request.meta.msg_id == MSG_ID_UID {
+                let _ = device.send_bc(&uid_reply(request.meta.msg_num, 200, TEST_UID), aes).await;
+            }
+        }
+    }
+
+    /// `answer_uid_as` with the UID the race tests connect to.
+    async fn answer_uid(device: &mut BcConnection) {
+        answer_uid_as(device, TEST_UID).await;
     }
 
     /// An alarm push (33 under 0) ahead of the nonce reply, as our RLN36 on
@@ -5184,7 +5542,8 @@ mod keepalive_tests {
         p2p: impl std::future::Future<Output = crate::Result<Vec<Leg>>> + Send + 'static,
         lan: impl std::future::Future<Output = crate::Result<Vec<Leg>>> + Send + 'static,
     ) -> crate::Result<ReolinkClient> {
-        ReolinkClient::first_login(Box::pin(p2p), Box::pin(lan), "admin", "swordfish").await
+        let none_held = Default::default();
+        ReolinkClient::first_login(Box::pin(p2p), Box::pin(lan), None, &none_held, TEST_UID, "admin", "swordfish").await
     }
 
     fn leg(
@@ -5204,7 +5563,12 @@ mod keepalive_tests {
             let aes = EncryptionProtocol::Aes { key: aes_key_from_password("swordfish", "TESTNONCE") };
             let login = device.recv_bc(&aes).await.unwrap();
             tokio::time::sleep(delay).await;
-            device.send_bc(&reply(login.meta.msg_num), &aes).await.unwrap();
+            let reply = reply(login.meta.msg_num);
+            device.send_bc(&reply, &aes).await.unwrap();
+            // A leg that is logged in asks which device it has.
+            if reply.meta.response_code == 200 {
+                answer_uid(&mut device).await;
+            }
             device
         });
         (leg(LegKind::P2pUdp, async move { Ok(client) }), device_addr, fake)
@@ -5216,7 +5580,9 @@ mod keepalive_tests {
         let addr = listener.local_addr().unwrap();
         let fake = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            fake_login_with_nonce_step(BcConnection::from_tcp(stream), Vec::new(), Vec::new(), login_reply).await;
+            let mut device =
+                fake_login_with_nonce_step(BcConnection::from_tcp(stream), Vec::new(), Vec::new(), login_reply).await;
+            answer_uid(&mut device).await;
         });
         (addr, fake)
     }
@@ -5327,7 +5693,8 @@ mod keepalive_tests {
             let addr = confirm_c2d_t(&dev, conn, Duration::ZERO).await;
             let peer =
                 PeerHandle { addr, local_connection_id: 2, remote_connection_id: 1, nonce: None, is_direct: false };
-            fake_login_step(BcConnection::new(Arc::new(dev), peer), Vec::new(), login_reply).await;
+            let mut device = fake_login_step(BcConnection::new(Arc::new(dev), peer), Vec::new(), login_reply).await;
+            answer_uid(&mut device).await;
         })
     }
 
@@ -5419,6 +5786,7 @@ mod keepalive_tests {
             let aes = EncryptionProtocol::Aes { key: aes_key_from_password("swordfish", "TESTNONCE") };
             let login = device.recv_bc(&aes).await.unwrap();
             device.send_bc(&login_reply(login.meta.msg_num), &aes).await.unwrap();
+            answer_uid(&mut device).await;
             while device.recv_bc(&aes).await.unwrap().meta.msg_id != MSG_ID_LOGOUT {}
         });
         let _fake_dev = p2p_device(dev, "local");
@@ -5520,6 +5888,7 @@ mod keepalive_tests {
             let aes = EncryptionProtocol::Aes { key: aes_key_from_password("swordfish", "TESTNONCE") };
             let login = device.recv_bc(&aes).await.unwrap();
             device.send_bc(&login_reply(login.meta.msg_num), &aes).await.unwrap();
+            answer_uid(&mut device).await;
             while device.recv_bc(&aes).await.unwrap().meta.msg_id != MSG_ID_LOGOUT {}
         });
         (addr, fake)
@@ -5734,9 +6103,221 @@ mod keepalive_tests {
             let login = device.recv_bc(&aes).await.unwrap();
             tokio::time::sleep(wait).await;
             let _ = device.send_bc(&reply(login.meta.msg_num), &aes).await;
+            serve_uid_until_closed(&mut device, &aes).await;
+        });
+        (addr, fake)
+    }
+
+    /// A device on TCP that accepts the login and answers the device check with `answer` under the request's
+    /// number, then reads until the connection ends.
+    async fn checking_camera(answer: fn(u16) -> Bc) -> (std::net::SocketAddr, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fake = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut device =
+                fake_login_with_nonce_step(BcConnection::from_tcp(stream), Vec::new(), Vec::new(), login_reply).await;
+            let aes = EncryptionProtocol::Aes { key: aes_key_from_password("swordfish", "TESTNONCE") };
+            let request = device.recv_bc(&aes).await.unwrap();
+            assert_eq!(request.meta.msg_id, MSG_ID_UID);
+            device.send_bc(&answer(request.meta.msg_num), &aes).await.unwrap();
             while device.recv_bc(&aes).await.is_ok() {}
         });
         (addr, fake)
+    }
+
+    fn another_uid(msg_num: u16) -> Bc {
+        uid_reply(msg_num, 200, "9527000EXAMPLE02")
+    }
+
+    fn no_uid(msg_num: u16) -> Bc {
+        device_message(MSG_ID_UID, msg_num, 400, None, None)
+    }
+
+    fn tcp_leg(kind: LegKind, addr: std::net::SocketAddr) -> Leg {
+        leg(kind, ReolinkClient::connect_by_ip(addr.ip(), addr.port()))
+    }
+
+    /// `race` with the leg to the saved address `saved`, which shares `turn` with the LAN legs.
+    async fn race_with_saved(
+        p2p: impl std::future::Future<Output = crate::Result<Vec<Leg>>> + Send + 'static,
+        lan: impl std::future::Future<Output = crate::Result<Vec<Leg>>> + Send + 'static,
+        saved: std::net::SocketAddr,
+    ) -> crate::Result<ReolinkClient> {
+        let saved = Some(ReolinkClient::saved_leg(saved, LanTurn::shared()));
+        let (p2p, lan, none_held) = (Box::pin(p2p), Box::pin(lan), Default::default());
+        ReolinkClient::first_login(p2p, lan, saved, &none_held, TEST_UID, "admin", "swordfish").await
+    }
+
+    /// With the registration refused the race waits for the LAN discovery. Once that has held back an answer
+    /// from another address and the saved address has failed too, there is nothing left to wait for: the race
+    /// ends at once, so that the user is asked without the search's 15 s.
+    #[tokio::test]
+    async fn a_held_back_answer_ends_the_wait_for_the_lan_once_nothing_else_runs() {
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let saved = Some(ReolinkClient::saved_leg(closed, LanTurn::shared()));
+        let held = std::sync::atomic::AtomicBool::new(true);
+        let rejected = Box::pin(async { Err(Error::RegisterRejected { rsp: -1 }) });
+        let still_asking = Box::pin(std::future::pending());
+        let raced = ReolinkClient::first_login(rejected, still_asking, saved, &held, TEST_UID, "admin", "swordfish");
+        let ended = tokio::time::timeout(Duration::from_secs(3), raced).await.expect("the race ended");
+        assert!(matches!(ended, Err(Error::RegisterRejected { rsp: -1 })), "{:?}", ended.err());
+    }
+
+    /// The leg to the saved address and the LAN legs go to one host and take turns with their credentials: after
+    /// a 401 to the saved leg, a LAN leg that already has its nonce sends nothing.
+    #[tokio::test]
+    async fn the_saved_leg_and_the_lan_legs_share_one_turn() {
+        let (refusing, _fake_refusing) = answering_camera(Duration::from_millis(200), refusal_401).await;
+        let (other, fake_other) = late_nonce_camera(Duration::from_millis(100)).await;
+        let turn = LanTurn::shared();
+        let saved = Some(ReolinkClient::saved_leg(refusing, turn.clone()));
+        let lan_leg = leg(LegKind::LanTcp, async move {
+            let mut client = ReolinkClient::connect_by_ip(other.ip(), other.port()).await?;
+            client.lan_turn = Some(turn);
+            Ok(client)
+        });
+        let rejected = Box::pin(async { Err(Error::RegisterRejected { rsp: -1 }) });
+        let lan = Box::pin(async move { Ok(vec![lan_leg]) });
+        let none_held = Default::default();
+        let raced = ReolinkClient::first_login(rejected, lan, saved, &none_held, TEST_UID, "admin", "swordfish");
+        let ended = tokio::time::timeout(Duration::from_secs(3), raced).await.expect("the race ended");
+        assert!(matches!(ended, Err(Error::RegisterRejected { rsp: -1 })), "{:?}", ended.err());
+        let sent = tokio::time::timeout(Duration::from_secs(2), fake_other).await.expect("the LAN leg is closed");
+        assert!(!sent.unwrap(), "the LAN leg sent its credentials after the saved leg's 401");
+    }
+
+    /// The address saved for a device is tried from the start, beside the lookup and the broadcast: with the
+    /// device there, it wins without either, and the device is known to be the one asked for.
+    #[tokio::test]
+    async fn the_saved_address_wins_when_the_device_is_there() {
+        let (saved, fake) = tcp_camera().await;
+        let raced = race_with_saved(std::future::pending(), std::future::pending(), saved);
+        let client = tokio::time::timeout(Duration::from_secs(5), raced).await.expect("a winner").unwrap();
+        assert_eq!(client.peer_addr().await, saved);
+        assert!(client.device_checked);
+        fake.await.unwrap();
+    }
+
+    /// Something else at the saved address, or nothing, does not keep the device from connecting another way,
+    /// and what is there never becomes the connection.
+    #[tokio::test]
+    async fn another_device_or_nothing_at_the_saved_address_leaves_the_other_legs_to_win() {
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let (other, _fake_other) = checking_camera(another_uid).await;
+        for saved in [other, closed] {
+            let (device, _fake_device) = slow_tcp_camera(Duration::from_millis(200)).await;
+            let p2p = async move { Ok(vec![tcp_leg(LegKind::P2pTcp, device)]) };
+            let raced = race_with_saved(p2p, std::future::pending(), saved);
+            let client = tokio::time::timeout(Duration::from_secs(5), raced).await.expect("a winner").unwrap();
+            assert_eq!(client.peer_addr().await, device);
+        }
+    }
+
+    /// With a saved address, a host that answers the LAN discovery from another address gets no legs, so no
+    /// login, and the race learns of it at once; the same answer from the saved address gets its legs.
+    #[tokio::test]
+    async fn a_lan_answer_from_another_address_than_the_saved_one_is_held_back() {
+        use crate::protocol::bcudp::xml::D2cCr;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (device_addr, _fake_device) = lan_device(|cid| D2cCr { rsp: 0, cid, did: 7 }).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held_back = Arc::new(AtomicBool::new(false));
+        let elsewhere: std::net::IpAddr = "127.0.0.9".parse().unwrap();
+        let legs = tokio::spawn(ReolinkClient::lan_legs_for(
+            TEST_UID,
+            device_addr,
+            port,
+            Some(elsewhere),
+            LanTurn::shared(),
+            held_back.clone(),
+        ));
+        assert!(!connects(&listener).await, "the host that answered from another address got a TCP connection");
+        assert!(held_back.load(Ordering::Relaxed), "the race is not told");
+        assert!(!legs.is_finished(), "the wait for the saved address's answer ended");
+        legs.abort();
+
+        let held_back = Arc::new(AtomicBool::new(false));
+        let from_saved = ReolinkClient::lan_legs_for(
+            TEST_UID,
+            device_addr,
+            port,
+            Some(device_addr.ip()),
+            LanTurn::shared(),
+            held_back.clone(),
+        );
+        let legs = tokio::time::timeout(Duration::from_secs(2), from_saved).await.expect("an answer").unwrap();
+        assert_eq!(legs.iter().map(|l| l.kind).collect::<Vec<_>>(), [LegKind::LanUdp, LegKind::LanTcp]);
+        assert!(!held_back.load(Ordering::Relaxed));
+    }
+
+    /// An address the device reported is saved only when a connection of its own to it finds the device there.
+    #[tokio::test]
+    async fn a_reported_address_is_confirmed_only_by_the_device_itself() {
+        let confirm = |addr| ReolinkClient::confirm_at(addr, TEST_UID, "admin", "swordfish");
+        let (device, fake) = tcp_camera().await;
+        assert!(confirm(device).await);
+        fake.await.unwrap();
+        let (other, _fake_other) = checking_camera(another_uid).await;
+        assert!(!confirm(other).await, "another device");
+        let (refusing, _fake_refusing) = answering_camera(Duration::ZERO, refusal_401).await;
+        assert!(!confirm(refusing).await, "a host that refuses the login");
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        assert!(!confirm(closed).await, "nothing there");
+    }
+
+    /// A host on the LAN that accepts the login is not the device unless it says so: one that reports another UID,
+    /// or none, loses, however fast it was, and a slower leg that reports the UID asked for wins.
+    #[tokio::test]
+    async fn a_lan_leg_that_does_not_report_the_uid_asked_for_loses() {
+        for answer in [another_uid, no_uid] {
+            let (stranger, fake_stranger) = checking_camera(answer).await;
+            let (device, _fake_device) = slow_tcp_camera(Duration::from_millis(200)).await;
+            let p2p = async move { Ok(vec![tcp_leg(LegKind::P2pTcp, device)]) };
+            let lan = async move { Ok(vec![tcp_leg(LegKind::LanTcp, stranger)]) };
+            let client = tokio::time::timeout(Duration::from_secs(4), race(p2p, lan)).await.expect("a winner").unwrap();
+            assert_eq!(client.peer_addr().await, device);
+            // The leg that failed the check is disconnected: its device end reads the end of the connection.
+            tokio::time::timeout(Duration::from_secs(2), fake_stranger).await.expect("disconnected").unwrap();
+        }
+    }
+
+    /// With no other leg, what the race says is that the device was not confirmed, and whether another one
+    /// answered: never a refused login, which would make the app forget the password.
+    #[tokio::test]
+    async fn a_race_whose_only_login_fails_the_device_check_says_so() {
+        for (answer, other) in [(another_uid as fn(u16) -> Bc, true), (no_uid, false)] {
+            let (stranger, _fake) = checking_camera(answer).await;
+            // The P2P leg fails once the LAN answer is in, while the LAN leg is still at its login.
+            let failed = async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Err(Error::P2pNegotiationTimeout)
+            };
+            let p2p = async move { Ok(vec![leg(LegKind::P2pUdp, failed)]) };
+            let ended = race(p2p, async move { Ok(vec![tcp_leg(LegKind::LanTcp, stranger)]) }).await;
+            match ended {
+                Err(Error::DeviceNotConfirmed { other_device }) => assert_eq!(other_device, other),
+                Err(e) => panic!("{e}"),
+                Ok(_) => panic!("the leg won"),
+            }
+        }
+    }
+
+    /// Reolink's servers led to a P2P leg, not a broadcast: a device there that gives no answer to the check still
+    /// connects, as a model without the request did before. One that reports another UID does not.
+    #[tokio::test]
+    async fn a_p2p_leg_wins_without_an_answer_to_the_device_check_but_not_as_another_device() {
+        let (silent, _fake) = checking_camera(no_uid).await;
+        let p2p = async move { Ok(vec![tcp_leg(LegKind::P2pTcp, silent)]) };
+        let client = race(p2p, std::future::pending()).await.unwrap();
+        assert_eq!(client.peer_addr().await, silent);
+
+        let (other, _fake) = checking_camera(another_uid).await;
+        let p2p = async move { Ok(vec![tcp_leg(LegKind::P2pTcp, other)]) };
+        let rejected = async { Err(Error::P2pNegotiationTimeout) };
+        let ended = race(p2p, rejected).await;
+        assert!(matches!(ended, Err(Error::DeviceNotConfirmed { other_device: true })), "{:?}", ended.err());
     }
 
     /// Two LAN legs over TCP that take turns with their credentials, as the two of `lan_legs` do.
@@ -5831,7 +6412,7 @@ mod keepalive_tests {
             tcp_has_credentials.send(()).unwrap();
             udp_nonce_out.await.unwrap();
             device.send_bc(&login_reply(login.meta.msg_num), &aes).await.unwrap();
-            while device.recv_bc(&aes).await.is_ok() {}
+            serve_uid_until_closed(&mut device, &aes).await;
         });
         let (goodbyes, credentials) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let (said, sent) = (goodbyes.clone(), credentials.clone());
