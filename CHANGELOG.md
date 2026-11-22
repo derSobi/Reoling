@@ -16,6 +16,8 @@ All notable changes of Reoling, newest first.
 - The first connection to a new device is as before: the paths on the local network run at once.
 - "Device settings…" in a card's menu is now offered for a camera on its own too: Info, Storage, Network, Time, Users and Maintenance, read-only. Before, it was there for a Home Hub or NVR only.
 - "Remove device" asks before it removes; Cancel is the default.
+- Saved passwords are found again after a login without a password (automatic login). The keyring is locked then, and Reoling did not ask for it to be unlocked, so on Linux Mint 22.3 it asked for every device's password at every start. It now asks the desktop to unlock the keyring, once, when it needs a password. A password that cannot be saved is reported in the terminal and in the Diagnostic Log.
+- The menu of the selected device card is readable on Linux Mint's Mint-Y theme, where its entries were white on white.
 - The Diagnostic Log says for each path whether the device was checked, when a saved address joins the connection attempt, when an answer on the local network was held back, and whether a reported address was saved or rejected. No address and no UID is written.
 - What this does not do: it does not protect the first login to a new device on the local network, and it is no cryptographic proof. The protocol gives a client nothing fresh to add to the session key, so a recorded session of the same device could be replayed, and a host that knows the password can report any UID.
 - Tested on my Home Hub Pro, two RLN36 and the two test cameras (RLC-520A, RLC-1224A): all five report the UID they were added with as the first request after login.

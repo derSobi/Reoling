@@ -90,7 +90,12 @@ pub struct Sidebar {
 
 /// The connected dot in the theme's accent colour. The colour is the
 /// theme's own named one, not ours.
-const DOT_CSS: &str = ".status-connected { color: @theme_selected_bg_color; }";
+///
+/// A card's menu is a child of its row, and a theme that gives its popovers no text colour of their own (Mint-Y on
+/// Linux Mint 22) lets them take the selected row's: white entries on a white menu. The menu therefore names the
+/// theme's ordinary text colour.
+const DOT_CSS: &str = ".status-connected { color: @theme_selected_bg_color; } \
+                       popover.card-menu, popover.card-menu > contents { color: @theme_fg_color; }";
 
 impl Sidebar {
     pub fn new(handlers: Handlers) -> Rc<Self> {
@@ -174,6 +179,7 @@ impl Sidebar {
         menu.set_icon_name("emblem-system-symbolic");
         menu.add_css_class("flat");
         let popover = Popover::new();
+        popover.add_css_class("card-menu");
         let menu_box = GtkBox::new(Orientation::Vertical, 2);
         let settings = Button::with_label("Device settings…");
         let relogin = Button::with_label("Change login…");
